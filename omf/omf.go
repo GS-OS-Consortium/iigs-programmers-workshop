@@ -360,3 +360,23 @@ func (f *File) Write() []byte {
 	}
 	return out.Bytes()
 }
+
+// SegmentImage returns a segment's initialized memory image: CONST/LCONST
+// payloads concatenated, DS reservations zero-filled, expression slots
+// zero-filled (they are patched by the linker).
+func SegmentImage(s *Segment) []byte {
+	var img []byte
+	for _, r := range s.Records {
+		switch {
+		case r.Op >= 0x01 && r.Op <= 0xDF:
+			img = append(img, r.Raw[1:]...)
+		case r.Op == RecLconst:
+			img = append(img, r.Raw[5:]...)
+		case r.Op == RecDS:
+			img = append(img, make([]byte, binary.LittleEndian.Uint32(r.Raw[1:]))...)
+		case r.Op == RecLexpr || r.Op == RecBexpr || r.Op == RecExpr:
+			img = append(img, make([]byte, r.Raw[1])...)
+		}
+	}
+	return img
+}

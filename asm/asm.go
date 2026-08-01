@@ -47,8 +47,12 @@ type segState struct {
 	loadName string
 	imports  map[string]bool // IMPORTs are scoped to the declaring segment
 	org      int64           // segment header ORG (from "PROC ORG expr")
-	actions  []action
-	endPC    int64
+	// OMF v2.1 TEMPORG (from "PROC TEMPORG expr"): assembly-time origin that
+	// does not become the load address
+	tempOrg    int64
+	hasTempOrg bool
+	actions    []action
+	endPC      int64
 }
 
 // ---------- assembler state ----------
@@ -65,7 +69,12 @@ type asmState struct {
 	msb        bool
 	strMode    string // "ASIS" or "PASCAL"
 
-	syms     map[string]Val
+	syms map[string]Val
+	// All definitions of each name in source order. A one-pass assembler
+	// binds a forward reference to the NEXT definition, so duplicated
+	// labels (common in this corpus) must not collapse to the last one.
+	symSeq   map[string][]Val
+	defSeq   int64           // monotonically increasing definition counter
 	imports  map[string]bool // IMPORTed external symbols
 	entries  map[string]bool // ENTRY labels awaiting definition
 	loadName string          // current SEG name for new PROCs
@@ -76,6 +85,7 @@ type asmState struct {
 	// RECORD ... ENDR template mode
 	inRecord bool
 	recPC    int64
+	recName  string // RECORD label, for qualified RECORD.FIELD references
 
 	// preprocessor state (conditionals, macros, set-vars) lives in preproc.go
 	pp *ppState
@@ -110,7 +120,9 @@ func (st *asmState) lookup(name string) Val {
 		}
 		return v
 	}
-	return fwdVal(name)
+	f := fwdVal(name)
+	f.Pos[0].atSeq = st.defSeq // bind to the next definition after this point
+	return f
 }
 
 func (st *asmState) scopedLocal(name string) string {
@@ -126,6 +138,9 @@ func (st *asmState) define(name string, v Val) {
 		st.localScope++
 	}
 	st.syms[name] = v
+	st.defSeq++
+	v.defSeq = st.defSeq
+	st.symSeq[name] = append(st.symSeq[name], v)
 }
 
 // ---------- line model ----------
@@ -220,8 +235,29 @@ func operandOnly(s string) string {
 // AssembleFile assembles a source file (CR or LF line endings); incDirs are
 // searched for INCLUDE files after the including file's own directory.
 func AssembleFile(path string, incDirs ...string) (*Object, error) {
+	return AssembleFileOpts(path, incDirs, nil)
+}
+
+// AssembleFileOpts assembles with include directories and command-line
+// symbol definitions ("-D NAME=VALUE", as the makefiles pass them).
+func AssembleFileOpts(path string, incDirs, defines []string) (*Object, error) {
 	st := newState()
 	st.pp.incDirs = incDirs
+	for _, d := range defines {
+		name, val, ok := strings.Cut(d, "=")
+		if !ok {
+			val = "1"
+		}
+		name = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "&"))
+		v, err := evalNum(strings.TrimSpace(val), &exprCtx{st: st})
+		if err != nil {
+			// non-numeric define: keep as a macro-language string variable
+			st.pp.globals[strings.ToUpper(name)] = strings.TrimSpace(val)
+			continue
+		}
+		st.define(name, num(v))
+		st.pp.globals[strings.ToUpper(name)] = strings.TrimSpace(val)
+	}
 	// absolutize so MPW '::' (parent-dir) include paths resolve correctly
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
@@ -247,6 +283,7 @@ func newState() *asmState {
 		msb:      false,
 		strMode:  "ASIS",
 		syms:     map[string]Val{},
+		symSeq:   map[string][]Val{},
 		imports:  map[string]bool{},
 		entries:  map[string]bool{},
 		loadName: "main",
@@ -299,14 +336,20 @@ func (st *asmState) doLine(l line) {
 		// "label PROC ORG expr" sets the segment header ORG
 		if rest := strings.TrimSpace(l.rest); rest != "" {
 			f := strings.Fields(rest)
-			if len(f) >= 2 && strings.EqualFold(f[0], "org") {
+			isOrg := len(f) >= 2 && strings.EqualFold(f[0], "org")
+			isTemp := len(f) >= 2 && strings.EqualFold(f[0], "temporg")
+			switch {
+			case isOrg, isTemp:
 				v, err := evalNum(strings.Join(f[1:], " "), &exprCtx{st: st})
 				if err != nil {
-					st.errf("PROC ORG: %v", err)
+					st.errf("PROC %s: %v", f[0], err)
+				} else if isTemp {
+					// OMF v2.1 TEMPORG: assembly-time origin only
+					seg.tempOrg, seg.hasTempOrg = v, true
 				} else {
 					seg.org = v
 				}
-			} else {
+			default:
 				st.errf("unsupported PROC operand %q", rest)
 			}
 		}
@@ -362,6 +405,7 @@ func (st *asmState) doLine(l line) {
 			}
 		}
 		st.recPC = v
+		st.recName = strings.ToUpper(l.label)
 		if l.label != "" {
 			st.define(l.label, num(v))
 		}
@@ -513,9 +557,17 @@ func (st *asmState) defineCodeLabel(name string) {
 // doRecordLine handles lines inside RECORD ... ENDR: a template that only
 // defines constants (field offsets); nothing is emitted.
 func (st *asmState) doRecordLine(op string, l line) {
+	// field labels are visible plain and as RECORD.FIELD
+	defField := func(name string, v Val) {
+		st.define(name, v)
+		if st.recName != "" && name != "" {
+			st.define(st.recName+"."+strings.ToUpper(name), v)
+		}
+	}
 	switch op {
 	case "endr":
 		st.inRecord = false
+		st.recName = ""
 		return
 	case "org":
 		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
@@ -534,7 +586,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 			size = 4
 		}
 		if l.label != "" {
-			st.define(l.label, num(st.recPC))
+			defField(l.label, num(st.recPC))
 		}
 		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
@@ -553,8 +605,44 @@ func (st *asmState) doRecordLine(op string, l line) {
 		return
 	case "", "anop":
 		if l.label != "" {
-			st.define(l.label, num(st.recPC))
+			defField(l.label, num(st.recPC))
 		}
+		return
+	case "dc", "dc.b", "dc.w", "dc.l", "dc.a", "dcb", "dcb.b":
+		// Inside a RECORD template, DC directives only size the field: the
+		// label takes the current template offset and no bytes are emitted.
+		if l.label != "" {
+			defField(l.label, num(st.recPC))
+		}
+		unit := int64(1)
+		switch op {
+		case "dc.w":
+			unit = 2
+		case "dc.a":
+			unit = 3
+		case "dc.l":
+			unit = 4
+		}
+		items := splitArgs(l.rest)
+		n := int64(len(items))
+		if op == "dcb" || op == "dcb.b" {
+			unit = 1
+			n = 0
+			if len(items) > 0 {
+				if c, err := evalNum(strings.TrimSpace(items[0]), &exprCtx{st: st}); err == nil {
+					n = c
+				}
+			}
+		} else {
+			for _, it := range items {
+				if it = strings.TrimSpace(it); strings.HasPrefix(it, "'") {
+					if u, err := unquote(it); err == nil {
+						n += int64(len(u)) - 1
+					}
+				}
+			}
+		}
+		st.recPC += n * unit
 		return
 	case "title", "eject", "print", "with", "endwith":
 		return

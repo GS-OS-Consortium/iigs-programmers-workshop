@@ -106,13 +106,16 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		}
 		return v.hasUnresolvedFwd(st)
 	}
-	for pending() {
+	for guard := 0; pending(); guard++ {
+		if guard > 64 {
+			return Val{}, fmt.Errorf("unresolvable expression (symbol cycle)")
+		}
 		next := num(v.C)
 		var err error
 		expandTerm := func(t term, neg bool) {
 			var tv Val
 			if t.fwd != "" {
-				if !forceAll && (st.imports[t.fwd] || st.entries[t.fwd]) {
+				if !forceAll && st.imports[t.fwd] {
 					if neg {
 						next, _ = next.sub(Val{Pos: []term{t}})
 					} else {
@@ -120,7 +123,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					}
 					return
 				}
-				r, ok := st.syms[t.fwd]
+				r, ok := st.nextDef(t.fwd, t.atSeq)
 				if !ok {
 					// unresolvable (e.g. branch to an external): hard error,
 					// never loop
@@ -165,6 +168,22 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		return Val{}, fmt.Errorf("expression does not reduce to label+constant")
 	}
 	return v, nil
+}
+
+// nextDef returns the first definition of name made after seq (a one-pass
+// forward reference binds to the next definition, not the last).
+func (st *asmState) nextDef(name string, seq int64) (Val, bool) {
+	defs := st.symSeq[name]
+	for _, d := range defs {
+		if d.defSeq > seq {
+			return d, true
+		}
+	}
+	if len(defs) > 0 {
+		return defs[len(defs)-1], true
+	}
+	v, ok := st.syms[name]
+	return v, ok
 }
 
 // exprRef gives the label name and displacement for an expression record
@@ -272,5 +291,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			e.expr(a.rec, a.size, nm, disp, a.shift)
 		}
 	}
-	return &Segment{Name: seg.name, LoadName: seg.loadName, Org: seg.org, Length: seg.endPC, Records: e.end()}, nil
+	return &Segment{Name: seg.name, LoadName: seg.loadName, Org: seg.org,
+		TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
+		Length: seg.endPC, Records: e.end()}, nil
 }

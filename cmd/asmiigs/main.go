@@ -16,6 +16,7 @@ import (
 func main() {
 	var inputs []string
 	var incDirs []string
+	var defines []string
 	var out string
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -32,6 +33,12 @@ func main() {
 				die("missing argument to -i")
 			}
 			incDirs = append(incDirs, strings.Split(args[i], ",")...)
+		case a == "-d" || a == "-D":
+			i++
+			if i >= len(args) {
+				die("missing argument to -d")
+			}
+			defines = append(defines, args[i])
 		case a == "-h" || a == "-wt" || a == "-wi" || a == "-w" || a == "-t" || a == "-unsafe":
 			// accepted, no behavioral difference implemented yet
 		case strings.HasPrefix(a, "-"):
@@ -43,7 +50,7 @@ func main() {
 	if len(inputs) != 1 || out == "" {
 		die("usage: asmiigs [options] file.aii -o file.obj")
 	}
-	obj, err := asm.AssembleFile(inputs[0], incDirs...)
+	obj, err := asm.AssembleFileOpts(inputs[0], incDirs, defines)
 	if err != nil {
 		die("%s:\n%v", inputs[0], err)
 	}

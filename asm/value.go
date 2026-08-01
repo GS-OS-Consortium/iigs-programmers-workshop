@@ -16,12 +16,15 @@ type term struct {
 	name   string // original symbol name for resolved labels (may be "")
 	symOff int64  // the symbol's own offset (to recover addends by name)
 	viaFwd bool   // reference was forward (symbol undefined when referenced)
+	atSeq  int64  // definition counter when the forward reference was made
 }
 
 type Val struct {
 	C   int64
 	Pos []term
 	Neg []term
+	// defSeq orders definitions of duplicated labels (see asmState.symSeq).
+	defSeq int64
 }
 
 func num(c int64) Val { return Val{C: c} }

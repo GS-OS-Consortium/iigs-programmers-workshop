@@ -5,11 +5,13 @@ import "encoding/binary"
 // Segment is one assembled OMF segment: header parameters plus the finished
 // record stream (which already ends with the END record).
 type Segment struct {
-	Name     string
-	LoadName string
-	Org      int64
-	Length   int64
-	Records  []byte
+	Name       string
+	LoadName   string
+	Org        int64
+	TempOrg    int64
+	HasTempOrg bool
+	Length     int64
+	Records    []byte
 }
 
 // Object is a finished assembly: one segment per PROC.
@@ -35,6 +37,9 @@ func (s *Segment) writeSeg(segNum int) []byte {
 		name = name[:255]
 	}
 	dispName := 0x2C
+	if s.HasTempOrg {
+		dispName = 0x30 // OMF v2.1: TEMPORG occupies $2C..$2F
+	}
 	dispData := dispName + 10 + 1 + len(name)
 	byteCnt := dispData + len(s.Records)
 
@@ -50,8 +55,12 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	le.PutUint32(hdr[0x18:], uint32(s.Org))    // ORG
 	le.PutUint32(hdr[0x1C:], 0)                // ALIGN
 	hdr[0x20] = 0                              // NUMSEX
-	le.PutUint16(hdr[0x22:], uint16(segNum))   // SEGNUM
-	le.PutUint32(hdr[0x24:], 0)                // ENTRY
+	if s.HasTempOrg {
+		hdr[0x21] = 1 // v2.1 marker (oracle-verified)
+		le.PutUint32(hdr[0x2C:], uint32(s.TempOrg))
+	}
+	le.PutUint16(hdr[0x22:], uint16(segNum)) // SEGNUM
+	le.PutUint32(hdr[0x24:], 0)              // ENTRY
 	le.PutUint16(hdr[0x28:], uint16(dispName))
 	le.PutUint16(hdr[0x2A:], uint16(dispData))
 	ln := s.LoadName

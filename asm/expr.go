@@ -275,6 +275,18 @@ func (p *exprParser) parseUnary() (Val, error) {
 		p.pos++
 		return v, nil
 	}
+	// ≈ is the MPW assembler's one's-complement operator
+	if strings.HasPrefix(p.s[p.pos:], "≈") {
+		p.pos += len("≈")
+		v, err := p.parseUnary()
+		if err != nil {
+			return Val{}, err
+		}
+		if !v.isNum() {
+			return Val{}, fmt.Errorf("cannot complement a label")
+		}
+		return num(^v.C), nil
+	}
 	return p.parseTerm()
 }
 
