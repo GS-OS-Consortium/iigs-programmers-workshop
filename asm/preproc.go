@@ -653,10 +653,15 @@ func (pp *ppState) condEval(s string) bool {
 	if up := strings.ToUpper(s); strings.HasSuffix(up, "THEN") {
 		s = strings.TrimSpace(s[:len(s)-4])
 	}
-	// A bare "IF Symbol THEN" tests the symbol's value; anything after the
-	// expression on the line is commentary.
-	if !strings.ContainsAny(s, "=<>") {
-		s = operandOnly(s)
+	// A bare "IF expr THEN" tests the value; anything after the expression is
+	// commentary. Word operators keep their operand.
+	if !strings.ContainsAny(s, "=<>≠≤≥") {
+		f := strings.Fields(s)
+		if len(f) > 1 && strings.EqualFold(f[0], "not") {
+			s = f[0] + " " + f[1]
+		} else {
+			s = operandOnly(s)
+		}
 	}
 	lhs, op, rhs := splitCompare(s)
 	if op == "" && strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {

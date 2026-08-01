@@ -14,6 +14,7 @@ const (
 	recLconst = 0xF2
 	recLexpr  = 0xF3
 	recBexpr  = 0xED
+	recExpr   = 0xEB // general expression (more than one label term)
 )
 
 // segEmitter builds a segment's record stream with the original assembler's
@@ -87,6 +88,48 @@ func (e *segEmitter) expr(rec byte, size int, segName string, disp int64, shift 
 		e.recs = append(e.recs, 0x81, b[0], b[1], b[2], b[3], 0x07)
 	}
 	e.recs = append(e.recs, recEnd)
+}
+
+// exprGeneral emits a general EXPR record for a value that does not reduce
+// to a single label plus a constant (e.g. the difference of labels in two
+// different segments). The body is an RPN token stream: $83 pushes a label,
+// $81 pushes a constant, $01 adds, $02 subtracts, $00 ends.
+func (e *segEmitter) exprGeneral(size int, pos, neg []string, c int64) {
+	e.flush()
+	body := []byte{}
+	pushLabel := func(name string) {
+		body = append(body, 0x83, byte(len(name)))
+		body = append(body, name...)
+	}
+	pushConst := func(v int64) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(v))
+		body = append(body, 0x81, b[0], b[1], b[2], b[3])
+	}
+	first := true
+	for _, n := range pos {
+		pushLabel(n)
+		if !first {
+			body = append(body, 0x01)
+		}
+		first = false
+	}
+	if first { // no positive label terms: start from the constant
+		pushConst(c)
+		c = 0
+		first = false
+	}
+	for _, n := range neg {
+		pushLabel(n)
+		body = append(body, 0x02)
+	}
+	if c != 0 {
+		pushConst(c)
+		body = append(body, 0x01)
+	}
+	body = append(body, recEnd)
+	e.recs = append(e.recs, recExpr, byte(size))
+	e.recs = append(e.recs, body...)
 }
 
 func (e *segEmitter) end() []byte {
@@ -163,11 +206,17 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		}
 		v = next
 	}
-	v = v.cancel()
-	if len(v.Neg) > 0 || len(v.Pos) > 1 {
-		return Val{}, fmt.Errorf("expression does not reduce to label+constant")
+	return v.cancel(), nil
+}
+
+// termNames maps resolved terms to the names an expression record uses.
+func (st *asmState) termNames(ts []term) []string {
+	var out []string
+	for _, t := range ts {
+		n, _ := st.exprRef(t, 0, -1) // -1: never the "current" segment
+		out = append(out, n)
 	}
-	return v, nil
+	return out
 }
 
 // nextDef returns the first definition of name made after seq (a one-pass
@@ -272,6 +321,10 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
+			if len(t.Pos)+len(t.Neg) > 1 {
+				e.exprGeneral(a.size, st.termNames(t.Pos), st.termNames(t.Neg), t.C)
+				continue
+			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
 			e.expr(a.rec, a.size, nm, disp, a.shift)
 		case aExpr:
@@ -287,6 +340,10 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 					b = append(b, byte(c>>(8*i)))
 				}
 				e.bytes(b)
+				continue
+			}
+			if len(t.Pos)+len(t.Neg) > 1 {
+				e.exprGeneral(a.size, st.termNames(t.Pos), st.termNames(t.Neg), t.C)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)

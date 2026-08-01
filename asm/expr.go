@@ -289,6 +289,32 @@ func (p *exprParser) parseUnary() (Val, error) {
 		p.pos++
 		return v, nil
 	}
+	// word-form logical/bitwise operators
+	rest := p.s[p.pos:]
+	for _, w := range []struct {
+		kw string
+		f  func(int64) int64
+	}{
+		{"not", func(v int64) int64 {
+			if v == 0 {
+				return 1
+			}
+			return 0
+		}},
+	} {
+		if len(rest) > len(w.kw) && strings.EqualFold(rest[:len(w.kw)], w.kw) &&
+			(rest[len(w.kw)] == ' ' || rest[len(w.kw)] == '\t' || rest[len(w.kw)] == '(') {
+			p.pos += len(w.kw)
+			v, err := p.parseUnary()
+			if err != nil {
+				return Val{}, err
+			}
+			if !v.isNum() {
+				return Val{}, fmt.Errorf("%s requires a constant operand", w.kw)
+			}
+			return num(w.f(v.C)), nil
+		}
+	}
 	// ≈ is the MPW assembler's one's-complement operator
 	if strings.HasPrefix(p.s[p.pos:], "≈") {
 		p.pos += len("≈")
@@ -410,4 +436,9 @@ func hexVal(c byte) int {
 func isSymStart(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '@' || c == '&' || c == '~'
 }
-func isSymChar(c byte) bool { return isSymStart(c) || c >= '0' && c <= '9' || c == '.' }
+
+// '$' may appear inside an identifier (e.g. cmd_$802A); it only introduces a
+// hex constant at the start of a term.
+func isSymChar(c byte) bool {
+	return isSymStart(c) || c >= '0' && c <= '9' || c == '.' || c == '$'
+}

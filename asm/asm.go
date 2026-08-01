@@ -245,7 +245,12 @@ func AssembleFile(path string, incDirs ...string) (*Object, error) {
 func AssembleFileOpts(path string, incDirs, defines []string) (*Object, error) {
 	st := newState()
 	st.pp.incDirs = incDirs
+	// A single -d flag may carry a comma-separated list, e.g. "-d &type,type=0"
+	var flat []string
 	for _, d := range defines {
+		flat = append(flat, strings.Split(d, ",")...)
+	}
+	for _, d := range flat {
 		name, val, ok := strings.Cut(d, "=")
 		if !ok {
 			val = "1"
@@ -423,15 +428,24 @@ func (st *asmState) doLine(l line) {
 		if r := operandOnly(l.rest); r != "" {
 			// "RECORD start[,increment|decrement]": decrement grows fields
 			// downward from the start offset
-			parts := splitArgs(r)
-			if len(parts) > 1 {
-				st.recDown = strings.EqualFold(strings.TrimSpace(parts[1]), "decrement")
-			}
-			n, err := evalNum(strings.TrimSpace(parts[0]), &exprCtx{st: st})
-			if err != nil {
-				st.errf("RECORD: %v", err)
-			} else {
-				v = n
+			for i, part := range splitArgs(r) {
+				part = strings.TrimSpace(part)
+				switch strings.ToLower(part) {
+				case "decrement":
+					st.recDown = true
+					continue
+				case "increment", "export", "private", "entry", "":
+					continue // attributes: no effect on field offsets
+				}
+				if i > 0 {
+					continue
+				}
+				n, err := evalNum(part, &exprCtx{st: st})
+				if err != nil {
+					st.errf("RECORD: %v", err)
+				} else {
+					v = n
+				}
 			}
 		}
 		st.recPC = v
@@ -1000,8 +1014,8 @@ func (st *asmState) doInst(mn, operand string) {
 			st.errf("%s: need two operands", mn)
 			return
 		}
-		src, err1 := evalNum(parts[0], &exprCtx{st: st})
-		dst, err2 := evalNum(parts[1], &exprCtx{st: st})
+		src, err1 := evalNumLenient(parts[0], &exprCtx{st: st})
+		dst, err2 := evalNumLenient(parts[1], &exprCtx{st: st})
 		if err1 != nil || err2 != nil {
 			st.errf("%s: bad operands", mn)
 			return
