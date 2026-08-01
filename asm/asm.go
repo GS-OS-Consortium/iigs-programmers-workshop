@@ -97,7 +97,11 @@ type asmState struct {
 	inRecord bool
 	recPC    int64
 	recName  string // RECORD label, for qualified RECORD.FIELD references
-	recDown  bool   // RECORD ...,decrement: fields grow downward
+	// recSize/recFields describe finished RECORD templates so that
+	// "label DS <record>" can reserve the right size and alias the fields.
+	recSize   map[string]int64
+	recFields map[string]map[string]int64
+	recDown   bool // RECORD ...,decrement: fields grow downward
 
 	// preprocessor state (conditionals, macros, set-vars) lives in preproc.go
 	pp *ppState
@@ -180,6 +184,28 @@ func (st *asmState) define(name string, v Val) {
 	st.defSeq++
 	v.defSeq = st.defSeq
 	st.symSeq[key] = append(st.symSeq[key], v)
+}
+
+// symbolList splits an IMPORT/EXPORT operand into its symbols. The list may
+// be parenthesized with the type applying to all of them, as in
+// "import (InitParm,TitLine):code".
+func symbolList(rest string) []string {
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "(") {
+		return splitArgs(rest)
+	}
+	end := strings.Index(rest, ")")
+	if end < 0 {
+		return splitArgs(rest)
+	}
+	kind := strings.TrimPrefix(strings.TrimSpace(rest[end+1:]), ":")
+	var out []string
+	for _, n := range splitArgs(rest[1:end]) {
+		if n = strings.TrimSpace(n); n != "" {
+			out = append(out, n+":"+kind)
+		}
+	}
+	return out
 }
 
 // redefine assigns a SET symbol. Unlike define it replaces the symbol's value
@@ -348,6 +374,8 @@ func newState() *asmState {
 		entries:   map[string]bool{},
 		entryPriv: map[string]byte{},
 		fileWide:  map[string]bool{},
+		recSize:   map[string]int64{},
+		recFields: map[string]map[string]int64{},
 		entryEqu:  map[string]bool{},
 		loadName:  "main",
 	}
@@ -568,15 +596,25 @@ func (st *asmState) doLine(l line) {
 		st.loadName = name
 		return
 	case "import":
-		for _, a := range splitArgs(operandOnly(l.rest)) {
-			// strip an optional :TYPE suffix
-			nm := strings.ToUpper(strings.TrimSpace(strings.SplitN(a, ":", 2)[0]))
+		for _, a := range symbolList(operandOnly(l.rest)) {
+			name, kind, _ := strings.Cut(a, ":")
+			nm := strings.ToUpper(strings.TrimSpace(name))
 			if nm == "" {
 				continue
 			}
 			st.imports[nm] = true // union, for resolve()
 			if st.cur != nil {
 				st.cur.imports[nm] = true
+			}
+			// The ":TYPE" suffix may name a RECORD template, which makes the
+			// external symbol's fields reachable as NAME.FIELD (Start.aii
+			// does "import FSTInfoParms:tFSTInfo" then "FSTInfoParms.fst_num").
+			rec := strings.ToUpper(strings.TrimSpace(kind))
+			for f, off := range st.recFields[rec] {
+				v := fwdVal(nm)
+				v.C = off
+				st.define(nm+"."+f, v)
+				st.fileWide[nm+"."+f] = true
 			}
 		}
 		return
@@ -588,7 +626,7 @@ func (st *asmState) doLine(l line) {
 		if op == "entry" {
 			priv = 1
 		}
-		for _, a := range splitArgs(operandOnly(l.rest)) {
+		for _, a := range symbolList(operandOnly(l.rest)) {
 			// optional ":TYPE" suffix, e.g. "cmd_tbl:data" or "c_len_len:EQU"
 			name, kind, _ := strings.Cut(a, ":")
 			nm := strings.ToUpper(strings.TrimSpace(name))
@@ -635,6 +673,20 @@ func (st *asmState) doLine(l line) {
 		}
 		if l.label != "" {
 			st.defineCodeLabel(l.label)
+		}
+		// "POpen ds openParms" reserves one instance of a RECORD template and
+		// makes its fields reachable as POpen.field.
+		if rec := strings.ToUpper(operandOnly(l.rest)); st.recSize[rec] != 0 {
+			base := st.pc
+			if l.label != "" {
+				for f, off := range st.recFields[rec] {
+					st.define(strings.ToUpper(l.label)+"."+f,
+						segVal(st.curSegIndex(), base+off))
+				}
+			}
+			st.addAction(action{kind: aDS, count: st.recSize[rec]})
+			st.pc += st.recSize[rec]
+			return
 		}
 		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
@@ -714,9 +766,16 @@ func (st *asmState) openSegment(seg *segState) {
 }
 
 func (st *asmState) defineCodeLabel(name string) {
+	// Storage declared between PROCs (an included .storage file, say) belongs
+	// to no segment's scope, so it stays visible file-wide even though the
+	// bytes land in whichever segment is resumed.
+	outside := st.cur == nil
 	if !st.resumeSegment() {
 		st.errf("label %q outside PROC", name)
 		return
+	}
+	if outside {
+		st.fileWide[strings.ToUpper(name)] = true
 	}
 	st.define(name, segVal(st.curSegIndex(), st.pc))
 	u := strings.ToUpper(name)
@@ -755,12 +814,21 @@ func (st *asmState) doRecordLine(op string, l line) {
 		st.define(name, v)
 		if st.recName != "" && name != "" {
 			st.define(st.recName+"."+strings.ToUpper(name), v)
+			if v.isNum() {
+				if st.recFields[st.recName] == nil {
+					st.recFields[st.recName] = map[string]int64{}
+				}
+				st.recFields[st.recName][strings.ToUpper(name)] = v.C
+			}
 		}
 	}
 	switch op {
 	case "endr", "endp", "end":
 		// MPW closes a RECORD template with ENDR or ENDP (both appear in the
 		// GS/OS sources); END closes everything.
+		if st.recName != "" {
+			st.recSize[st.recName] = st.recPC
+		}
 		st.inRecord = false
 		st.recName = ""
 		if op == "end" {

@@ -47,6 +47,8 @@ type ppState struct {
 	incDirs []string
 	// mexit is set by MEXIT to stop expanding the current macro body
 	mexit bool
+	// gotoTarget is the sequence symbol a GOTO is skipping forward to
+	gotoTarget string
 }
 
 func newPP(st *asmState) *ppState {
@@ -151,14 +153,13 @@ func (pp *ppState) processSource(src, path string) {
 		// A trailing '\' continues the statement on the next line (the
 		// driver sources wrap long expressions this way). The marker sits
 		// before any comment, so comments are removed first.
-		if body := stripAsmComment(raw); strings.HasSuffix(strings.TrimRight(body, " \t"), "\\") {
-			joined := strings.TrimSuffix(strings.TrimRight(body, " \t"), "\\")
+		if body, cont := splitContinuation(stripAsmComment(raw)); cont {
+			joined := body
 			for n+1 < len(lines) {
 				next := stripAsmComment(lines[n+1])
 				n++
-				trimmed := strings.TrimRight(next, " \t")
-				if strings.HasSuffix(trimmed, "\\") {
-					joined = joinContinuation(joined, strings.TrimSuffix(trimmed, "\\"))
+				if body, cont := splitContinuation(next); cont {
+					joined = joinContinuation(joined, body)
 					continue
 				}
 				joined = joinContinuation(joined, next)
@@ -169,6 +170,26 @@ func (pp *ppState) processSource(src, path string) {
 		pp.processLine(raw)
 	}
 	st.curFile, st.curLine = prevFile, prevLine
+}
+
+// splitContinuation reports whether a line is continued, returning the text
+// before the '\'. Apple's own note in DOS3.3.FST says it: "The presence of
+// comments after the line continuation character (\) is NOT officially
+// supported by the MAX assembler but works fine for version 1.1d9" -- so
+// anything after the marker is commentary, not part of the statement.
+func splitContinuation(s string) (string, bool) {
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			inStr = !inStr
+		case '\\':
+			if !inStr {
+				return strings.TrimRight(s[:i], " \t"), true
+			}
+		}
+	}
+	return s, false
 }
 
 // joinContinuation appends a '\'-continued line to what came before it.
@@ -189,6 +210,25 @@ func joinContinuation(acc, next string) string {
 	}
 	return acc + " " + next
 }
+
+// splitIfGoto separates "cond GOTO .sym" into its parts.
+func splitIfGoto(rest string) (cond, target string, ok bool) {
+	up := strings.ToUpper(rest)
+	i := strings.Index(up, "GOTO")
+	if i < 0 {
+		return "", "", false
+	}
+	if i > 0 && !isSpaceByte(rest[i-1]) {
+		return "", "", false
+	}
+	target = strings.TrimSpace(operandOnly(strings.TrimSpace(rest[i+4:])))
+	if !strings.HasPrefix(target, ".") {
+		return "", "", false
+	}
+	return strings.TrimSpace(rest[:i]), target, true
+}
+
+func isSpaceByte(c byte) bool { return c == ' ' || c == '\t' }
 
 func (pp *ppState) processLine(raw string) {
 	st := pp.st
@@ -218,6 +258,27 @@ func (pp *ppState) processLine(raw string) {
 	l := splitLine(raw)
 	op := strings.ToLower(l.op)
 
+	// A GOTO skips forward to the line whose label field holds the matching
+	// sequence symbol (".tl1"); everything in between is not assembled. The
+	// target line itself still is -- ".a phb" both marks the target and
+	// assembles an instruction.
+	if pp.gotoTarget != "" {
+		if !strings.EqualFold(l.label, pp.gotoTarget) {
+			return
+		}
+		pp.gotoTarget = ""
+	}
+	// A sequence symbol is a branch target for GOTO, not a program label.
+	if strings.HasPrefix(l.label, ".") {
+		raw = strings.Repeat(" ", len(l.label)) + raw[len(l.label):]
+		l = splitLine(raw)
+		op = strings.ToLower(l.op)
+	}
+	if op == "goto" || op == "ago" {
+		pp.gotoTarget = strings.TrimSpace(operandOnly(pp.subst(l.rest)))
+		return
+	}
+
 	// MEXIT leaves the macro body early (MEND still closes the definition).
 	if op == "mexit" && pp.active() {
 		pp.mexit = true
@@ -229,6 +290,13 @@ func (pp *ppState) processLine(raw string) {
 	case "if":
 		if !pp.active() {
 			pp.conds = append(pp.conds, condFrame{parentActive: false})
+			return
+		}
+		// "IF cond GOTO .sym" branches instead of opening a block.
+		if cond, target, ok := splitIfGoto(pp.subst(l.rest)); ok {
+			if pp.condEval(cond) {
+				pp.gotoTarget = target
+			}
 			return
 		}
 		v := pp.condEval(pp.subst(l.rest))
