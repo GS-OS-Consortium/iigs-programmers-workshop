@@ -8,7 +8,6 @@ package asm
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -93,10 +92,21 @@ type asmState struct {
 	cur      *segState
 	pc       int64
 
+	// pendingRecs holds records produced before any segment exists (an
+	// "export k:equ" whose equate sits at file scope); the original puts them
+	// at the head of the first segment.
+	pendingRecs [][]byte
+
+	// scopeSeg overrides the symbol scope during pass 2, when st.cur no
+	// longer reflects the segment a deferred expression came from (-1 = use
+	// the current segment).
+	scopeSeg int
+
 	// RECORD ... ENDR template mode
 	inRecord bool
 	recPC    int64
 	recName  string // RECORD label, for qualified RECORD.FIELD references
+	recHigh  int64  // highest offset reached, for a bare ORG "reset to max"
 	// recSize/recFields describe finished RECORD templates so that
 	// "label DS <record>" can reserve the right size and alias the fields.
 	recSize   map[string]int64
@@ -127,6 +137,9 @@ func (st *asmState) curSegIndex() int { return len(st.segs) - 1 }
 // template defines offsets, not storage), the fields of a RECORD data
 // segment, and anything published with ENTRY/EXPORT.
 func (st *asmState) scopePrefix() string {
+	if st.scopeSeg >= 0 {
+		return fmt.Sprintf("%d\x00", st.scopeSeg)
+	}
 	if st.cur == nil || st.inRecord || st.cur.kind == 0x4001 {
 		return ""
 	}
@@ -287,6 +300,10 @@ func splitLine(s string) line {
 
 // operandOnly trims a trailing bare comment: the operand field ends at the
 // first whitespace outside quotes/parens/brackets.
+//
+// An operand that is syntactically incomplete continues past the blanks --
+// "entry alloc_mem,<tab>do_alloc" is one list, and "|mode.page_number +x" is
+// one expression. Only a blank that follows a complete operand ends the field.
 func operandOnly(s string) string {
 	depth := 0
 	inStr := false
@@ -303,12 +320,27 @@ func operandOnly(s string) string {
 				depth--
 			}
 		case ' ', '\t':
-			if !inStr && depth == 0 {
-				return s[:i]
+			if inStr || depth != 0 {
+				continue
 			}
+			// look past a run of blanks to the last real character
+			j := i
+			for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t') {
+				j--
+			}
+			if j > 0 && continuesOperand(s[j-1]) {
+				continue
+			}
+			return s[:i]
 		}
 	}
 	return s
+}
+
+// continuesOperand reports whether an operand ending in c is incomplete, so
+// that following blanks are separators rather than the end of the field.
+func continuesOperand(c byte) bool {
+	return strings.IndexByte(",+-*/&|^<>=", c) >= 0
 }
 
 // ---------- entry points ----------
@@ -374,6 +406,7 @@ func newState() *asmState {
 		entries:   map[string]bool{},
 		entryPriv: map[string]byte{},
 		fileWide:  map[string]bool{},
+		scopeSeg:  -1,
 		recSize:   map[string]int64{},
 		recFields: map[string]map[string]int64{},
 		entryEqu:  map[string]bool{},
@@ -417,10 +450,12 @@ func (st *asmState) doLine(l line) {
 	}
 
 	switch op {
-	case "proc":
+	case "proc", "func":
+		// FUNC is PROC under another name: the original emits the same
+		// KIND $4000 segment for both.
 		name := strings.ToUpper(l.label)
 		if name == "" {
-			st.errf("PROC requires a label")
+			st.errf("%s requires a label", strings.ToUpper(op))
 			return
 		}
 		seg := &segState{name: name, loadName: st.loadName, imports: map[string]bool{}}
@@ -435,15 +470,15 @@ func (st *asmState) doLine(l line) {
 			kw := strings.ToLower(f[0])
 			if len(f) == 1 {
 				switch kw {
-				case "export", "private", "entry", "dynamic":
+				case "export", "private", "entry", "dynamic", "skip", "noskip":
 					continue // no effect on the emitted object
 				}
-				st.errf("unsupported PROC operand %q", opt)
+				st.errf("unsupported %s operand %q", strings.ToUpper(op), opt)
 				continue
 			}
 			v, err := evalNum(strings.Join(f[1:], " "), &exprCtx{st: st})
 			if err != nil {
-				st.errf("PROC %s: %v", f[0], err)
+				st.errf("%s %s: %v", strings.ToUpper(op), f[0], err)
 				continue
 			}
 			switch kw {
@@ -455,12 +490,12 @@ func (st *asmState) doLine(l line) {
 			case "align":
 				seg.align = v
 			default:
-				st.errf("unsupported PROC operand %q", opt)
+				st.errf("unsupported %s operand %q", strings.ToUpper(op), opt)
 			}
 		}
 		st.openSegment(seg)
 		return
-	case "endp", "endproc":
+	case "endp", "endproc", "endf":
 		if st.cur != nil {
 			st.cur.endPC = st.pc
 		}
@@ -508,7 +543,12 @@ func (st *asmState) doLine(l line) {
 		}
 		st.define(l.label, v)
 		if u := strings.ToUpper(l.label); st.entryEqu[u] && v.isNum() {
-			st.addAction(action{kind: aRec, bytes: gequRec(u, st.entryPriv[u], v.C)})
+			rec := gequRec(u, st.entryPriv[u], v.C)
+			if st.cur == nil && len(st.segs) == 0 {
+				st.pendingRecs = append(st.pendingRecs, rec)
+			} else {
+				st.addAction(action{kind: aRec, bytes: rec})
+			}
 		}
 		return
 	case "aerror":
@@ -550,6 +590,7 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		st.inRecord = true
+		st.recHigh = v
 		st.recPC = v
 		st.recName = strings.ToUpper(l.label)
 		if l.label != "" {
@@ -584,7 +625,7 @@ func (st *asmState) doLine(l line) {
 		return
 	case "title", "eject", "print", "space", "page", "pagesize", "blanks",
 		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl",
-		"datachk":
+		"datachk", "codechk":
 		return // listing/diagnostic control: no object-file effect
 	case "with", "endwith":
 		return // record fields are defined globally here
@@ -641,8 +682,8 @@ func (st *asmState) doLine(l line) {
 			}
 		}
 		return
-	case "writeln":
-		fmt.Fprintln(os.Stderr, l.rest)
+	case "write", "writeln", "writehex":
+		// listing-directed output; no effect on the object
 		return
 	case "org":
 		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
@@ -759,6 +800,10 @@ func (st *asmState) openSegment(seg *segState) {
 	st.segs = append(st.segs, seg)
 	st.cur = seg
 	st.pc = 0
+	for _, rec := range st.pendingRecs {
+		seg.actions = append(seg.actions, action{kind: aRec, bytes: rec})
+	}
+	st.pendingRecs = nil
 	// The segment's own label names it, so the label stays visible to the
 	// whole file even though the labels inside it do not.
 	st.fileWide[seg.name] = true
@@ -823,7 +868,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 		}
 	}
 	switch op {
-	case "endr", "endp", "end":
+	case "endr", "endp", "endf", "end":
 		// MPW closes a RECORD template with ENDR or ENDP (both appear in the
 		// GS/OS sources); END closes everything.
 		if st.recName != "" {
@@ -836,10 +881,22 @@ func (st *asmState) doRecordLine(op string, l line) {
 		}
 		return
 	case "org":
+		// A bare ORG restores the location counter to its high-water mark,
+		// which is how overlapping ORG regions in a template are unioned.
+		if operandOnly(l.rest) == "" {
+			if st.recPC > st.recHigh {
+				st.recHigh = st.recPC
+			}
+			st.recPC = st.recHigh
+			return
+		}
 		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("RECORD ORG: %v", err)
 			return
+		}
+		if st.recPC > st.recHigh {
+			st.recHigh = st.recPC
 		}
 		st.recPC = v
 		return
@@ -865,13 +922,16 @@ func (st *asmState) doRecordLine(op string, l line) {
 			st.recPC += n * size
 		}
 		return
-	case "equ":
+	case "equ", "set":
 		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
-			st.errf("EQU: %v", err)
+			st.errf("%s: %v", strings.ToUpper(op), err)
 			return
 		}
-		st.define(l.label, v)
+		// An equate inside a template is reachable as RECORD.NAME too --
+		// DP.a ends with "dir_page_size equ *" and Data.a reserves
+		// "DirectPage.dir_page_size+2" bytes from it.
+		defField(l.label, v)
 		return
 	case "", "anop":
 		if l.label != "" {

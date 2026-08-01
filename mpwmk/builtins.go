@@ -186,26 +186,71 @@ func (e *Env) runAsm(args []string) error {
 	return os.WriteFile(output, obj.WriteOMF(), 0644)
 }
 
+// linkSel resolves an input spec that may select one segment of an object
+// file: "{Object}scm.obj(@oscall_seg)".
+func (e *Env) linkSel(a string) (link.Sel, error) {
+	name, seg := a, ""
+	if i := strings.Index(a, "("); i >= 0 && strings.HasSuffix(a, ")") {
+		name, seg = a[:i], strings.TrimPrefix(a[i+1:len(a)-1], "@")
+	}
+	p := e.HostPath(name)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return link.Sel{}, err
+	}
+	f, err := omf.Parse(data)
+	if err != nil {
+		return link.Sel{}, fmt.Errorf("%s: %w", filepath.Base(p), err)
+	}
+	return link.Sel{File: f, Seg: seg}, nil
+}
+
 func (e *Env) runLink(args []string) error {
 	var inputs []string
 	var output string
+	var groups []link.Group
+	apw := false
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
 		case "-o":
 			i++
 			output = e.HostPath(args[i])
-		case "-t", "-at", "-org", "-lseg", "-lib", "-s":
+		case "-lseg":
+			// "-lseg NAME obj..." starts a named load segment
+			i++
+			groups = append(groups, link.Group{Name: args[i]})
+		case "-apw":
+			apw = true
+		case "-t", "-at", "-org", "-lib", "-s":
 			i++ // consume the option's argument (type/aux stamping is metadata)
-		case "-x", "-w", "-l", "-apw":
+		case "-x", "-w", "-l":
 		default:
 			if strings.HasPrefix(a, "-") {
 				return fmt.Errorf("linkiigs: unsupported option %q", a)
 			}
+			if len(groups) > 0 {
+				sel, err := e.linkSel(a)
+				if err != nil {
+					return fmt.Errorf("linkiigs: %w", err)
+				}
+				groups[len(groups)-1].Sels = append(groups[len(groups)-1].Sels, sel)
+				continue
+			}
 			inputs = append(inputs, e.HostPath(a))
 		}
 	}
-	if len(inputs) == 0 || output == "" {
+	if output == "" || (len(inputs) == 0 && len(groups) == 0) {
 		return fmt.Errorf("linkiigs: need inputs and -o output")
+	}
+	if len(groups) > 0 {
+		res, err := link.LinkGroups(groups, apw)
+		if err != nil {
+			return fmt.Errorf("linkiigs: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(output, res, 0644)
 	}
 	var objs []*omf.File
 	for _, p := range inputs {
@@ -260,6 +305,30 @@ func (e *Env) runMakeBin(args []string) error {
 	f, err := omf.Parse(data)
 	if err != nil {
 		return err
+	}
+	// A load file with several load segments becomes one .bin per segment:
+	// "scm.bin", "scm.bin.2", "scm.bin.3", ... which is how make.os then
+	// catenates the pieces of GS.OS together.
+	var segs []*omf.Segment
+	for i := range f.Segments {
+		if f.Segments[i].SegName != "~ExpressLoad" {
+			segs = append(segs, &f.Segments[i])
+		}
+	}
+	if len(segs) > 1 {
+		if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
+			return err
+		}
+		for i, s := range segs {
+			name := output
+			if i > 0 {
+				name = fmt.Sprintf("%s.%d", output, i+1)
+			}
+			if err := os.WriteFile(name, omf.SegmentImage(s), 0644); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	img, base := flatten(f, org)
 	_ = base

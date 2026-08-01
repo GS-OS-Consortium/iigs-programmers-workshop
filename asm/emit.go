@@ -327,8 +327,10 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes([]byte{byte(disp), byte(disp >> 8)})
 			}
 		case aDefer:
+			st.scopeSeg = a.segAt
 			v, err := evalExpr(a.expr, &exprCtx{st: st, overridePC: true,
 				pcOverride: a.pcAt, segOverride: a.segAt, absLabels: true})
+			st.scopeSeg = -1
 			if err != nil {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}

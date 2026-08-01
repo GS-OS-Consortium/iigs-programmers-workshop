@@ -7,6 +7,7 @@ package link
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"github.com/dagenbrock/iigs-tools/omf"
 )
@@ -28,6 +29,12 @@ type relocPatch struct {
 // which is what every GS/OS-era makefile default produces for single-file
 // links) into a load file.
 func Link(objs []*omf.File) ([]byte, error) {
+	// Object segments merge into load segments by their load name (the SEG
+	// directive). The loader is built from two -- 'Loader' and 'Loader_LC' --
+	// and becomes Loader.bin and Loader.bin.2.
+	if gs := groupByLoadName(objs); len(gs) > 1 {
+		return LinkGroups(gs, true)
+	}
 	// place object segments sequentially
 	var segs []*objSeg
 	byName := map[string]*objSeg{}
@@ -352,4 +359,211 @@ func relocRecords(patches []relocPatch) []byte {
 		out = append(out, body...)
 	}
 	return out
+}
+
+// ---------- multi-segment (-lseg) linking ----------
+
+// Group is one "-lseg NAME obj... obj(@seg)..." load segment: a name and the
+// object segments that make it up, in order.
+type Group struct {
+	Name string
+	Sels []Sel
+}
+
+// Sel selects a whole object file, or the segments carrying one load name
+// when Seg is set. The "file(@name)" form the GS/OS makefiles use to split
+// scm.obj across load segments names a SEG, not a PROC: "@oscall_seg" picks
+// up every segment assembled under "SEG 'oscall_seg'".
+type Sel struct {
+	File *omf.File
+	Seg  string // "" = every segment in the file
+}
+
+// LinkGroups links each group into its own load segment of one load file.
+// Symbols are resolved across all groups, so a reference from one load
+// segment to a label in another still finds it.
+//
+// apw selects the plain (APW) load-file form with no ~ExpressLoad segment.
+func LinkGroups(groups []Group, apw bool) ([]byte, error) {
+	_ = apw // a multi-segment file is always emitted in the plain form
+	type built struct {
+		name    string
+		image   []byte
+		org     int64
+		kind    uint16
+		patches []relocPatch
+	}
+
+	// First pass over every group: place segments and collect symbols. The
+	// images cannot be patched yet because a later group may define a symbol
+	// an earlier one references.
+	globals := map[string]int64{}
+	absolutes := map[string]int64{}
+	byName := map[string]*objSeg{}
+	var all [][]*objSeg
+	var out []built
+	for _, g := range groups {
+		b := built{name: g.Name}
+		var segs []*objSeg
+		for _, sel := range g.Sels {
+			for i := range sel.File.Segments {
+				s := &sel.File.Segments[i]
+				if sel.Seg != "" &&
+					!strings.EqualFold(strings.TrimRight(s.LoadName, " "), sel.Seg) &&
+					!strings.EqualFold(s.SegName, sel.Seg) {
+					continue
+				}
+				os := &objSeg{name: s.SegName, base: int64(len(b.image)), seg: s}
+				segs = append(segs, os)
+				byName[s.SegName] = os
+				if len(segs) == 1 {
+					b.org, b.kind = int64(s.Org), s.Kind
+				}
+				img, err := segImage(s)
+				if err != nil {
+					return nil, err
+				}
+				if err := collectSymbols(s, os.base, globals, absolutes); err != nil {
+					return nil, err
+				}
+				b.image = append(b.image, img...)
+			}
+		}
+		if len(segs) == 0 {
+			return nil, fmt.Errorf("load segment %q selected no object segments", g.Name)
+		}
+		all = append(all, segs)
+		out = append(out, b)
+	}
+
+	// Second pass: patch, now that every symbol is known.
+	for gi := range out {
+		b := &out[gi]
+		for _, os := range all[gi] {
+			pc := os.base
+			for _, r := range os.seg.Records {
+				switch {
+				case r.Op >= 0x01 && r.Op <= 0xDF:
+					pc += int64(r.Op)
+				case r.Op == omf.RecLconst, r.Op == omf.RecDS:
+					pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
+				case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
+					size := int(r.Raw[1])
+					val, shift, err := evalOMFExpr(r.Raw[2:], byName, globals, absolutes, os)
+					if err != nil {
+						return nil, fmt.Errorf("segment %s: %w", os.name, err)
+					}
+					if b.org != 0 {
+						v := b.org + val
+						if shift < 0 {
+							v >>= uint(-shift)
+						} else if shift > 0 {
+							v <<= uint(shift)
+						}
+						putLE(b.image[pc:], v, size)
+					} else {
+						putLE(b.image[pc:], val, size)
+						b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
+					}
+					pc += int64(size)
+				case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
+				default:
+					return nil, fmt.Errorf("segment %s: unsupported record %s in linker",
+						os.name, omf.RecName(r.Op))
+				}
+			}
+		}
+	}
+
+	var file []byte
+	for i := range out {
+		b := &out[i]
+		file = append(file, loadSegment(b.name, i+1, b.image, b.org, b.kind, b.patches)...)
+	}
+	return file, nil
+}
+
+// collectSymbols records a segment's GLOBAL and GEQU definitions.
+func collectSymbols(s *omf.Segment, base int64, globals, absolutes map[string]int64) error {
+	off := base
+	for _, r := range s.Records {
+		switch {
+		case r.Op >= 0x01 && r.Op <= 0xDF:
+			off += int64(r.Op)
+		case r.Op == omf.RecLconst, r.Op == omf.RecDS:
+			off += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
+		case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr:
+			off += int64(r.Raw[1])
+		case r.Op == omf.RecGlobal:
+			n := int(r.Raw[1])
+			globals[string(r.Raw[2:2+n])] = off
+		case r.Op == omf.RecGequ:
+			n := int(r.Raw[1])
+			v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil)
+			if err != nil {
+				return fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
+			}
+			absolutes[string(r.Raw[2:2+n])] = v
+		}
+	}
+	return nil
+}
+
+// loadSegment emits one load-file segment carrying image plus its relocations.
+func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, patches []relocPatch) []byte {
+	le := binary.LittleEndian
+	dispData := mainDispName + 10 + 1 + len(name)
+	relocBytes := relocRecords(patches)
+	byteCnt := dispData + len(image) + 5 + len(relocBytes) + 1
+
+	hdr := make([]byte, dispData)
+	le.PutUint32(hdr[0x00:], uint32(byteCnt))
+	le.PutUint32(hdr[0x08:], uint32(len(image)))
+	hdr[0x0E] = 4
+	hdr[0x0F] = 2
+	le.PutUint32(hdr[0x10:], 0x10000)
+	le.PutUint16(hdr[0x14:], kind)
+	le.PutUint32(hdr[0x18:], uint32(org))
+	le.PutUint16(hdr[0x22:], uint16(segNum))
+	le.PutUint16(hdr[0x28:], uint16(mainDispName))
+	le.PutUint16(hdr[0x2A:], uint16(dispData))
+	hdr[mainDispName+10] = byte(len(name))
+	copy(hdr[mainDispName+11:], name)
+
+	out := append([]byte(nil), hdr...)
+	out = append(out, 0xF2)
+	var cnt [4]byte
+	le.PutUint32(cnt[:], uint32(len(image)))
+	out = append(out, cnt[:]...)
+	out = append(out, image...)
+	out = append(out, relocBytes...)
+	return append(out, 0x00)
+}
+
+// groupByLoadName splits objects into one group per distinct load name, in
+// the order the names first appear.
+func groupByLoadName(objs []*omf.File) []Group {
+	var order []string
+	seen := map[string]bool{}
+	for _, f := range objs {
+		for i := range f.Segments {
+			n := strings.TrimRight(f.Segments[i].LoadName, " ")
+			if !seen[n] {
+				seen[n] = true
+				order = append(order, n)
+			}
+		}
+	}
+	if len(order) <= 1 {
+		return nil
+	}
+	var gs []Group
+	for _, n := range order {
+		g := Group{Name: n}
+		for _, f := range objs {
+			g.Sels = append(g.Sels, Sel{File: f, Seg: n})
+		}
+		gs = append(gs, g)
+	}
+	return gs
 }

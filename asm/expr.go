@@ -101,6 +101,18 @@ func (p *exprParser) peek2() string {
 	return ""
 }
 
+// peekWord reports whether the next token is the given word operator,
+// delimited so that a symbol such as ANDMASK is not mistaken for one.
+func (p *exprParser) peekWord(w string) bool {
+	if p.pos+len(w) > len(p.s) || !strings.EqualFold(p.s[p.pos:p.pos+len(w)], w) {
+		return false
+	}
+	if j := p.pos + len(w); j < len(p.s) && isSymChar(p.s[j]) {
+		return false
+	}
+	return p.pos == 0 || !isSymChar(p.s[p.pos-1])
+}
+
 func (p *exprParser) parseAdd() (Val, error) {
 	v, err := p.parseShift()
 	if err != nil {
@@ -109,6 +121,33 @@ func (p *exprParser) parseAdd() (Val, error) {
 	for {
 		p.skipWS()
 		switch {
+		case p.peekWord("AND"): // word forms of the bitwise operators
+			p.pos += 3
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOp("AND", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peekWord("OR"):
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOp("OR", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peekWord("EOR"), p.peekWord("XOR"):
+			p.pos += 3
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOp("EOR", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
+				return Val{}, err
+			}
 		case p.peek2() == "--": // bitwise XOR (MPW asm)
 			p.pos += 2
 			r, err := p.parseShift()

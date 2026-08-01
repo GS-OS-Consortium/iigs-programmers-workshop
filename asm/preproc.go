@@ -49,6 +49,11 @@ type ppState struct {
 	mexit bool
 	// gotoTarget is the sequence symbol a GOTO is skipping forward to
 	gotoTarget string
+	// whileCond/whileBody capture a WHILE ... ENDWHILE macro loop
+	whileCond  string
+	whileBody  []string
+	whileDepth int
+	inWhile    bool
 }
 
 func newPP(st *asmState) *ppState {
@@ -230,6 +235,24 @@ func splitIfGoto(rest string) (cond, target string, ok bool) {
 
 func isSpaceByte(c byte) bool { return c == ' ' || c == '\t' }
 
+// runWhile executes a captured WHILE body until its condition goes false.
+func (pp *ppState) runWhile() {
+	cond, body := pp.whileCond, pp.whileBody
+	pp.inWhile, pp.whileCond, pp.whileBody = false, "", nil
+	for n := 0; pp.condEval(pp.subst(cond)); n++ {
+		if n > 100000 {
+			pp.st.errf("WHILE %s: loop does not terminate", cond)
+			return
+		}
+		for _, bl := range body {
+			if pp.st.ended {
+				return
+			}
+			pp.processLine(bl)
+		}
+	}
+}
+
 func (pp *ppState) processLine(raw string) {
 	st := pp.st
 	if st.ended {
@@ -257,6 +280,40 @@ func (pp *ppState) processLine(raw string) {
 
 	l := splitLine(raw)
 	op := strings.ToLower(l.op)
+
+	// WHILE cond DO ... ENDWHILE: capture the body, then run it while the
+	// condition holds. The gsos HEX macro walks a string this way.
+	if pp.inWhile {
+		switch op {
+		case "while":
+			pp.whileDepth++
+		case "endwhile":
+			if pp.whileDepth > 0 {
+				pp.whileDepth--
+			} else {
+				pp.runWhile()
+				return
+			}
+		}
+		pp.whileBody = append(pp.whileBody, raw)
+		return
+	}
+	if op == "while" && pp.active() {
+		cond := strings.TrimSpace(l.rest)
+		if up := strings.ToUpper(cond); strings.HasSuffix(up, "DO") {
+			cond = strings.TrimSpace(cond[:len(cond)-2])
+		}
+		pp.whileCond, pp.whileBody, pp.inWhile = cond, nil, true
+		return
+	}
+	if op == "endwhile" {
+		// A WHILE inside an inactive conditional was skipped, so its ENDWHILE
+		// is skipped too rather than reported.
+		if pp.active() {
+			st.errf("ENDWHILE without WHILE")
+		}
+		return
+	}
 
 	// A GOTO skips forward to the line whose label field holds the matching
 	// sequence symbol (".tl1"); everything in between is not assembled. The
@@ -362,8 +419,10 @@ func (pp *ppState) processLine(raw string) {
 			st.errf("INCLUDE %s: %v", spec, err)
 		}
 		return
-	case "writeln":
-		fmt.Fprintln(os.Stderr, pp.subst(l.rest))
+	case "write", "writeln", "writehex":
+		// listing-directed output; substitution still happens for its side
+		// effects but nothing is printed or emitted
+		pp.subst(l.rest)
 		return
 	}
 
@@ -438,7 +497,10 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	if def.nameVar != "" {
 		frame.vars[def.nameVar] = nameSuffix
 	}
-	args := splitArgs(operandOnly(inv.rest))
+	// A macro argument may contain blanks -- the gsos macros are invoked as
+	// "freespace SCM segment 0,seg_0_start,..." -- so the whole operand field
+	// is the argument list, not just up to the first blank.
+	args := splitArgs(strings.TrimRight(inv.rest, " \t"))
 	for i, p := range def.params {
 		v := ""
 		if i < len(args) {
@@ -547,6 +609,7 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
+	"ORD": true, "SUBSTR": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -683,11 +746,20 @@ func (pp *ppState) argNum(a string) int64 {
 
 func (pp *ppState) callFunc(name string, args []string) string {
 	switch name {
-	case "EVAL":
+	case "EVAL", "ORD":
+		// &ORD yields the numeric value of its argument; the gsos macros use
+		// "&segment_pc seta &segment_pc+&ord(*)" to total a segment's size.
 		if len(args) != 1 {
 			return "0"
 		}
 		return strconv.FormatInt(pp.argNum(args[0]), 10)
+	case "SUBSTR":
+		// &SUBSTR(str, start, length) -- the function form of the &var[a:b]
+		// substring syntax.
+		if len(args) != 3 {
+			return ""
+		}
+		return substr(pp.rawArg(args[:1]), pp.argNum(args[1]), pp.argNum(args[2]))
 	case "TRIM":
 		return strings.TrimSpace(pp.rawArg(args))
 	case "LEN":
