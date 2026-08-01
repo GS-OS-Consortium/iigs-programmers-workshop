@@ -145,10 +145,29 @@ func (e *Env) HostPath(p string) string {
 			// "::" inside a path: go up
 			out = filepath.Dir(out)
 		default:
-			out = filepath.Join(out, seg)
+			out = filepath.Join(out, hostName(out, seg))
 		}
 	}
 	return filepath.Clean(out)
+}
+
+// hostName maps one MPW path component to the name it has on disk. '/' is an
+// ordinary character in a Mac filename (":" is the separator there), so names
+// like "SCSI Get Vol/Disk" cannot survive extraction intact; this source tree
+// carries them with '_' in its place.
+func hostName(dir, seg string) string {
+	if !strings.Contains(seg, "/") {
+		return seg
+	}
+	if alt := strings.ReplaceAll(seg, "/", "_"); fileExists(filepath.Join(dir, alt)) {
+		return alt
+	}
+	return seg
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // Tokenize splits a command line into words, honoring single and double

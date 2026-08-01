@@ -52,7 +52,8 @@ type segState struct {
 	// does not become the load address
 	tempOrg    int64
 	hasTempOrg bool
-	align      int64 // PROC ALIGN n (segment alignment)
+	align      int64  // PROC ALIGN n (segment alignment)
+	kind       uint16 // OMF KIND ($4001 for a data segment from bare RECORD)
 	actions    []action
 	endPC      int64
 }
@@ -115,14 +116,14 @@ func (st *asmState) curSegIndex() int { return len(st.segs) - 1 }
 
 // scopePrefix is the symbol-table prefix for definitions made at this point.
 //
-// Labels and equates declared inside a PROC belong to that segment alone --
+// Labels and equates declared inside a code PROC belong to that segment alone --
 // the original assembler reports "Undefined ID" for them in a second PROC,
 // which is how a file can reuse a name like "done" in every routine. Symbols
 // defined outside a PROC are visible file-wide, as are RECORD fields (a
-// template defines offsets, not storage) and anything published with
-// ENTRY/EXPORT.
+// template defines offsets, not storage), the fields of a RECORD data
+// segment, and anything published with ENTRY/EXPORT.
 func (st *asmState) scopePrefix() string {
-	if st.cur == nil || st.inRecord {
+	if st.cur == nil || st.inRecord || st.cur.kind == 0x4001 {
 		return ""
 	}
 	return fmt.Sprintf("%d\x00", st.curSegIndex())
@@ -413,13 +414,7 @@ func (st *asmState) doLine(l line) {
 				st.errf("unsupported PROC operand %q", opt)
 			}
 		}
-		st.segs = append(st.segs, seg)
-		st.cur = seg
-		st.pc = 0
-		// The PROC's own label names the segment, so it stays visible to the
-		// whole file even though the labels inside it do not.
-		st.fileWide[strings.ToUpper(name)] = true
-		st.define(name, segVal(st.curSegIndex(), 0))
+		st.openSegment(seg)
 		return
 	case "endp", "endproc":
 		if st.cur != nil {
@@ -467,9 +462,9 @@ func (st *asmState) doLine(l line) {
 		}
 		return
 	case "record":
-		st.inRecord = true
 		st.recDown = false
 		v := int64(0)
+		hasStart := false
 		if r := operandOnly(l.rest); r != "" {
 			// "RECORD start[,increment|decrement]": decrement grows fields
 			// downward from the start offset
@@ -489,10 +484,19 @@ func (st *asmState) doLine(l line) {
 				if err != nil {
 					st.errf("RECORD: %v", err)
 				} else {
-					v = n
+					v, hasStart = n, true
 				}
 			}
 		}
+		if !hasStart {
+			// A RECORD with no start offset is not a template at all: it
+			// opens a data segment (oracle-verified KIND $4001), which is how
+			// these sources define tables like Character.FST's cmd_tbl that
+			// other segments reach through IMPORT.
+			st.beginSegment(l.label, 0x4001)
+			return
+		}
+		st.inRecord = true
 		st.recPC = v
 		st.recName = strings.ToUpper(l.label)
 		if l.label != "" {
@@ -623,11 +627,18 @@ func (st *asmState) doLine(l line) {
 		st.doDCB(op, l)
 		return
 	case "dci", "endr":
-		if op == "endr" {
-			st.errf("ENDR without RECORD")
-		} else {
+		if op != "endr" {
 			st.errf("undefined macro or opcode: %s", strings.ToUpper(l.op))
+			return
 		}
+		// A data segment opened by a bare RECORD closes with either ENDR or
+		// ENDP; only a template's ENDR is handled in doRecordLine.
+		if st.cur == nil {
+			st.errf("ENDR without RECORD")
+			return
+		}
+		st.cur.endPC = st.pc
+		st.cur = nil
 		return
 	}
 
@@ -655,13 +666,40 @@ func (st *asmState) resumeSegment() bool {
 	return true
 }
 
+// beginSegment opens a segment with no options beyond its OMF kind.
+func (st *asmState) beginSegment(label string, kind uint16) {
+	name := strings.ToUpper(label)
+	if name == "" {
+		st.errf("segment requires a label")
+		return
+	}
+	st.openSegment(&segState{name: name, loadName: st.loadName,
+		imports: map[string]bool{}, kind: kind})
+}
+
+func (st *asmState) openSegment(seg *segState) {
+	st.segs = append(st.segs, seg)
+	st.cur = seg
+	st.pc = 0
+	// The segment's own label names it, so the label stays visible to the
+	// whole file even though the labels inside it do not.
+	st.fileWide[seg.name] = true
+	st.define(seg.name, segVal(st.curSegIndex(), 0))
+}
+
 func (st *asmState) defineCodeLabel(name string) {
 	if !st.resumeSegment() {
 		st.errf("label %q outside PROC", name)
 		return
 	}
 	st.define(name, segVal(st.curSegIndex(), st.pc))
-	if u := strings.ToUpper(name); st.entries[u] && !st.entryEqu[u] {
+	u := strings.ToUpper(name)
+	// Fields of a RECORD data segment are also reachable through the
+	// qualified "record.field" form, as a template's fields are.
+	if st.cur.kind == 0x4001 && u != st.cur.name {
+		st.define(st.cur.name+"."+u, segVal(st.curSegIndex(), st.pc))
+	}
+	if st.entries[u] && !st.entryEqu[u] {
 		st.addAction(action{kind: aRec, bytes: globalRec(u, st.entryPriv[u])})
 	}
 }

@@ -10,6 +10,7 @@ type Segment struct {
 	Org        int64
 	TempOrg    int64
 	HasTempOrg bool
+	Kind       uint16 // OMF KIND: $4000 private code, $4001 private data
 	Length     int64
 	Records    []byte
 }
@@ -50,11 +51,18 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	hdr[0x0D] = 0                              // LABLEN (pstrings)
 	hdr[0x0E] = 4                              // NUMLEN
 	hdr[0x0F] = 2                              // VERSION
-	le.PutUint32(hdr[0x10:], 0x10000)          // BANKSIZE
-	le.PutUint16(hdr[0x14:], 0x4000)           // KIND: private code
-	le.PutUint32(hdr[0x18:], uint32(s.Org))    // ORG
-	le.PutUint32(hdr[0x1C:], 0)                // ALIGN
-	hdr[0x20] = 0                              // NUMSEX
+	kind := s.Kind
+	if kind == 0 {
+		kind = 0x4000 // private code
+	}
+	if kind != 0x4001 {
+		// data segments carry BANKSIZE 0 (oracle-verified)
+		le.PutUint32(hdr[0x10:], 0x10000) // BANKSIZE
+	}
+	le.PutUint16(hdr[0x14:], kind)          // KIND
+	le.PutUint32(hdr[0x18:], uint32(s.Org)) // ORG
+	le.PutUint32(hdr[0x1C:], 0)             // ALIGN
+	hdr[0x20] = 0                           // NUMSEX
 	if s.HasTempOrg {
 		hdr[0x21] = 1 // v2.1 marker (oracle-verified)
 		le.PutUint32(hdr[0x2C:], uint32(s.TempOrg))

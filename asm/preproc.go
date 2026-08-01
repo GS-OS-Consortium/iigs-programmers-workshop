@@ -123,7 +123,11 @@ func (pp *ppState) findInclude(spec string) string {
 			continue
 		}
 		for _, ent := range entries {
-			if strings.EqualFold(ent.Name(), base) {
+			// '/' is an ordinary character in a Mac filename (":" separates
+			// there), so a name like "SCSI Get Vol/Disk" reaches this tree
+			// with '_' in its place.
+			if strings.EqualFold(ent.Name(), base) ||
+				strings.EqualFold(ent.Name(), strings.ReplaceAll(base, "/", "_")) {
 				return filepath.Join(d, ent.Name())
 			}
 		}
