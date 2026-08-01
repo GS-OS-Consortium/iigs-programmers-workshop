@@ -62,6 +62,14 @@ type segState struct {
 	endPC      int64
 }
 
+// bareField remembers a symbol a RECORD template's field name shadowed.
+type bareField struct {
+	key    string
+	val    Val
+	had    bool
+	seqLen int
+}
+
 // ---------- assembler state ----------
 
 type symEntry struct {
@@ -127,9 +135,9 @@ type asmState struct {
 	recSize   map[string]int64
 	recFields map[string]map[string]int64
 	recDown   bool // RECORD ...,decrement: fields grow downward
-	// recBare are the unqualified field names of the open template, dropped
-	// again at ENDR (see doRecordLine).
-	recBare []string
+	// recBare records what the open template's unqualified field names hid,
+	// so ENDR can put it back (see doRecordLine).
+	recBare []bareField
 	// withs are the record instances named by WITH, innermost last; a bare
 	// field name is looked up through them before the plain symbol table.
 	withs []string
@@ -1104,10 +1112,12 @@ func (st *asmState) doRecordLine(op string, l line) {
 	// defined globally let a template field shadow a PROC of the same name:
 	// the loader's call table folded "DC.L LoadName-1" to a constant.
 	defField := func(name string, v Val) {
-		st.define(name, v)
 		if key := st.sym(name); key != "" {
-			st.recBare = append(st.recBare, key)
+			prev, had := st.syms[key]
+			st.recBare = append(st.recBare,
+				bareField{key: key, val: prev, had: had, seqLen: len(st.symSeq[key])})
 		}
+		st.define(name, v)
 		if st.recName != "" && name != "" {
 			st.define(st.recName+"."+st.sym(name), v)
 			if v.isNum() {
@@ -1125,9 +1135,19 @@ func (st *asmState) doRecordLine(op string, l line) {
 		if st.recName != "" {
 			st.recSize[st.recName] = st.recPC
 		}
-		for _, k := range st.recBare {
-			delete(st.syms, k)
-			delete(st.symSeq, k)
+		// Restore in reverse: a field may shadow a global equate of the same
+		// name (SCSIHD.Equates has "removable" both ways), and deleting it
+		// outright took the equate with it.
+		for i := len(st.recBare) - 1; i >= 0; i-- {
+			b := st.recBare[i]
+			if b.had {
+				st.syms[b.key] = b.val
+			} else {
+				delete(st.syms, b.key)
+			}
+			if len(st.symSeq[b.key]) > b.seqLen {
+				st.symSeq[b.key] = st.symSeq[b.key][:b.seqLen]
+			}
 		}
 		st.recBare = nil
 		st.inRecord = false
