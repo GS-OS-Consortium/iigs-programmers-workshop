@@ -109,6 +109,24 @@ func (p *exprParser) parseAdd() (Val, error) {
 	for {
 		p.skipWS()
 		switch {
+		case p.peek2() == "--": // bitwise XOR (MPW asm)
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOp("--", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peek2() == "++": // bitwise OR (MPW asm)
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOp("++", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+				return Val{}, err
+			}
 		case p.peek() == '+':
 			p.pos++
 			r, err := p.parseShift()

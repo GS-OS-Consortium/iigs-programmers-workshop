@@ -95,11 +95,15 @@ func (st *asmState) lookup(name string) Val {
 	if strings.HasPrefix(name, "@") {
 		name = st.scopedLocal(name)
 	}
-	if st.entries[name] || st.imports[name] {
-		// ENTRY/IMPORT symbols are referenced by name in expression records
+	if st.imports[name] {
 		return fwdVal(name)
 	}
 	if v, ok := st.syms[name]; ok {
+		// tag single-label values with the original name so emission can
+		// reference ENTRY symbols by name (ENTRY may appear later)
+		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
+			v.Pos = []term{{seg: v.Pos[0].seg, name: name, symOff: v.C}}
+		}
 		return v
 	}
 	return fwdVal(name)

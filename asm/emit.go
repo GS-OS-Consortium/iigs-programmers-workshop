@@ -131,6 +131,11 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					err = fmt.Errorf("undefined ID (unresolvable): %s", t.fwd)
 					return
 				}
+				if len(r.Pos) == 1 && len(r.Neg) == 0 && r.Pos[0].name == "" {
+					r.Pos = append([]term(nil), r.Pos...)
+					r.Pos[0].name = t.fwd
+					r.Pos[0].symOff = r.C
+				}
 				tv = r
 			} else {
 				tv = Val{Pos: []term{t}}
@@ -159,12 +164,17 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 	return v, nil
 }
 
-// exprName is the label to reference in an emitted expression record.
-func (st *asmState) exprName(t term) string {
+// exprRef gives the label name and displacement for an expression record:
+// ENTRY symbols are referenced by their own name, everything else by the
+// enclosing PROC name plus offset.
+func (st *asmState) exprRef(t term, c int64) (string, int64) {
 	if t.fwd != "" {
-		return t.fwd // external (IMPORT) symbol
+		return t.fwd, c // external (IMPORT) or forward-named symbol
 	}
-	return st.segs[t.seg].name
+	if t.name != "" && st.entries[t.name] {
+		return t.name, c - t.symOff
+	}
+	return st.segs[t.seg].name, c
 }
 
 // emitSegment runs pass 2 over a segment's actions.
@@ -227,7 +237,8 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
-			e.expr(a.rec, a.size, st.exprName(t.Pos[0]), t.C, a.shift)
+			nm, disp := st.exprRef(t.Pos[0], t.C)
+			e.expr(a.rec, a.size, nm, disp, a.shift)
 		case aExpr:
 			t, err := st.resolve(a.target)
 			if err != nil {
@@ -243,7 +254,8 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
-			e.expr(a.rec, a.size, st.exprName(t.Pos[0]), t.C, a.shift)
+			nm, disp := st.exprRef(t.Pos[0], t.C)
+			e.expr(a.rec, a.size, nm, disp, a.shift)
 		}
 	}
 	return &Segment{Name: seg.name, LoadName: seg.loadName, Org: seg.org, Length: seg.endPC, Records: e.end()}, nil

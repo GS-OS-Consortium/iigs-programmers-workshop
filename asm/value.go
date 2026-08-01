@@ -11,8 +11,10 @@ import "fmt"
 // (the original assembler folds e.g. `APPLESOFT+$912-*` and even
 // forward-forward differences like `FDCEND-FOUTBL` to plain constants).
 type term struct {
-	seg int    // -1 when fwd is set
-	fwd string // unresolved symbol name
+	seg    int    // -1 when fwd is set
+	fwd    string // unresolved symbol name
+	name   string // original symbol name for resolved labels (may be "")
+	symOff int64  // the symbol's own offset (to recover addends by name)
 }
 
 type Val struct {
