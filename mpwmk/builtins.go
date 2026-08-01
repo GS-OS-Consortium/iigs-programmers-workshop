@@ -355,7 +355,13 @@ func (e *Env) runMakeBin(args []string) error {
 			if i > 0 {
 				name = fmt.Sprintf("%s.%d", output, i+1)
 			}
-			if err := os.WriteFile(name, omf.SegmentImage(s), 0644); err != nil {
+			img := omf.SegmentImage(s)
+			at := int64(s.Org)
+			if org >= 0 {
+				at = org
+			}
+			omf.Relocate(s, img, at)
+			if err := os.WriteFile(name, img, 0644); err != nil {
 				return err
 			}
 		}
@@ -386,6 +392,7 @@ func flatten(f *omf.File, orgFlag int64) ([]byte, int64) {
 		}
 		off := org - base
 		seg := omf.SegmentImage(s)
+		omf.Relocate(s, seg, org)
 		if need := off + int64(len(seg)); need > int64(len(img)) {
 			img = append(img, make([]byte, need-int64(len(img)))...)
 		}

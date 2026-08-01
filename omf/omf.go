@@ -380,3 +380,92 @@ func SegmentImage(s *Segment) []byte {
 	}
 	return img
 }
+
+// Relocate applies a load segment's relocation dictionary to its image for a
+// segment loaded at base.
+//
+// MakeBinIIGS's "-org" names the address the binary will run at, and the
+// relocatable load file the linker produced still carries its dictionary: the
+// bytes in the image hold segment-relative values until this runs. Skipping it
+// leaves every absolute reference pointing into page zero -- ProDOS is built
+// with "-org $2000" and jumped to $03xx instead of $23xx.
+func Relocate(s *Segment, img []byte, base int64) {
+	put := func(off, val int64, n int, shift int8) {
+		if shift < 0 {
+			val >>= uint(-shift)
+		} else if shift > 0 {
+			val <<= uint(shift)
+		}
+		for i := 0; i < n && off+int64(i) < int64(len(img)); i++ {
+			img[off+int64(i)] = byte(val >> (8 * uint(i)))
+		}
+	}
+	get := func(off int64, n int) int64 {
+		var v int64
+		for i := 0; i < n && off+int64(i) < int64(len(img)); i++ {
+			v |= int64(img[off+int64(i)]) << (8 * uint(i))
+		}
+		return v
+	}
+	for _, r := range s.Records {
+		switch r.Op {
+		case RecReloc:
+			n, shift := int(r.Raw[1]), int8(r.Raw[2])
+			off := int64(binary.LittleEndian.Uint32(r.Raw[3:]))
+			val := int64(binary.LittleEndian.Uint32(r.Raw[7:]))
+			put(off, val+base, n, shift)
+		case RecCReloc:
+			n, shift := int(r.Raw[1]), int8(r.Raw[2])
+			off := int64(binary.LittleEndian.Uint16(r.Raw[3:]))
+			val := int64(binary.LittleEndian.Uint16(r.Raw[5:]))
+			put(off, val+base, n, shift)
+		case RecSuper:
+			// The site's current contents are the segment-relative value.
+			n, shift := superWidth(r.Raw[5])
+			if n == 0 {
+				continue
+			}
+			for _, off := range superOffsets(r.Raw[6 : 1+4+int(binary.LittleEndian.Uint32(r.Raw[1:]))]) {
+				put(off, get(off, n)+base, n, shift)
+			}
+		}
+	}
+}
+
+// superWidth gives the patch width and shift for a SUPER record type; 0 means
+// a type this does not handle (the INTERSEG families, which a single-file
+// load never produces).
+func superWidth(typ byte) (int, int8) {
+	switch typ {
+	case 0: // SUPER_RELOC2
+		return 2, 0
+	case 1: // SUPER_RELOC3
+		return 3, 0
+	case 0x1B: // 2-byte bank reference, as the shipped 6.0.1 linker emits
+		return 2, -16
+	}
+	return 0, 0
+}
+
+// superOffsets decodes a SUPER record body into image offsets. A subrecord
+// implicitly advances one page; $80|n skips n pages beyond that.
+func superOffsets(body []byte) []int64 {
+	var out []int64
+	page := int64(0)
+	for i := 0; i < len(body); {
+		b := body[i]
+		if b&0x80 != 0 {
+			page += int64(b & 0x7F)
+			i++
+			continue
+		}
+		n := int(b) + 1
+		i++
+		for k := 0; k < n && i+k < len(body); k++ {
+			out = append(out, page<<8|int64(body[i+k]))
+		}
+		i += n
+		page++
+	}
+	return out
+}
