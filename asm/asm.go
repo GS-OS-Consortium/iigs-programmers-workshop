@@ -127,6 +127,10 @@ type asmState struct {
 	// withs are the record instances named by WITH, innermost last; a bare
 	// field name is looked up through them before the plain symbol table.
 	withs []string
+	// dataChk/codeChk select BEXPR over LEXPR for 2-byte absolute references
+	// (oracle-probed); CODECHK defaults on, DATACHK off.
+	dataChk bool
+	codeChk bool
 	// skipMode is PROC SKIP: a sticky mode, not a per-segment attribute --
 	// once a PROC carries SKIP every later segment keeps the KIND bit until a
 	// PROC carries NOSKIP (oracle-probed).
@@ -443,6 +447,7 @@ func newState() *asmState {
 		imports:    map[string]bool{},
 		entries:    map[string]bool{},
 		entryPriv:  map[string]byte{},
+		codeChk:    true,
 		globalNth:  map[string]int{},
 		lastPubSeq: map[string]int64{},
 		fileWide:   map[string]bool{},
@@ -689,9 +694,16 @@ func (st *asmState) doLine(l line) {
 		st.strMode = strings.ToUpper(operandOnly(l.rest))
 		return
 	case "title", "eject", "print", "space", "page", "pagesize", "blanks",
-		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl",
-		"datachk", "codechk":
+		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl":
 		return // listing/diagnostic control: no object-file effect
+	case "datachk", "codechk":
+		on := strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "on")
+		if op == "datachk" {
+			st.dataChk = on
+		} else {
+			st.codeChk = on
+		}
+		return
 	case "with":
 		// WITH brings a record instance's fields into scope unqualified. For a
 		// template that changes nothing (its fields are plain offsets defined
@@ -1213,6 +1225,28 @@ func (st *asmState) doDC(op string, l line) {
 	}
 }
 
+// exprRecFor picks the expression record for an instruction operand. BEXPR
+// asks the linker to check that the address lands in the current bank, which
+// only makes sense for a 2-byte absolute operand; everything else, including
+// long transfers and DC data, is a LEXPR.
+func (st *asmState) exprRecFor(mn string, chosen Mode) byte {
+	switch chosen {
+	case Abs, AbsX, AbsY:
+	default:
+		return recLexpr
+	}
+	if mn == "jmp" || mn == "jsr" {
+		if st.codeChk {
+			return recBexpr
+		}
+		return recLexpr
+	}
+	if st.dataChk {
+		return recBexpr
+	}
+	return recLexpr
+}
+
 func (st *asmState) doDCB(op string, l line) {
 	if l.label != "" {
 		st.defineCodeLabel(l.label)
@@ -1477,10 +1511,7 @@ func (st *asmState) doInst(mn, operand string) {
 
 	switch {
 	case deferred:
-		rec := byte(recLexpr)
-		if (mn == "jmp" || mn == "jsr") && chosen == Abs {
-			rec = recBexpr // bank-truncated; indirect/long forms use LEXPR
-		}
+		rec := st.exprRecFor(mn, chosen)
 		if chosen == Rel8 || chosen == Rel16 {
 			st.emitBytes(info.code)
 			st.addAction(action{kind: aBranch, target: val, size: n,
@@ -1497,12 +1528,7 @@ func (st *asmState) doInst(mn, operand string) {
 		st.addAction(action{kind: aBranch, target: val, size: n, pcNext: st.pc + int64(n)})
 		st.pc += int64(n)
 	case val.isLabel():
-		// expression record: BEXPR for 2-byte jmp/jsr targets (bank-
-		// truncated), LEXPR for data refs and long transfers
-		rec := byte(recLexpr)
-		if (mn == "jmp" || mn == "jsr") && chosen == Abs {
-			rec = recBexpr
-		}
+		rec := st.exprRecFor(mn, chosen)
 		st.emitBytes(info.code)
 		st.addAction(action{kind: aExpr, target: val, size: n, rec: rec, shift: shift + val.Shift})
 		st.pc += int64(n)
