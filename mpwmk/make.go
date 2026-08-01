@@ -28,7 +28,18 @@ type Makefile struct {
 // comments.
 func ParseMakefile(text string) (*Makefile, error) {
 	mf := &Makefile{Vars: map[string]string{}, byTgt: map[string]*Rule{}}
-	lines := joinContinuations(strings.Split(text, "\n"))
+	// Comments are per physical line and must be removed BEFORE continuation
+	// joining, or a trailing "# note ∂" swallows the rest of the command.
+	raw := strings.Split(text, "\n")
+	for i, l := range raw {
+		if c := stripComment(l); c != l {
+			raw[i] = strings.TrimRight(c, " \t")
+			if strings.HasSuffix(strings.TrimRight(l, " \t"), string(RuneContinue)) {
+				raw[i] += string(RuneContinue)
+			}
+		}
+	}
+	lines := joinContinuations(raw)
 	var cur *Rule
 	for _, ln := range lines {
 		raw := ln.text
@@ -36,7 +47,7 @@ func ParseMakefile(text string) (*Makefile, error) {
 			continue
 		}
 		indented := raw[0] == '\t' || raw[0] == ' '
-		body := strings.TrimSpace(stripComment(raw))
+		body := strings.TrimSpace(raw)
 		if body == "" {
 			continue
 		}
@@ -138,9 +149,11 @@ func indexDep(s string) int {
 	return -1
 }
 
+// splitFields splits a rule's target/dependency list, honoring MPW quoting
+// (file names in this corpus contain spaces, e.g. 'SCSI Driver main').
 func splitFields(s string) []string {
 	var out []string
-	for _, f := range strings.Fields(s) {
+	for _, f := range Tokenize(s) {
 		if f != "" {
 			out = append(out, f)
 		}
@@ -215,10 +228,8 @@ func (b *Builder) Build(target string) error {
 	if b.Env.Verbose {
 		fmt.Fprintf(b.Env.Out, "  %s\n", target)
 	}
-	for _, c := range rule.Cmds {
-		if err := b.Env.RunCommand(c); err != nil {
-			return fmt.Errorf("%s: %w", target, err)
-		}
+	if err := b.Env.RunBlock(rule.Cmds); err != nil {
+		return fmt.Errorf("%s: %w", target, err)
 	}
 	return nil
 }

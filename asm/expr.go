@@ -224,6 +224,20 @@ func (p *exprParser) parseMul() (Val, error) {
 			if v, err = numOp("*", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x * y, nil }); err != nil {
 				return Val{}, err
 			}
+		case p.peek2() == "//": // integer remainder (MPW asm)
+			p.pos += 2
+			r, err := p.parseUnary()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOp("//", p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
+				if y == 0 {
+					return 0, fmt.Errorf("division by zero")
+				}
+				return x % y, nil
+			}); err != nil {
+				return Val{}, err
+			}
 		case p.peek() == '/':
 			p.pos++
 			r, err := p.parseUnary()

@@ -165,8 +165,16 @@ func (e *Env) runAsm(args []string) error {
 			input = e.HostPath(a)
 		}
 	}
-	if input == "" || output == "" {
-		return fmt.Errorf("asmiigs: need input and -o output")
+	if input == "" {
+		return fmt.Errorf("asmiigs: no input file")
+	}
+	if output == "" {
+		output = input + ".obj" // AsmIIGS default output name
+	}
+	// The real AsmIIGS finds the toolbox interface files through the
+	// {AIIGSIncludes} shell variable; make that automatic.
+	if d := e.Get("aiigsincludes"); d != "" {
+		incDirs = append(incDirs, e.HostPath(d))
 	}
 	obj, err := asm.AssembleFileOpts(input, incDirs, defines)
 	if err != nil {

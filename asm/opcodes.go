@@ -99,6 +99,8 @@ var opTable = map[string][]modeEnt{
 	"cpx": {{ImmX, 0xE0, cpu6502}, {DP, 0xE4, cpu6502}, {Abs, 0xEC, cpu6502}},
 	"cpy": {{ImmX, 0xC0, cpu6502}, {DP, 0xC4, cpu6502}, {Abs, 0xCC, cpu6502}},
 	"dec": {{Accum, 0x3A, cpu65C02}, {Implied, 0x3A, cpu65C02}, {DP, 0xC6, cpu6502}, {DPX, 0xD6, cpu6502}, {Abs, 0xCE, cpu6502}, {AbsX, 0xDE, cpu6502}},
+	"dea": {{Implied, 0x3A, cpu65C02}, {Accum, 0x3A, cpu65C02}}, // DEC A alias
+	"ina": {{Implied, 0x1A, cpu65C02}, {Accum, 0x1A, cpu65C02}}, // INC A alias
 	"dex": {{Implied, 0xCA, cpu6502}},
 	"dey": {{Implied, 0x88, cpu6502}},
 	"eor": {{ImmM, 0x49, cpu6502}, {DP, 0x45, cpu6502}, {DPX, 0x55, cpu6502}, {Abs, 0x4D, cpu6502}, {AbsX, 0x5D, cpu6502}, {AbsY, 0x59, cpu6502}, {DPIndX, 0x41, cpu6502}, {DPIndY, 0x51, cpu6502}, {DPInd, 0x52, cpu65C02}, {AbsL, 0x4F, cpu65816}, {AbsLX, 0x5F, cpu65816}, {DPIndL, 0x47, cpu65816}, {DPIndLY, 0x57, cpu65816}, {SR, 0x43, cpu65816}, {SRIndY, 0x53, cpu65816}},

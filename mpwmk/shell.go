@@ -114,6 +114,8 @@ func (e *Env) HostPath(p string) string {
 	if p == "" {
 		return ""
 	}
+	// MPW quotes protect spaces in names; they are not part of the path.
+	p = strings.ReplaceAll(p, "\"", "")
 	if strings.HasPrefix(p, "/") { // already a host path
 		// MPW directory values keep a trailing ':' and may use ':' separators
 		p = strings.TrimSuffix(p, ":")
@@ -187,6 +189,141 @@ func Tokenize(line string) []string {
 		words = append(words, cur.String())
 	}
 	return words
+}
+
+// RunBlock executes a sequence of command lines with MPW Shell control
+// flow (if / else if / else / end), splitting ';'-separated statements.
+func (e *Env) RunBlock(cmds []string) error {
+	var stmts []string
+	for _, c := range cmds {
+		stmts = append(stmts, splitStatements(c)...)
+	}
+	type frame struct{ active, taken, parent bool }
+	var stack []frame
+	active := func() bool {
+		for _, f := range stack {
+			if !f.active {
+				return false
+			}
+		}
+		return true
+	}
+	for _, st := range stmts {
+		w := Tokenize(e.Expand(st))
+		if len(w) == 0 {
+			continue
+		}
+		switch strings.ToLower(w[0]) {
+		case "if":
+			if !active() {
+				stack = append(stack, frame{})
+				continue
+			}
+			v := e.condition(w[1:])
+			stack = append(stack, frame{active: v, taken: v, parent: true})
+			continue
+		case "else":
+			if len(stack) == 0 {
+				return fmt.Errorf("else without if")
+			}
+			f := &stack[len(stack)-1]
+			if !f.parent {
+				continue
+			}
+			// "else if cond"
+			if len(w) > 1 && strings.EqualFold(w[1], "if") {
+				if f.taken {
+					f.active = false
+				} else {
+					v := e.condition(w[2:])
+					f.active, f.taken = v, v
+				}
+				continue
+			}
+			f.active = !f.taken
+			f.taken = true
+			continue
+		case "end":
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		if !active() {
+			continue
+		}
+		if err := e.RunCommand(st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// condition evaluates an MPW Shell test, including || and && between terms.
+func (e *Env) condition(w []string) bool {
+	for i, t := range w {
+		if t == "||" {
+			return e.condition(w[:i]) || e.condition(w[i+1:])
+		}
+	}
+	for i, t := range w {
+		if t == "&&" {
+			return e.condition(w[:i]) && e.condition(w[i+1:])
+		}
+	}
+	return e.conditionTerm(w)
+}
+
+// conditionTerm evaluates a single test: a lone word is true when non-empty
+// and not "0"; comparisons use == != =~ !~.
+func (e *Env) conditionTerm(w []string) bool {
+	switch len(w) {
+	case 0:
+		return false
+	case 1:
+		v := strings.TrimSpace(w[0])
+		return v != "" && v != "0"
+	}
+	if len(w) >= 3 {
+		l, op, r := w[0], w[1], strings.Join(w[2:], " ")
+		switch op {
+		case "==", "=":
+			return strings.EqualFold(l, r)
+		case "!=", "<>":
+			return !strings.EqualFold(l, r)
+		case "=~":
+			return strings.Contains(strings.ToLower(l), strings.ToLower(strings.Trim(r, "/≈")))
+		case "!~":
+			return !strings.Contains(strings.ToLower(l), strings.ToLower(strings.Trim(r, "/≈")))
+		}
+	}
+	return strings.TrimSpace(w[0]) != ""
+}
+
+// splitStatements splits a line on ';' outside quotes.
+func splitStatements(line string) []string {
+	var out []string
+	depth := 0
+	inS, inD := false, false
+	start := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\'':
+			inS = !inS
+		case '"':
+			inD = !inD
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ';':
+			if !inS && !inD && depth == 0 {
+				out = append(out, line[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, line[start:])
 }
 
 // RunCommand executes one expanded command line (builtins first, then the

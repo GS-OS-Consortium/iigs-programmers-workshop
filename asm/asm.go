@@ -51,6 +51,7 @@ type segState struct {
 	// does not become the load address
 	tempOrg    int64
 	hasTempOrg bool
+	align      int64 // PROC ALIGN n (segment alignment)
 	actions    []action
 	endPC      int64
 }
@@ -86,6 +87,7 @@ type asmState struct {
 	inRecord bool
 	recPC    int64
 	recName  string // RECORD label, for qualified RECORD.FIELD references
+	recDown  bool   // RECORD ...,decrement: fields grow downward
 
 	// preprocessor state (conditionals, macros, set-vars) lives in preproc.go
 	pp *ppState
@@ -333,24 +335,38 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		seg := &segState{name: name, loadName: st.loadName, imports: map[string]bool{}}
-		// "label PROC ORG expr" sets the segment header ORG
-		if rest := strings.TrimSpace(l.rest); rest != "" {
-			f := strings.Fields(rest)
-			isOrg := len(f) >= 2 && strings.EqualFold(f[0], "org")
-			isTemp := len(f) >= 2 && strings.EqualFold(f[0], "temporg")
-			switch {
-			case isOrg, isTemp:
-				v, err := evalNum(strings.Join(f[1:], " "), &exprCtx{st: st})
-				if err != nil {
-					st.errf("PROC %s: %v", f[0], err)
-				} else if isTemp {
-					// OMF v2.1 TEMPORG: assembly-time origin only
-					seg.tempOrg, seg.hasTempOrg = v, true
-				} else {
-					seg.org = v
+		// PROC operands are comma- or space-separated options:
+		//   EXPORT | PRIVATE | ENTRY | DYNAMIC   (linkage attributes)
+		//   ORG addr | TEMPORG addr | ALIGN n
+		for _, opt := range splitArgs(strings.TrimSpace(l.rest)) {
+			f := strings.Fields(strings.TrimSpace(opt))
+			if len(f) == 0 {
+				continue
+			}
+			kw := strings.ToLower(f[0])
+			if len(f) == 1 {
+				switch kw {
+				case "export", "private", "entry", "dynamic":
+					continue // no effect on the emitted object
 				}
+				st.errf("unsupported PROC operand %q", opt)
+				continue
+			}
+			v, err := evalNum(strings.Join(f[1:], " "), &exprCtx{st: st})
+			if err != nil {
+				st.errf("PROC %s: %v", f[0], err)
+				continue
+			}
+			switch kw {
+			case "org":
+				seg.org = v
+			case "temporg":
+				// OMF v2.1 TEMPORG: assembly-time origin only
+				seg.tempOrg, seg.hasTempOrg = v, true
+			case "align":
+				seg.align = v
 			default:
-				st.errf("unsupported PROC operand %q", rest)
+				st.errf("unsupported PROC operand %q", opt)
 			}
 		}
 		st.segs = append(st.segs, seg)
@@ -358,11 +374,18 @@ func (st *asmState) doLine(l line) {
 		st.pc = 0
 		st.define(name, segVal(st.curSegIndex(), 0))
 		return
-	case "endp":
+	case "endp", "endproc":
 		if st.cur != nil {
 			st.cur.endPC = st.pc
 		}
 		st.cur = nil
+		return
+	case "procname":
+		// names the enclosing procedure for the debugger; the label (if any)
+		// marks the current location
+		if l.label != "" {
+			st.defineCodeLabel(l.label)
+		}
 		return
 	case "end":
 		if st.cur != nil {
@@ -395,9 +418,16 @@ func (st *asmState) doLine(l line) {
 		return
 	case "record":
 		st.inRecord = true
+		st.recDown = false
 		v := int64(0)
 		if r := operandOnly(l.rest); r != "" {
-			n, err := evalNum(r, &exprCtx{st: st})
+			// "RECORD start[,increment|decrement]": decrement grows fields
+			// downward from the start offset
+			parts := splitArgs(r)
+			if len(parts) > 1 {
+				st.recDown = strings.EqualFold(strings.TrimSpace(parts[1]), "decrement")
+			}
+			n, err := evalNum(strings.TrimSpace(parts[0]), &exprCtx{st: st})
 			if err != nil {
 				st.errf("RECORD: %v", err)
 			} else {
@@ -436,8 +466,8 @@ func (st *asmState) doLine(l line) {
 	case "string":
 		st.strMode = strings.ToUpper(operandOnly(l.rest))
 		return
-	case "title", "eject", "print", "space", "page", "blanks", "list", "nolist",
-		"case", "trace", "err", "obj", "noobj":
+	case "title", "eject", "print", "space", "page", "pagesize", "blanks",
+		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl":
 		return // listing/diagnostic control: no object-file effect
 	case "with", "endwith":
 		return // record fields are defined globally here
@@ -517,8 +547,8 @@ func (st *asmState) doLine(l line) {
 	case "dc", "dc.b", "dc.w", "dc.l", "dc.a":
 		st.doDC(op, l)
 		return
-	case "dcb", "dcb.b":
-		st.doDCB(l)
+	case "dcb", "dcb.b", "dcb.w", "dcb.l", "dcb.a":
+		st.doDCB(op, l)
 		return
 	case "dci", "endr":
 		if op == "endr" {
@@ -599,7 +629,11 @@ func (st *asmState) doRecordLine(op string, l line) {
 			st.errf("RECORD DS: %v", err)
 			return
 		}
-		st.recPC += n * size
+		if st.recDown {
+			st.recPC -= n * size
+		} else {
+			st.recPC += n * size
+		}
 		return
 	case "equ":
 		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
@@ -648,7 +682,11 @@ func (st *asmState) doRecordLine(op string, l line) {
 				}
 			}
 		}
-		st.recPC += n * unit
+		if st.recDown {
+			st.recPC -= n * unit
+		} else {
+			st.recPC += n * unit
+		}
 		return
 	case "title", "eject", "print", "with", "endwith":
 		return
@@ -737,7 +775,7 @@ func (st *asmState) doDC(op string, l line) {
 	}
 }
 
-func (st *asmState) doDCB(l line) {
+func (st *asmState) doDCB(op string, l line) {
 	if l.label != "" {
 		st.defineCodeLabel(l.label)
 	}
@@ -752,16 +790,26 @@ func (st *asmState) doDCB(l line) {
 		st.errf("DCB.B: bad operands")
 		return
 	}
-	if v == 0 && n > 5 {
-		// zero fills longer than a DS record (5 bytes) are emitted as DS
-		// (oracle-verified space optimization)
-		st.addAction(action{kind: aDS, count: n})
-		st.pc += n
+	unit := int64(1)
+	switch op {
+	case "dcb.w":
+		unit = 2
+	case "dcb.a":
+		unit = 3
+	case "dcb.l":
+		unit = 4
+	}
+	if v == 0 && n*unit > 5 {
+		// zero fills longer than a DS record are emitted as DS
+		st.addAction(action{kind: aDS, count: n * unit})
+		st.pc += n * unit
 		return
 	}
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = byte(v)
+	b := make([]byte, 0, n*unit)
+	for i := int64(0); i < n; i++ {
+		for k := int64(0); k < unit; k++ {
+			b = append(b, byte(v>>(8*k)))
+		}
 	}
 	st.emitBytes(b...)
 }

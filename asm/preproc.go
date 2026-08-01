@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 // The preprocessor layer: INCLUDE, IF/ELSEIF/ELSE/ENDIF conditionals, and
@@ -64,20 +67,99 @@ func (pp *ppState) processFile(path string) error {
 	if err != nil {
 		return err
 	}
-	src := strings.ReplaceAll(strings.ReplaceAll(string(data), "\r\n", "\n"), "\r", "\n")
+	var text string
+	if utf8.Valid(data) {
+		text = string(data)
+	} else if d, derr := charmap.Macintosh.NewDecoder().Bytes(data); derr == nil {
+		text = string(d) // classic-Mac MacRoman interface files
+	} else {
+		text = string(data)
+	}
+	src := strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
 	pp.processSource(src, path)
 	return nil
+}
+
+// stripAsmComment removes a ';' comment (outside quotes); a '*' or ';' in
+// column one makes the whole line a comment.
+func stripAsmComment(s string) string {
+	if s != "" && (s[0] == '*' || s[0] == ';') {
+		return ""
+	}
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			inStr = !inStr
+		case ';':
+			if !inStr {
+				return s[:i]
+			}
+		}
+	}
+	return s
+}
+
+// findInclude resolves an INCLUDE spec: the including file's directory
+// first, then the search path, matching names case-insensitively (MPW file
+// names are case-insensitive and the sources are inconsistent).
+func (pp *ppState) findInclude(spec string) string {
+	direct := mpwPath(filepath.Dir(pp.st.curFile), spec)
+	if _, err := os.Stat(direct); err == nil {
+		return direct
+	}
+	base := spec
+	if i := strings.LastIndex(base, ":"); i >= 0 {
+		base = base[i+1:]
+	}
+	dirs := append([]string{filepath.Dir(pp.st.curFile)}, pp.incDirs...)
+	for _, d := range dirs {
+		cand := filepath.Join(d, base)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, ent := range entries {
+			if strings.EqualFold(ent.Name(), base) {
+				return filepath.Join(d, ent.Name())
+			}
+		}
+	}
+	return direct
 }
 
 func (pp *ppState) processSource(src, path string) {
 	st := pp.st
 	prevFile, prevLine := st.curFile, st.curLine
 	st.curFile = path
-	for n, raw := range strings.Split(src, "\n") {
+	lines := strings.Split(src, "\n")
+	for n := 0; n < len(lines); n++ {
 		if st.ended {
 			break
 		}
+		raw := lines[n]
 		st.curLine = n + 1
+		// A trailing '\' continues the statement on the next line (the
+		// driver sources wrap long expressions this way). The marker sits
+		// before any comment, so comments are removed first.
+		if body := stripAsmComment(raw); strings.HasSuffix(strings.TrimRight(body, " \t"), "\\") {
+			joined := strings.TrimSuffix(strings.TrimRight(body, " \t"), "\\")
+			for n+1 < len(lines) {
+				next := stripAsmComment(lines[n+1])
+				n++
+				trimmed := strings.TrimRight(next, " \t")
+				if strings.HasSuffix(trimmed, "\\") {
+					joined += strings.TrimLeft(strings.TrimSuffix(trimmed, "\\"), " \t")
+					continue
+				}
+				joined += strings.TrimLeft(next, " \t")
+				break
+			}
+			raw = joined
+		}
 		pp.processLine(raw)
 	}
 	st.curFile, st.curLine = prevFile, prevLine
@@ -176,16 +258,7 @@ func (pp *ppState) processLine(raw string) {
 		if s, err := unquote(operandOnly(spec)); err == nil {
 			spec = s
 		}
-		path := mpwPath(filepath.Dir(st.curFile), spec)
-		if _, serr := os.Stat(path); serr != nil {
-			for _, d := range pp.incDirs {
-				cand := filepath.Join(d, strings.ReplaceAll(strings.TrimPrefix(spec, ":"), ":", "/"))
-				if _, serr2 := os.Stat(cand); serr2 == nil {
-					path = cand
-					break
-				}
-			}
-		}
+		path := pp.findInclude(spec)
 		if err := pp.processFile(path); err != nil {
 			st.errf("INCLUDE %s: %v", spec, err)
 		}
@@ -195,10 +268,10 @@ func (pp *ppState) processLine(raw string) {
 		return
 	}
 
-	// inside a macro expansion, substitute & references before assembling
-	if len(pp.frames) > 0 {
-		raw2 := pp.subst(raw)
-		l = splitLine(raw2)
+	// substitute & references (macro parameters, set-variables and the
+	// builtin functions); these are legal outside macros too
+	if strings.ContainsRune(raw, '&') {
+		l = splitLine(pp.subst(raw))
 		op = strings.ToLower(l.op)
 	}
 
@@ -580,7 +653,17 @@ func (pp *ppState) condEval(s string) bool {
 	if up := strings.ToUpper(s); strings.HasSuffix(up, "THEN") {
 		s = strings.TrimSpace(s[:len(s)-4])
 	}
+	// A bare "IF Symbol THEN" tests the symbol's value; anything after the
+	// expression on the line is commentary.
+	if !strings.ContainsAny(s, "=<>") {
+		s = operandOnly(s)
+	}
 	lhs, op, rhs := splitCompare(s)
+	if op == "" && strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		if inner := s[1 : len(s)-1]; balancedParens(inner) {
+			return pp.condEval(inner)
+		}
+	}
 	if op == "" {
 		n, err := evalNum(s, &exprCtx{st: pp.st})
 		if err != nil {
@@ -614,9 +697,34 @@ func (pp *ppState) condEval(s string) bool {
 		return strings.EqualFold(ls, rs)
 	case "<>":
 		return !strings.EqualFold(ls, rs)
+	case "<":
+		return strings.ToUpper(ls) < strings.ToUpper(rs)
+	case ">":
+		return strings.ToUpper(ls) > strings.ToUpper(rs)
+	case "<=":
+		return strings.ToUpper(ls) <= strings.ToUpper(rs)
+	case ">=":
+		return strings.ToUpper(ls) >= strings.ToUpper(rs)
 	}
 	pp.st.errf("cannot compare %q %s %q", lhs, op, rhs)
 	return false
+}
+
+// balancedParens reports whether every '(' in s is closed within s.
+func balancedParens(s string) bool {
+	depth := 0
+	for _, c := range s {
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
 }
 
 func stripQuote(s string) string {
@@ -631,6 +739,12 @@ func stripQuote(s string) string {
 
 // splitCompare finds the top-level comparison operator.
 func splitCompare(s string) (string, string, string) {
+	// MacRoman comparison operators
+	for _, op := range []struct{ tok, norm string }{{"≠", "<>"}, {"≤", "<="}, {"≥", ">="}} {
+		if i := strings.Index(s, op.tok); i >= 0 {
+			return strings.TrimSpace(s[:i]), op.norm, strings.TrimSpace(s[i+len(op.tok):])
+		}
+	}
 	depth := 0
 	inStr := false
 	for i := 0; i < len(s); i++ {
