@@ -456,8 +456,22 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 			return v, true
 		}
 	}
-	v, ok := pp.globals[name]
-	return v, ok
+	if v, ok := pp.globals[name]; ok {
+		return v, true
+	}
+	// Built-in variables naming the current position. The loader asserts
+	// with them: "if &SysSeg <> 'Loader    ' then AError ...", so SysSeg is
+	// blank-padded to the 10-character OMF load-segment name.
+	switch name {
+	case "SYSSEG":
+		return fmt.Sprintf("%-10s", strings.Trim(pp.st.loadName, "'")), true
+	case "SYSMOD":
+		if pp.st.cur != nil {
+			return pp.st.cur.name, true
+		}
+		return "", true
+	}
+	return "", false
 }
 
 // ---------- & substitution ----------
@@ -805,6 +819,14 @@ func (pp *ppState) condCompare(s string) (int64, bool) {
 	// One side did not evaluate as a number, so compare as strings. A macro
 	// argument substituted into the condition often is not numeric at all.
 	ls, rs := stripQuote(lhs), stripQuote(rhs)
+	// Trailing blanks are significant between two quoted strings, but an
+	// unquoted operand is a substituted value whose own trailing blanks are
+	// indistinguishable from the whitespace separating it from the operator.
+	// &SysSeg yields a blank-padded 10-character name and the loader compares
+	// it against 'Loader    ', so ignore trailing blanks in that case.
+	if !isQuoted(lhs) || !isQuoted(rhs) {
+		ls, rs = strings.TrimRight(ls, " \t"), strings.TrimRight(rs, " \t")
+	}
 	if op == "=" || op == "<>" {
 		eq := strings.EqualFold(ls, rs)
 		return boolVal(eq == (op == "=")), true
@@ -866,6 +888,11 @@ func balancedParens(s string) bool {
 		}
 	}
 	return depth == 0
+}
+
+func isQuoted(s string) bool {
+	s = strings.TrimSpace(s)
+	return len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\''
 }
 
 func stripQuote(s string) string {

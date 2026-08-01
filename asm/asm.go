@@ -555,7 +555,8 @@ func (st *asmState) doLine(l line) {
 		st.strMode = strings.ToUpper(operandOnly(l.rest))
 		return
 	case "title", "eject", "print", "space", "page", "pagesize", "blanks",
-		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl":
+		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl",
+		"datachk":
 		return // listing/diagnostic control: no object-file effect
 	case "with", "endwith":
 		return // record fields are defined globally here

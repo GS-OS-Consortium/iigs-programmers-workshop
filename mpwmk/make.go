@@ -213,12 +213,23 @@ func (b *Builder) Build(target string) error {
 	}
 	var newest time.Time
 	for _, d := range rule.Deps {
-		if err := b.Build(d); err != nil {
-			return err
+		// A dependency that is nothing but a variable reference may hold a
+		// whole list of files -- make.os builds the loader from "{Files}".
+		// Only that form is re-split: MPW file names contain spaces, so
+		// splitting an ordinary dependency would tear one name into pieces.
+		deps := []string{d}
+		if t := strings.TrimSpace(d); strings.HasPrefix(t, "{") &&
+			strings.HasSuffix(t, "}") && !strings.Contains(t[:len(t)-1], "}") {
+			deps = splitFields(b.Env.Expand(t))
 		}
-		if fi, err := os.Stat(b.Env.HostPath(d)); err == nil {
-			if fi.ModTime().After(newest) {
-				newest = fi.ModTime()
+		for _, dep := range deps {
+			if err := b.Build(dep); err != nil {
+				return err
+			}
+			if fi, err := os.Stat(b.Env.HostPath(dep)); err == nil {
+				if fi.ModTime().After(newest) {
+					newest = fi.ModTime()
+				}
 			}
 		}
 	}
