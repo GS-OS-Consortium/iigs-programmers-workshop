@@ -182,6 +182,22 @@ func (st *asmState) define(name string, v Val) {
 	st.symSeq[key] = append(st.symSeq[key], v)
 }
 
+// redefine assigns a SET symbol. Unlike define it replaces the symbol's value
+// instead of recording another definition: a dummy PC is reassigned dozens of
+// times, and each one is meant to be read immediately, not to become another
+// candidate for a forward reference to bind to.
+func (st *asmState) redefine(name string, v Val) {
+	name = strings.ToUpper(name)
+	key := name
+	if !st.entries[name] && !st.fileWide[name] {
+		key = st.scopePrefix() + name
+	}
+	st.defSeq++
+	v.defSeq = st.defSeq
+	st.syms[key] = v
+	st.symSeq[key] = []Val{v}
+}
+
 // ---------- line model ----------
 
 type line struct {
@@ -446,20 +462,29 @@ func (st *asmState) doLine(l line) {
 			st.errf("a label is not allowed on ANOP")
 		}
 		return
-	case "equ":
+	case "equ", "set":
+		// SET is EQU for a symbol that may be redefined; the DSect/BYTE/WORD/
+		// LONG macros walk a dummy PC that way to lay out parameter records.
 		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
-			st.errf("EQU: %v", err)
+			st.errf("%s: %v", strings.ToUpper(op), err)
 			return
 		}
 		if v.hasFwd() {
-			st.errf("EQU: undefined forward symbol in %q", l.rest)
+			st.errf("%s: undefined forward symbol in %q", strings.ToUpper(op), l.rest)
+			return
+		}
+		if op == "set" {
+			st.redefine(l.label, v)
 			return
 		}
 		st.define(l.label, v)
 		if u := strings.ToUpper(l.label); st.entryEqu[u] && v.isNum() {
 			st.addAction(action{kind: aRec, bytes: gequRec(u, st.entryPriv[u], v.C)})
 		}
+		return
+	case "aerror":
+		st.errf("AERROR %s", strings.TrimSpace(l.rest))
 		return
 	case "record":
 		st.recDown = false
@@ -866,7 +891,11 @@ func (st *asmState) doDC(op string, l line) {
 	case "dc.l":
 		size = 4
 	}
-	for _, item := range splitArgs(l.rest) {
+	// The operand field ends at the first blank outside a quoted string, so a
+	// bare trailing comment is not part of it -- these sources contain typos
+	// like "DC.L ctree_idx_rec  'ptr to ..." where the comment opens with a
+	// quote instead of a semicolon.
+	for _, item := range splitArgs(operandOnly(l.rest)) {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue

@@ -45,6 +45,8 @@ type ppState struct {
 	protoNext bool // next line is the macro prototype
 
 	incDirs []string
+	// mexit is set by MEXIT to stop expanding the current macro body
+	mexit bool
 }
 
 func newPP(st *asmState) *ppState {
@@ -216,6 +218,12 @@ func (pp *ppState) processLine(raw string) {
 	l := splitLine(raw)
 	op := strings.ToLower(l.op)
 
+	// MEXIT leaves the macro body early (MEND still closes the definition).
+	if op == "mexit" && pp.active() {
+		pp.mexit = true
+		return
+	}
+
 	// conditional structure is tracked even in inactive regions
 	switch op {
 	case "if":
@@ -373,11 +381,12 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	pp.frames = append(pp.frames, frame)
 	condDepth := len(pp.conds)
 	for _, bl := range def.body {
-		if pp.st.ended {
+		if pp.st.ended || pp.mexit {
 			break
 		}
 		pp.processLine(bl)
 	}
+	pp.mexit = false
 	// close any conditional left open by the body (defensive)
 	if len(pp.conds) > condDepth {
 		pp.conds = pp.conds[:condDepth]
