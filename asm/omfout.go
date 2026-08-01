@@ -60,8 +60,10 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	if s.Skip {
 		kind |= 0x0200
 	}
-	if kind&^0x0200 != 0x4001 {
-		// data segments carry BANKSIZE 0 (oracle-verified)
+	// The low five bits of KIND are the segment type; type 1 is data, and a
+	// data segment carries BANKSIZE 0 whatever its attribute bits say
+	// (oracle-verified for both $4001 and the exported $0001).
+	if kind&0x1F != 0x01 {
 		le.PutUint32(hdr[0x10:], 0x10000) // BANKSIZE
 	}
 	le.PutUint16(hdr[0x14:], kind)          // KIND

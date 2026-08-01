@@ -124,6 +124,9 @@ type asmState struct {
 	recSize   map[string]int64
 	recFields map[string]map[string]int64
 	recDown   bool // RECORD ...,decrement: fields grow downward
+	// withs are the record instances named by WITH, innermost last; a bare
+	// field name is looked up through them before the plain symbol table.
+	withs []string
 	// skipMode is PROC SKIP: a sticky mode, not a per-segment attribute --
 	// once a PROC carries SKIP every later segment keeps the KIND bit until a
 	// PROC carries NOSKIP (oracle-probed).
@@ -170,6 +173,13 @@ func (st *asmState) lookup(name string) Val {
 	// there, even when another segment in the same file defines it.
 	if st.cur != nil && st.cur.imports[name] {
 		return fwdVal(name)
+	}
+	// A WITH'd record instance qualifies a bare field name; the most recent
+	// WITH wins.
+	for i := len(st.withs) - 1; i >= 0; i-- {
+		if v, ok := st.syms[st.withs[i]+"."+name]; ok {
+			return v
+		}
 	}
 	scope := st.scopePrefix()
 	for _, key := range [2]string{scope + name, name} {
@@ -603,6 +613,7 @@ func (st *asmState) doLine(l line) {
 		st.recDown = false
 		v := int64(0)
 		hasStart := false
+		export := false
 		if r := operandOnly(l.rest); r != "" {
 			// "RECORD start[,increment|decrement]": decrement grows fields
 			// downward from the start offset
@@ -612,7 +623,10 @@ func (st *asmState) doLine(l line) {
 				case "decrement":
 					st.recDown = true
 					continue
-				case "increment", "export", "private", "entry", "":
+				case "export":
+					export = true
+					continue
+				case "increment", "private", "entry", "":
 					continue // attributes: no effect on field offsets
 				}
 				if i > 0 {
@@ -630,8 +644,14 @@ func (st *asmState) doLine(l line) {
 			// A RECORD with no start offset is not a template at all: it
 			// opens a data segment (oracle-verified KIND $4001), which is how
 			// these sources define tables like Character.FST's cmd_tbl that
-			// other segments reach through IMPORT.
-			st.beginSegment(l.label, 0x4001)
+			// other segments reach through IMPORT. EXPORT clears its PRIVATE
+			// bit exactly as it does for a PROC, giving KIND $0001 (Init1's
+			// std_buffer).
+			kind := uint16(0x4001)
+			if export {
+				kind = 0x0001
+			}
+			st.beginSegment(l.label, kind)
 			return
 		}
 		st.inRecord = true
@@ -672,8 +692,21 @@ func (st *asmState) doLine(l line) {
 		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl",
 		"datachk", "codechk":
 		return // listing/diagnostic control: no object-file effect
-	case "with", "endwith":
-		return // record fields are defined globally here
+	case "with":
+		// WITH brings a record instance's fields into scope unqualified. For a
+		// template that changes nothing (its fields are plain offsets defined
+		// globally), but for an instance -- Init4 does "import
+		// jn_parms:jn_parmBlock" then "with jn_parms" -- a bare field name has
+		// to mean jn_parms.field, an external reference, not the bare offset.
+		for _, a := range splitArgs(operandOnly(l.rest)) {
+			if a = strings.ToUpper(strings.TrimSpace(a)); a != "" {
+				st.withs = append(st.withs, a)
+			}
+		}
+		return
+	case "endwith":
+		st.withs = nil
+		return
 	case "seg":
 		name := operandOnly(l.rest)
 		if u, err := unquote(name); err == nil && strings.HasPrefix(name, "'") {
@@ -699,8 +732,10 @@ func (st *asmState) doLine(l line) {
 			for f, off := range st.recFields[rec] {
 				v := fwdVal(nm)
 				v.C = off
-				st.define(nm+"."+f, v)
+				// file-wide BEFORE defining: define() consults fileWide to
+				// decide whether to scope the key to the current segment
 				st.fileWide[nm+"."+f] = true
+				st.define(nm+"."+f, v)
 			}
 		}
 		return
@@ -870,6 +905,7 @@ func (st *asmState) beginSegment(label string, kind uint16) {
 }
 
 func (st *asmState) openSegment(seg *segState) {
+	st.withs = nil // WITH scoping does not cross a segment boundary
 	// A segment whose own label is EXPORTed is not private: UniDisk3.5 says
 	// "EXPORT driver_data" before "driver_data PROC" and its segment is
 	// KIND $0000 (oracle-verified), the same as writing "PROC EXPORT".
