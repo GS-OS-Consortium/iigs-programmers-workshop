@@ -421,7 +421,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			// A published name is declared once, at its last definition;
 			// earlier ones were provisional and are dropped now that the
 			// count is known.
-			if a.global != "" && a.gseq != st.globalNth[a.global] {
+			if a.global != "" && a.gseq != st.pubGseq[a.global] {
 				continue
 			}
 			e.flush()

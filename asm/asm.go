@@ -93,10 +93,13 @@ type asmState struct {
 	// labels that name the segments themselves.
 	fileWide map[string]bool
 	segNames map[string]bool // segment labels, which do fold in differences
-	// globalNth counts definitions of each published name as they are seen;
-	// only the last one keeps its GLOBAL record (see defineCodeLabel), and
-	// lastPubSeq remembers which definition that was.
+	// A published name emits exactly one GLOBAL record. globalNth numbers the
+	// definitions as they are seen, entrySeg says which segment the ENTRY or
+	// EXPORT directive pinned it to (-1 = file scope, unpinned), pubGseq is
+	// the definition finally chosen, and lastPubSeq is its defSeq.
 	globalNth  map[string]int
+	entrySeg   map[string]int
+	pubGseq    map[string]int
 	lastPubSeq map[string]int64
 	loadName   string // current SEG name for new PROCs
 	segs       []*segState
@@ -468,6 +471,8 @@ func newState() *asmState {
 		entryPriv:  map[string]byte{},
 		codeChk:    true,
 		globalNth:  map[string]int{},
+		entrySeg:   map[string]int{},
+		pubGseq:    map[string]int{},
 		lastPubSeq: map[string]int64{},
 		fileWide:   map[string]bool{},
 		segNames:   map[string]bool{},
@@ -787,7 +792,20 @@ func (st *asmState) doLine(l line) {
 			}
 			st.entries[nm] = true
 			st.fileWide[nm] = true
-			st.entryPriv[nm] = priv
+			// EXPORT wins over ENTRY whichever order they come in: scm
+			// declares "export fst_count" once and "entry fst_count" twice
+			// more, and the GLOBAL is still public (oracle-probed).
+			if _, seen := st.entryPriv[nm]; priv == 0 || !seen {
+				st.entryPriv[nm] = priv
+			}
+			// A directive inside a segment pins the publication to the
+			// definition standing in that segment; one at file scope leaves
+			// it to the first definition seen.
+			if st.cur != nil {
+				st.entrySeg[nm] = st.curSegIndex()
+			} else if _, seen := st.entrySeg[nm]; !seen {
+				st.entrySeg[nm] = -1
+			}
 			if strings.EqualFold(strings.TrimSpace(kind), "equ") {
 				st.entryEqu[nm] = true
 			}
@@ -984,7 +1002,13 @@ func (st *asmState) defineCodeLabel(name string) {
 	// both a PROC and, much later, a plain label).
 	if st.entries[u] && !st.entryEqu[u] && !st.segNames[u] {
 		st.globalNth[u]++
-		st.lastPubSeq[u] = st.defSeq
+		pinned, ok := st.entrySeg[u]
+		_, chosen := st.pubGseq[u]
+		// The pinned segment's definition wins; failing that, the first.
+		if (ok && pinned == st.curSegIndex()) || (!chosen && (!ok || pinned < 0)) {
+			st.pubGseq[u] = st.globalNth[u]
+			st.lastPubSeq[u] = st.defSeq
+		}
 		st.addAction(action{kind: aRec, bytes: globalRec(u, st.entryPriv[u]),
 			global: u, gseq: st.globalNth[u]})
 	}

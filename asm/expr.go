@@ -37,7 +37,7 @@ type exprParser struct {
 
 func evalExpr(s string, ctx *exprCtx) (Val, error) {
 	p := &exprParser{s: strings.TrimSpace(s), ctx: ctx}
-	v, err := p.parseAdd()
+	v, err := p.parseShift()
 	if err != nil {
 		return Val{}, err
 	}
@@ -115,7 +115,7 @@ func (p *exprParser) peekWord(w string) bool {
 }
 
 func (p *exprParser) parseAdd() (Val, error) {
-	v, err := p.parseShift()
+	v, err := p.parseMul()
 	if err != nil {
 		return Val{}, err
 	}
@@ -124,7 +124,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 		switch {
 		case p.peekWord("AND"): // word forms of the bitwise operators
 			p.pos += 3
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -133,7 +133,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			}
 		case p.peekWord("OR"):
 			p.pos += 2
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -142,7 +142,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			}
 		case p.peekWord("EOR"), p.peekWord("XOR"):
 			p.pos += 3
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -151,7 +151,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			}
 		case p.peek2() == "--": // bitwise XOR (MPW asm)
 			p.pos += 2
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -160,7 +160,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			}
 		case p.peek2() == "++": // bitwise OR (MPW asm)
 			p.pos += 2
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -169,7 +169,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			}
 		case p.peek() == '+':
 			p.pos++
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -178,7 +178,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			}
 		case p.peek() == '-':
 			p.pos++
-			r, err := p.parseShift()
+			r, err := p.parseMul()
 			if err != nil {
 				return Val{}, err
 			}
@@ -206,8 +206,12 @@ func (p *exprParser) absify(v Val) Val {
 	return v
 }
 
+// parseShift is the OUTERMOST binary level: ">>" and "<<" bind more loosely
+// than anything else, taking the whole expression on either side. So
+// "device_name+1>>16" is "(device_name+1)>>16" and "lab>>16+$4000" shifts by
+// 16400 (both oracle-probed).
 func (p *exprParser) parseShift() (Val, error) {
-	v, err := p.parseMul()
+	v, err := p.parseAdd()
 	if err != nil {
 		return Val{}, err
 	}
@@ -216,7 +220,7 @@ func (p *exprParser) parseShift() (Val, error) {
 		switch p.peek2() {
 		case ">>":
 			p.pos += 2
-			r, err := p.parseMul()
+			r, err := p.parseAdd()
 			if err != nil {
 				return Val{}, err
 			}
@@ -225,7 +229,7 @@ func (p *exprParser) parseShift() (Val, error) {
 			}
 		case "<<":
 			p.pos += 2
-			r, err := p.parseMul()
+			r, err := p.parseAdd()
 			if err != nil {
 				return Val{}, err
 			}
@@ -318,7 +322,7 @@ func (p *exprParser) parseUnary() (Val, error) {
 		return v.negate(), nil
 	case '(':
 		p.pos++
-		v, err := p.parseAdd()
+		v, err := p.parseShift()
 		if err != nil {
 			return Val{}, err
 		}
