@@ -49,6 +49,22 @@ func Link(objs []*omf.File) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Record GLOBAL (ENTRY/EXPORT) definitions at their offsets in
+			// the merged image so expressions can reference them by name.
+			off := os.base
+			for _, r := range s.Records {
+				switch {
+				case r.Op >= 0x01 && r.Op <= 0xDF:
+					off += int64(r.Op)
+				case r.Op == omf.RecLconst, r.Op == omf.RecDS:
+					off += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
+				case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr:
+					off += int64(r.Raw[1])
+				case r.Op == omf.RecGlobal:
+					n := int(r.Raw[1])
+					globals[string(r.Raw[2:2+n])] = off
+				}
+			}
 			image = append(image, img...)
 		}
 	}

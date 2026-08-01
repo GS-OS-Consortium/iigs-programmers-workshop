@@ -491,11 +491,12 @@ func (st *asmState) doLine(l line) {
 			}
 		}
 		return
-	case "export":
-		return // exports don't change our object output yet (oracle TBD)
-	case "entry":
+	case "entry", "export":
+		// Both publish a symbol to the linker: a GLOBAL record is emitted
+		// where the label is defined, and references use the symbol name.
 		for _, a := range splitArgs(operandOnly(l.rest)) {
-			nm := strings.ToUpper(strings.TrimSpace(a))
+			// an optional ":TYPE" suffix (e.g. "cmd_tbl:data") is a hint only
+			nm := strings.ToUpper(strings.TrimSpace(strings.SplitN(a, ":", 2)[0]))
 			if nm != "" {
 				st.entries[nm] = true
 			}
@@ -569,8 +570,22 @@ func (st *asmState) doLine(l line) {
 	st.errf("unknown opcode/directive %q", l.op)
 }
 
+// resumeSegment reopens the most recent segment when code or data appears
+// after its ENDP (several drivers continue their data that way).
+func (st *asmState) resumeSegment() bool {
+	if st.cur != nil {
+		return true
+	}
+	if st.ended || len(st.segs) == 0 {
+		return false
+	}
+	st.cur = st.segs[len(st.segs)-1]
+	st.pc = st.cur.endPC
+	return true
+}
+
 func (st *asmState) defineCodeLabel(name string) {
-	if st.cur == nil {
+	if !st.resumeSegment() {
 		st.errf("label %q outside PROC", name)
 		return
 	}
@@ -695,7 +710,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 }
 
 func (st *asmState) addAction(a action) {
-	if st.cur == nil {
+	if !st.resumeSegment() {
 		st.errf("code outside PROC")
 		return
 	}
@@ -707,7 +722,7 @@ func (st *asmState) addAction(a action) {
 // Units are kept separate: the original assembler's CONST/LCONST chunking
 // flushes at unit boundaries when the next unit would cross 255 bytes.
 func (st *asmState) emitBytes(b ...byte) {
-	if st.cur == nil {
+	if !st.resumeSegment() {
 		st.errf("code outside PROC")
 		return
 	}

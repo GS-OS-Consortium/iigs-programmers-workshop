@@ -197,7 +197,9 @@ func (st *asmState) exprRef(t term, c int64, curSeg int) (string, int64) {
 	if t.fwd != "" {
 		return t.fwd, c
 	}
-	if t.name != "" && (t.seg != curSeg || (t.viaFwd && st.entries[t.name])) {
+	// Only ENTRY symbols can be named in an expression record; a plain
+	// cross-segment label is reached through its own segment plus offset.
+	if t.name != "" && st.entries[t.name] && (t.seg != curSeg || t.viaFwd) {
 		return t.name, c - t.symOff
 	}
 	return st.segs[t.seg].name, c
