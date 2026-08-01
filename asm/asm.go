@@ -57,6 +57,7 @@ type segState struct {
 	align      int64  // PROC ALIGN n (segment alignment)
 	kind       uint16 // OMF KIND ($4001 for a data segment from bare RECORD)
 	kindSet    bool   // kind was set explicitly (PROC EXPORT clears to $0000)
+	skip       bool   // OMF KIND SKIP bit ($0200), from the sticky PROC SKIP mode
 	actions    []action
 	endPC      int64
 }
@@ -123,6 +124,10 @@ type asmState struct {
 	recSize   map[string]int64
 	recFields map[string]map[string]int64
 	recDown   bool // RECORD ...,decrement: fields grow downward
+	// skipMode is PROC SKIP: a sticky mode, not a per-segment attribute --
+	// once a PROC carries SKIP every later segment keeps the KIND bit until a
+	// PROC carries NOSKIP (oracle-probed).
+	skipMode bool
 
 	// preprocessor state (conditionals, macros, set-vars) lives in preproc.go
 	pp *ppState
@@ -502,7 +507,13 @@ func (st *asmState) doLine(l line) {
 					seg.kind = 0x0000
 					seg.kindSet = true
 					continue
-				case "private", "entry", "dynamic", "skip", "noskip":
+				case "skip":
+					st.skipMode = true
+					continue
+				case "noskip":
+					st.skipMode = false
+					continue
+				case "private", "entry", "dynamic":
 					continue // no effect on the emitted object
 				}
 				st.errf("unsupported %s operand %q", strings.ToUpper(op), opt)
@@ -525,6 +536,7 @@ func (st *asmState) doLine(l line) {
 				st.errf("unsupported %s operand %q", strings.ToUpper(op), opt)
 			}
 		}
+		seg.skip = st.skipMode
 		st.openSegment(seg)
 		return
 	case "endp", "endproc", "endf":
@@ -1175,8 +1187,35 @@ func (st *asmState) doDCB(op string, l line) {
 		return
 	}
 	n, err1 := evalNum(strings.TrimSpace(args[0]), &exprCtx{st: st})
+	if err1 != nil {
+		st.errf("DCB.B: bad operands")
+		return
+	}
+	// The fill value is a data item like any other, so under STRING PASCAL a
+	// quoted one carries its length byte and each repeat is two bytes wide:
+	// the SCSI manager's "dcb.b 20,' '" name padding is 40 bytes, not 20.
+	if fill := strings.TrimSpace(args[1]); st.strMode == "PASCAL" && len(fill) > 1 && fill[0] == '\'' {
+		s, err := unquote(fill)
+		if err != nil {
+			st.errf("DCB: %v", err)
+			return
+		}
+		b := []byte(s)
+		if st.msb {
+			for i := range b {
+				b[i] |= 0x80
+			}
+		}
+		b = append([]byte{byte(len(b))}, b...)
+		var out []byte
+		for i := int64(0); i < n; i++ {
+			out = append(out, b...)
+		}
+		st.emitBytes(out...)
+		return
+	}
 	v, err2 := evalNum(strings.TrimSpace(args[1]), &exprCtx{st: st})
-	if err1 != nil || err2 != nil {
+	if err2 != nil {
 		st.errf("DCB.B: bad operands")
 		return
 	}

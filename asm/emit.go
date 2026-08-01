@@ -496,6 +496,6 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 		}
 	}
 	return &Segment{Name: seg.name, LoadName: seg.loadName, Org: seg.org, Kind: seg.kind, KindSet: seg.kindSet,
-		TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
+		Skip: seg.skip, TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
 		Length: seg.endPC, Records: e.end()}, nil
 }
