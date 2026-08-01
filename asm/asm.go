@@ -166,7 +166,11 @@ func (st *asmState) scopePrefix() string {
 	if st.scopeSeg >= 0 {
 		return fmt.Sprintf("%d\x00", st.scopeSeg)
 	}
-	if st.cur == nil || st.inRecord || st.cur.kind == 0x4001 {
+	// A data segment's fields are file-wide whether or not it is exported --
+	// the low five bits of KIND are the type, so $0001 counts as much as
+	// $4001 (HFS's "data" record is exported, and scoping its fields to their
+	// own segment made every cross-segment field reference undefined).
+	if st.cur == nil || st.inRecord || st.cur.kind&0x1F == 0x01 {
 		return ""
 	}
 	return fmt.Sprintf("%d\x00", st.curSegIndex())
@@ -992,7 +996,7 @@ func (st *asmState) defineCodeLabel(name string) {
 	u := strings.ToUpper(name)
 	// Fields of a RECORD data segment are also reachable through the
 	// qualified "record.field" form, as a template's fields are.
-	if st.cur.kind == 0x4001 && u != st.cur.name {
+	if st.cur.kind&0x1F == 0x01 && u != st.cur.name {
 		st.define(st.cur.name+"."+u, segVal(st.curSegIndex(), st.pc))
 	}
 	// A published name yields exactly ONE GLOBAL record, at its last
