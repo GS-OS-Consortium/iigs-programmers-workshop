@@ -180,7 +180,7 @@ func (p *exprParser) parseShift() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp(">>", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x >> uint(y), nil }); err != nil {
+			if v, err = shiftOp(">>", p.absify(v), p.absify(r), -r.C); err != nil {
 				return Val{}, err
 			}
 		case "<<":
@@ -189,7 +189,7 @@ func (p *exprParser) parseShift() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("<<", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x << uint(y), nil }); err != nil {
+			if v, err = shiftOp("<<", p.absify(v), p.absify(r), r.C); err != nil {
 				return Val{}, err
 			}
 		default:

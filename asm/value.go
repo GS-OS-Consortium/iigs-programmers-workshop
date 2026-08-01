@@ -23,6 +23,11 @@ type Val struct {
 	C   int64
 	Pos []term
 	Neg []term
+	// Shift is a pending shift on a relocatable value (negative = right), as
+	// in `pushlong #label>>16` to extract a label's bank. The amount cannot be
+	// applied here because the segment base is not known until link time, so
+	// it rides along and the linker performs it via an expression record.
+	Shift int64
 	// defSeq orders definitions of duplicated labels (see asmState.symSeq).
 	defSeq int64
 }
@@ -114,4 +119,22 @@ func numOp(name string, a, b Val, f func(x, y int64) (int64, error)) (Val, error
 	}
 	c, err := f(a.C, b.C)
 	return num(c), err
+}
+
+// shiftOp applies << or >> (amount negated for >>). A relocatable left side
+// defers the shift to the linker; anything more involved than one pending
+// shift on a bare label is beyond what an expression record can carry.
+func shiftOp(name string, a, b Val, amount int64) (Val, error) {
+	if a.isNum() && b.isNum() {
+		return num(applyShift(a.C, amount)), nil
+	}
+	if !b.isNum() {
+		return Val{}, fmt.Errorf("%s requires a constant shift count", name)
+	}
+	if a.Shift != 0 {
+		return Val{}, fmt.Errorf("%s: cannot shift a relocatable value twice", name)
+	}
+	r := a
+	r.Shift = amount
+	return r, nil
 }

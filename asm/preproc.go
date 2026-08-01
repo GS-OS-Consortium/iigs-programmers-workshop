@@ -152,10 +152,10 @@ func (pp *ppState) processSource(src, path string) {
 				n++
 				trimmed := strings.TrimRight(next, " \t")
 				if strings.HasSuffix(trimmed, "\\") {
-					joined += strings.TrimLeft(strings.TrimSuffix(trimmed, "\\"), " \t")
+					joined = joinContinuation(joined, strings.TrimSuffix(trimmed, "\\"))
 					continue
 				}
-				joined += strings.TrimLeft(next, " \t")
+				joined = joinContinuation(joined, next)
 				break
 			}
 			raw = joined
@@ -163,6 +163,25 @@ func (pp *ppState) processSource(src, path string) {
 		pp.processLine(raw)
 	}
 	st.curFile, st.curLine = prevFile, prevLine
+}
+
+// joinContinuation appends a '\'-continued line to what came before it.
+//
+// The break may fall in the middle of an expression ("#bit_6++\" + "bit_7")
+// or between whole tokens ("IF block_dvc = true\" + "AND ..."). The original
+// assembler keeps both working, so keep the pieces adjacent when either side
+// carries an operator and separate them otherwise; inserting a blank into an
+// expression would end the operand field under BLANKS OFF.
+func joinContinuation(acc, next string) string {
+	next = strings.TrimLeft(next, " \t")
+	isOp := func(c byte) bool { return strings.IndexByte("+-*/<>=&|^,()[]#", c) >= 0 }
+	if acc == "" || next == "" {
+		return acc + next
+	}
+	if isOp(acc[len(acc)-1]) || isOp(next[0]) {
+		return acc + next
+	}
+	return acc + " " + next
 }
 
 func (pp *ppState) processLine(raw string) {
@@ -611,12 +630,19 @@ func (pp *ppState) callFunc(name string, args []string) string {
 		}
 		return s
 	case "SETTING":
-		switch strings.ToUpper(pp.argText(args[0])) {
-		case "MSB":
-			if pp.st.msb {
+		onOff := func(b bool) string {
+			if b {
 				return "ON"
 			}
 			return "OFF"
+		}
+		switch strings.ToUpper(pp.argText(args[0])) {
+		case "MSB":
+			return onOff(pp.st.msb)
+		case "LONGA":
+			return onOff(pp.st.longA)
+		case "LONGI":
+			return onOff(pp.st.longI)
 		case "STRING":
 			return pp.st.strMode
 		}
@@ -646,13 +672,94 @@ func (pp *ppState) rawArg(args []string) string {
 
 // ---------- conditionals ----------
 
-// condEval evaluates an IF/ELSEIF condition (trailing THEN stripped):
-// numeric comparison when both sides evaluate; string comparison otherwise.
+// condEval evaluates an IF/ELSEIF condition (trailing THEN stripped).
+//
+// The assembler distinguishes boolean-typed from integer-typed results, and
+// tests them differently (verified against the original assembler): a
+// comparison or a NOT/AND/OR expression is boolean and true when bit 0 is set,
+// while a bare arithmetic expression is true when it is non-zero. So
+// "IF 2" is true but "IF not 1" is false (not 1 = $FFFE, bit 0 clear).
 func (pp *ppState) condEval(s string) bool {
+	v, isBool := pp.condValue(s)
+	if isBool {
+		return v&1 != 0
+	}
+	return v != 0
+}
+
+// condValue evaluates a condition to its value plus whether that value is
+// boolean-typed. NOT binds tighter than AND, which binds tighter than OR; all
+// three combine bitwise.
+func (pp *ppState) condValue(s string) (int64, bool) {
 	s = strings.TrimSpace(s)
 	if up := strings.ToUpper(s); strings.HasSuffix(up, "THEN") {
 		s = strings.TrimSpace(s[:len(s)-4])
 	}
+	if parts := splitLogical(s, "OR"); len(parts) > 1 {
+		var acc int64
+		for _, p := range parts {
+			v, _ := pp.condValue(p)
+			acc |= v
+		}
+		return acc, true
+	}
+	if parts := splitLogical(s, "AND"); len(parts) > 1 {
+		acc := int64(-1)
+		for _, p := range parts {
+			v, _ := pp.condValue(p)
+			acc &= v
+		}
+		return acc, true
+	}
+	if f := strings.Fields(s); len(f) > 1 && strings.EqualFold(f[0], "not") {
+		v, _ := pp.condValue(strings.TrimSpace(s[len(f[0]):]))
+		return ^v, true
+	}
+	return pp.condCompare(s)
+}
+
+// splitLogical splits s on a top-level whole-word AND/OR (case-insensitive),
+// ignoring occurrences inside quotes or parentheses.
+func splitLogical(s, word string) []string {
+	var parts []string
+	depth, inStr, start := 0, false, 0
+	isWordByte := func(c byte) bool {
+		return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '_' || c == '&' || c == '.'
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\'':
+			inStr = !inStr
+		case inStr:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case depth == 0 && (c == word[0] || c == word[0]+32):
+			if i+len(word) > len(s) || !strings.EqualFold(s[i:i+len(word)], word) {
+				continue
+			}
+			if i > 0 && isWordByte(s[i-1]) {
+				continue
+			}
+			if j := i + len(word); j < len(s) && isWordByte(s[j]) {
+				continue
+			}
+			parts = append(parts, strings.TrimSpace(s[start:i]))
+			start = i + len(word)
+			i = start - 1
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return append(parts, strings.TrimSpace(s[start:]))
+}
+
+// condCompare evaluates a single comparison or bare expression.
+func (pp *ppState) condCompare(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
 	// A bare "IF expr THEN" tests the value; anything after the expression is
 	// commentary. Word operators keep their operand.
 	if !strings.ContainsAny(s, "=<>≠≤≥") {
@@ -666,52 +773,68 @@ func (pp *ppState) condEval(s string) bool {
 	lhs, op, rhs := splitCompare(s)
 	if op == "" && strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
 		if inner := s[1 : len(s)-1]; balancedParens(inner) {
-			return pp.condEval(inner)
+			return pp.condValue(inner)
 		}
 	}
 	if op == "" {
 		n, err := evalNum(s, &exprCtx{st: pp.st})
 		if err != nil {
 			pp.st.errf("IF: %v", err)
-			return false
+			return 0, false
 		}
-		return n != 0
+		return n, false
 	}
 	ln, lerr := evalNum(lhs, &exprCtx{st: pp.st})
 	rn, rerr := evalNum(rhs, &exprCtx{st: pp.st})
 	if lerr == nil && rerr == nil {
-		switch op {
-		case "=":
-			return ln == rn
-		case "<>":
-			return ln != rn
-		case "<":
-			return ln < rn
-		case ">":
-			return ln > rn
-		case "<=":
-			return ln <= rn
-		case ">=":
-			return rn <= ln
-		}
+		return boolVal(compareOrdered(ln, rn, op)), true
 	}
-	// string comparison
+	// One side did not evaluate as a number, so compare as strings. A macro
+	// argument substituted into the condition often is not numeric at all.
 	ls, rs := stripQuote(lhs), stripQuote(rhs)
+	if op == "=" || op == "<>" {
+		eq := strings.EqualFold(ls, rs)
+		return boolVal(eq == (op == "=")), true
+	}
+	return boolVal(compareOrderedStr(strings.ToUpper(ls), strings.ToUpper(rs), op)), true
+}
+
+func boolVal(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func compareOrdered(l, r int64, op string) bool {
 	switch op {
 	case "=":
-		return strings.EqualFold(ls, rs)
+		return l == r
 	case "<>":
-		return !strings.EqualFold(ls, rs)
+		return l != r
 	case "<":
-		return strings.ToUpper(ls) < strings.ToUpper(rs)
+		return l < r
 	case ">":
-		return strings.ToUpper(ls) > strings.ToUpper(rs)
+		return l > r
 	case "<=":
-		return strings.ToUpper(ls) <= strings.ToUpper(rs)
+		return l <= r
 	case ">=":
-		return strings.ToUpper(ls) >= strings.ToUpper(rs)
+		return l >= r
 	}
-	pp.st.errf("cannot compare %q %s %q", lhs, op, rhs)
+	return false
+}
+
+func compareOrderedStr(l, r, op string) bool {
+	switch op {
+	case "<":
+		return l < r
+	case ">":
+		return l > r
+	case "<=":
+		return l <= r
+	case ">=":
+		return l >= r
+	}
 	return false
 }
 
@@ -743,7 +866,23 @@ func stripQuote(s string) string {
 }
 
 // splitCompare finds the top-level comparison operator.
+//
+// Brackets group ([foo],y indirect operands) only when they balance: a
+// substring reference such as &addr[1:1] can expand to a bare "[", and
+// treating that as an open group would hide the comparison behind it.
 func splitCompare(s string) (string, string, string) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '[' {
+			depth++
+		} else if s[i] == ']' {
+			depth--
+		}
+	}
+	return splitCompareIn(s, depth == 0)
+}
+
+func splitCompareIn(s string, brackets bool) (string, string, string) {
 	// MacRoman comparison operators
 	for _, op := range []struct{ tok, norm string }{{"≠", "<>"}, {"≤", "<="}, {"≥", ">="}} {
 		if i := strings.Index(s, op.tok); i >= 0 {
@@ -756,12 +895,20 @@ func splitCompare(s string) (string, string, string) {
 		switch s[i] {
 		case '\'':
 			inStr = !inStr
-		case '(', '[':
+		case '(':
 			if !inStr {
 				depth++
 			}
-		case ')', ']':
+		case ')':
 			if !inStr {
+				depth--
+			}
+		case '[':
+			if !inStr && brackets {
+				depth++
+			}
+		case ']':
+			if !inStr && brackets {
 				depth--
 			}
 		case '<':

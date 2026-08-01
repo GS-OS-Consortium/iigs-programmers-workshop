@@ -32,6 +32,8 @@ func Link(objs []*omf.File) ([]byte, error) {
 	var segs []*objSeg
 	byName := map[string]*objSeg{}
 	globals := map[string]int64{} // ENTRY symbols -> offset in the image
+	// "EXPORT name:EQU" symbols: absolute values, not image offsets
+	absolutes := map[string]int64{}
 	var image []byte
 	var org int64
 	var kind uint16 = 0x4000
@@ -63,6 +65,15 @@ func Link(objs []*omf.File) ([]byte, error) {
 				case r.Op == omf.RecGlobal:
 					n := int(r.Raw[1])
 					globals[string(r.Raw[2:2+n])] = off
+				case r.Op == omf.RecGequ:
+					// "EXPORT name:EQU" publishes a constant rather than a
+					// location, so its value is absolute, not image-relative.
+					n := int(r.Raw[1])
+					v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil)
+					if err != nil {
+						return nil, fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
+					}
+					absolutes[string(r.Raw[2:2+n])] = v
 				}
 			}
 			image = append(image, img...)
@@ -83,7 +94,7 @@ func Link(objs []*omf.File) ([]byte, error) {
 				pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 			case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 				size := int(r.Raw[1])
-				val, shift, err := evalOMFExpr(r.Raw[2:], byName, globals, os)
+				val, shift, err := evalOMFExpr(r.Raw[2:], byName, globals, absolutes, os)
 				if err != nil {
 					return nil, fmt.Errorf("segment %s: %w", os.name, err)
 				}
@@ -101,7 +112,7 @@ func Link(objs []*omf.File) ([]byte, error) {
 					patches = append(patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 				}
 				pc += int64(size)
-			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal:
+			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
 			default:
 				return nil, fmt.Errorf("segment %s: unsupported record %s in linker", os.name, omf.RecName(r.Op))
 			}
@@ -125,7 +136,7 @@ func segImage(s *omf.Segment) ([]byte, error) {
 			img = append(img, make([]byte, binary.LittleEndian.Uint32(r.Raw[1:]))...)
 		case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 			img = append(img, make([]byte, r.Raw[1])...)
-		case r.Op == omf.RecEnd || r.Op == omf.RecGlobal:
+		case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
 		default:
 			return nil, fmt.Errorf("unsupported record %s", omf.RecName(r.Op))
 		}
@@ -135,7 +146,7 @@ func segImage(s *omf.Segment) ([]byte, error) {
 
 // evalOMFExpr evaluates an OMF expression (label +- consts, optional final
 // shift) against object-segment bases. Returns (value, shift).
-func evalOMFExpr(b []byte, byName map[string]*objSeg, globals map[string]int64, cur *objSeg) (int64, int64, error) {
+func evalOMFExpr(b []byte, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, int64, error) {
 	var stack []int64
 	var shift int64
 	pos := 0
@@ -160,6 +171,8 @@ func evalOMFExpr(b []byte, byName map[string]*objSeg, globals map[string]int64, 
 				stack = append(stack, os.base)
 			} else if off, ok := globals[name]; ok {
 				stack = append(stack, off)
+			} else if v, ok := absolutes[name]; ok {
+				stack = append(stack, v)
 			} else {
 				return 0, 0, fmt.Errorf("undefined label %q", name)
 			}

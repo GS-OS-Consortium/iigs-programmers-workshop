@@ -6,6 +6,7 @@
 package asm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,14 +75,19 @@ type asmState struct {
 	// All definitions of each name in source order. A one-pass assembler
 	// binds a forward reference to the NEXT definition, so duplicated
 	// labels (common in this corpus) must not collapse to the last one.
-	symSeq   map[string][]Val
-	defSeq   int64           // monotonically increasing definition counter
-	imports  map[string]bool // IMPORTed external symbols
-	entries  map[string]bool // ENTRY labels awaiting definition
-	loadName string          // current SEG name for new PROCs
-	segs     []*segState
-	cur      *segState
-	pc       int64
+	symSeq  map[string][]Val
+	defSeq  int64           // monotonically increasing definition counter
+	imports map[string]bool // IMPORTed external symbols
+	entries map[string]bool // ENTRY/EXPORT labels awaiting definition
+	// entryPriv is the GLOBAL record's private byte: ENTRY publishes 1,
+	// EXPORT 0. entryEqu holds the names declared "name:EQU", which resolve
+	// to a constant and so are published as GEQU rather than GLOBAL.
+	entryPriv map[string]byte
+	entryEqu  map[string]bool
+	loadName  string // current SEG name for new PROCs
+	segs      []*segState
+	cur       *segState
+	pc        int64
 
 	// RECORD ... ENDR template mode
 	inRecord bool
@@ -284,16 +290,18 @@ func AssembleSource(src, dir string) (*Object, error) {
 
 func newState() *asmState {
 	st := &asmState{
-		cpu:      cpu65816,
-		longA:    true,
-		longI:    true,
-		msb:      false,
-		strMode:  "ASIS",
-		syms:     map[string]Val{},
-		symSeq:   map[string][]Val{},
-		imports:  map[string]bool{},
-		entries:  map[string]bool{},
-		loadName: "main",
+		cpu:       cpu65816,
+		longA:     true,
+		longI:     true,
+		msb:       false,
+		strMode:   "ASIS",
+		syms:      map[string]Val{},
+		symSeq:    map[string][]Val{},
+		imports:   map[string]bool{},
+		entries:   map[string]bool{},
+		entryPriv: map[string]byte{},
+		entryEqu:  map[string]bool{},
+		loadName:  "main",
 	}
 	st.pp = newPP(st)
 	return st
@@ -420,6 +428,9 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		st.define(l.label, v)
+		if u := strings.ToUpper(l.label); st.entryEqu[u] && v.isNum() {
+			st.addAction(action{kind: aRec, bytes: gequRec(u, st.entryPriv[u], v.C)})
+		}
 		return
 	case "record":
 		st.inRecord = true
@@ -506,13 +517,24 @@ func (st *asmState) doLine(l line) {
 		}
 		return
 	case "entry", "export":
-		// Both publish a symbol to the linker: a GLOBAL record is emitted
-		// where the label is defined, and references use the symbol name.
+		// Both publish a symbol to the linker: a record is emitted where the
+		// symbol is defined, and references use the symbol name. They differ
+		// only in the private byte (ENTRY 1, EXPORT 0).
+		priv := byte(0)
+		if op == "entry" {
+			priv = 1
+		}
 		for _, a := range splitArgs(operandOnly(l.rest)) {
-			// an optional ":TYPE" suffix (e.g. "cmd_tbl:data") is a hint only
-			nm := strings.ToUpper(strings.TrimSpace(strings.SplitN(a, ":", 2)[0]))
-			if nm != "" {
-				st.entries[nm] = true
+			// optional ":TYPE" suffix, e.g. "cmd_tbl:data" or "c_len_len:EQU"
+			name, kind, _ := strings.Cut(a, ":")
+			nm := strings.ToUpper(strings.TrimSpace(name))
+			if nm == "" {
+				continue
+			}
+			st.entries[nm] = true
+			st.entryPriv[nm] = priv
+			if strings.EqualFold(strings.TrimSpace(kind), "equ") {
+				st.entryEqu[nm] = true
 			}
 		}
 		return
@@ -604,14 +626,26 @@ func (st *asmState) defineCodeLabel(name string) {
 		return
 	}
 	st.define(name, segVal(st.curSegIndex(), st.pc))
-	if u := strings.ToUpper(name); st.entries[u] {
-		// ENTRY label definition emits a GLOBAL record (oracle-verified:
-		// name, length=0, type 'M', attr 1)
-		rec := []byte{0xE6, byte(len(u))}
-		rec = append(rec, u...)
-		rec = append(rec, 0x00, 0x00, 'M', 0x01)
-		st.addAction(action{kind: aRec, bytes: rec})
+	if u := strings.ToUpper(name); st.entries[u] && !st.entryEqu[u] {
+		st.addAction(action{kind: aRec, bytes: globalRec(u, st.entryPriv[u])})
 	}
+}
+
+// globalRec builds a GLOBAL record for a published label (oracle-verified:
+// name, length=0, type 'M', then the private byte).
+func globalRec(name string, private byte) []byte {
+	rec := append([]byte{0xE6, byte(len(name))}, name...)
+	return append(rec, 0x00, 0x00, 'M', private)
+}
+
+// gequRec builds a GEQU record: the same header as GLOBAL followed by the
+// symbol's value as an expression (constant, end).
+func gequRec(name string, private byte, v int64) []byte {
+	rec := append([]byte{0xE7, byte(len(name))}, name...)
+	rec = append(rec, 0x00, 0x00, 'M', private, 0x81)
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(v))
+	return append(append(rec, b[:]...), 0x00)
 }
 
 // doRecordLine handles lines inside RECORD ... ENDR: a template that only
@@ -798,7 +832,7 @@ func (st *asmState) doDC(op string, l line) {
 			}
 			st.emitBytes(b...)
 		} else {
-			st.addAction(action{kind: aExpr, target: v, size: size, rec: byte(recLexpr), shift: shift})
+			st.addAction(action{kind: aExpr, target: v, size: size, rec: byte(recLexpr), shift: shift + v.Shift})
 			st.pc += int64(size)
 		}
 	}
@@ -1068,7 +1102,7 @@ func (st *asmState) doInst(mn, operand string) {
 			rec = recBexpr
 		}
 		st.emitBytes(info.code)
-		st.addAction(action{kind: aExpr, target: val, size: n, rec: rec, shift: shift})
+		st.addAction(action{kind: aExpr, target: val, size: n, rec: rec, shift: shift + val.Shift})
 		st.pc += int64(n)
 	default:
 		b := []byte{info.code}
