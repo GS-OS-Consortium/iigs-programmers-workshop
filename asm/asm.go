@@ -45,7 +45,8 @@ type action struct {
 type segState struct {
 	name     string
 	loadName string
-	org      int64 // segment header ORG (from "PROC ORG expr")
+	imports  map[string]bool // IMPORTs are scoped to the declaring segment
+	org      int64           // segment header ORG (from "PROC ORG expr")
 	actions  []action
 	endPC    int64
 }
@@ -95,12 +96,15 @@ func (st *asmState) lookup(name string) Val {
 	if strings.HasPrefix(name, "@") {
 		name = st.scopedLocal(name)
 	}
-	if st.imports[name] {
+	// An IMPORT declared in the current segment makes the symbol external
+	// there, even when another segment in the same file defines it.
+	if st.cur != nil && st.cur.imports[name] {
 		return fwdVal(name)
 	}
 	if v, ok := st.syms[name]; ok {
-		// tag single-label values with the original name so emission can
-		// reference ENTRY symbols by name (ENTRY may appear later)
+		// Tag with the symbol's own name/offset so cross-segment references
+		// can be emitted by name; same-segment backward refs still use
+		// segment+offset (see exprRef).
 		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
 			v.Pos = []term{{seg: v.Pos[0].seg, name: name, symOff: v.C}}
 		}
@@ -291,7 +295,7 @@ func (st *asmState) doLine(l line) {
 			st.errf("PROC requires a label")
 			return
 		}
-		seg := &segState{name: name, loadName: st.loadName}
+		seg := &segState{name: name, loadName: st.loadName, imports: map[string]bool{}}
 		// "label PROC ORG expr" sets the segment header ORG
 		if rest := strings.TrimSpace(l.rest); rest != "" {
 			f := strings.Fields(rest)
@@ -403,8 +407,12 @@ func (st *asmState) doLine(l line) {
 		for _, a := range splitArgs(operandOnly(l.rest)) {
 			// strip an optional :TYPE suffix
 			nm := strings.ToUpper(strings.TrimSpace(strings.SplitN(a, ":", 2)[0]))
-			if nm != "" {
-				st.imports[nm] = true
+			if nm == "" {
+				continue
+			}
+			st.imports[nm] = true // union, for resolve()
+			if st.cur != nil {
+				st.cur.imports[nm] = true
 			}
 		}
 		return

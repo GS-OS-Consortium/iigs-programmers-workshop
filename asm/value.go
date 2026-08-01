@@ -15,6 +15,7 @@ type term struct {
 	fwd    string // unresolved symbol name
 	name   string // original symbol name for resolved labels (may be "")
 	symOff int64  // the symbol's own offset (to recover addends by name)
+	viaFwd bool   // reference was forward (symbol undefined when referenced)
 }
 
 type Val struct {

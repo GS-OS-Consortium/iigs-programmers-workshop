@@ -131,10 +131,13 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					err = fmt.Errorf("undefined ID (unresolvable): %s", t.fwd)
 					return
 				}
-				if len(r.Pos) == 1 && len(r.Neg) == 0 && r.Pos[0].name == "" {
+				if len(r.Pos) == 1 && len(r.Neg) == 0 {
 					r.Pos = append([]term(nil), r.Pos...)
-					r.Pos[0].name = t.fwd
-					r.Pos[0].symOff = r.C
+					if r.Pos[0].name == "" {
+						r.Pos[0].name = t.fwd
+						r.Pos[0].symOff = r.C
+					}
+					r.Pos[0].viaFwd = true
 				}
 				tv = r
 			} else {
@@ -164,14 +167,18 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 	return v, nil
 }
 
-// exprRef gives the label name and displacement for an expression record:
-// ENTRY symbols are referenced by their own name, everything else by the
-// enclosing PROC name plus offset.
-func (st *asmState) exprRef(t term, c int64) (string, int64) {
+// exprRef gives the label name and displacement for an expression record
+// (oracle-verified one-pass rules):
+//   - external (IMPORT) symbols: by name
+//   - cross-segment references: by the symbol's own name (it must be an ENTRY)
+//   - same-segment forward references to ENTRY symbols: by name, because the
+//     one-pass assembler did not yet know the symbol was local
+//   - everything else (same-segment, already defined): segment name + offset
+func (st *asmState) exprRef(t term, c int64, curSeg int) (string, int64) {
 	if t.fwd != "" {
-		return t.fwd, c // external (IMPORT) or forward-named symbol
+		return t.fwd, c
 	}
-	if t.name != "" && st.entries[t.name] {
+	if t.name != "" && (t.seg != curSeg || (t.viaFwd && st.entries[t.name])) {
 		return t.name, c - t.symOff
 	}
 	return st.segs[t.seg].name, c
@@ -180,6 +187,13 @@ func (st *asmState) exprRef(t term, c int64) (string, int64) {
 // emitSegment runs pass 2 over a segment's actions.
 func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 	e := &segEmitter{}
+	segIdx := -1
+	for i, s := range st.segs {
+		if s == seg {
+			segIdx = i
+			break
+		}
+	}
 	for _, a := range seg.actions {
 		switch a.kind {
 		case aBytes:
@@ -237,7 +251,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
-			nm, disp := st.exprRef(t.Pos[0], t.C)
+			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
 			e.expr(a.rec, a.size, nm, disp, a.shift)
 		case aExpr:
 			t, err := st.resolve(a.target)
@@ -254,7 +268,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
-			nm, disp := st.exprRef(t.Pos[0], t.C)
+			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
 			e.expr(a.rec, a.size, nm, disp, a.shift)
 		}
 	}
