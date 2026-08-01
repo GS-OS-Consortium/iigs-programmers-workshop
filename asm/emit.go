@@ -128,6 +128,27 @@ func (e *segEmitter) relexpr(size int, pos, neg []termRef, c int64, post []postO
 	e.recs = append(e.recs, exprBody(pos, neg, c, post)...)
 }
 
+// exprConstPlusShifted emits "const + (label >> n)". The original pushes the
+// constant first, then the label, then the shift, and adds -- source order --
+// rather than folding the constant into the label's displacement, which would
+// apply the shift to the sum. Init2's "pea $4000+(draw_window>>16)".
+func (e *segEmitter) exprConstPlusShifted(size int, name string, c, shift int64) {
+	e.flush()
+	body := []byte{}
+	push := func(v int64) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(v))
+		body = append(body, 0x81, b[0], b[1], b[2], b[3])
+	}
+	push(c)
+	body = append(body, 0x83, byte(len(name)))
+	body = append(body, name...)
+	push(shift)
+	body = append(body, 0x07, 0x01, recEnd)
+	e.recs = append(e.recs, recExpr, byte(size))
+	e.recs = append(e.recs, body...)
+}
+
 // exprBody builds the RPN token stream shared by the expression records.
 func exprBody(pos, neg []termRef, c int64, post []postOp) []byte {
 	body := []byte{}
@@ -190,9 +211,9 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		}
 		return v.hasUnresolvedFwd(st)
 	}
-	post, shift := v.Post, v.Shift
+	post, shift, after := v.Post, v.Shift, v.AfterShift
 	restore := func(r Val) Val {
-		r.Post, r.Shift = post, shift
+		r.Post, r.Shift, r.AfterShift = post, shift, after
 		return r
 	}
 	for guard := 0; pending(); guard++ {
@@ -469,6 +490,13 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
+			// Only a literal addend from the expression takes the
+			// const-plus-shifted form; a label's own offset within its
+			// segment is part of the reference, not an addend.
+			if a.shift != 0 && t.AfterShift && t.C-t.Pos[0].symOff != 0 {
+				e.exprConstPlusShifted(a.size, nm, disp, a.shift)
+				continue
+			}
 			e.expr(a.rec, a.size, nm, disp, a.shift)
 		case aExpr:
 			t, err := st.resolve(a.target)
@@ -492,6 +520,13 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
+			// Only a literal addend from the expression takes the
+			// const-plus-shifted form; a label's own offset within its
+			// segment is part of the reference, not an addend.
+			if a.shift != 0 && t.AfterShift && t.C-t.Pos[0].symOff != 0 {
+				e.exprConstPlusShifted(a.size, nm, disp, a.shift)
+				continue
+			}
 			e.expr(a.rec, a.size, nm, disp, a.shift)
 		}
 	}

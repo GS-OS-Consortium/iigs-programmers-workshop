@@ -53,6 +53,11 @@ type Val struct {
 	// applied here because the segment base is not known until link time, so
 	// it rides along and the linker performs it via an expression record.
 	Shift int64
+	// AfterShift records that C was added AFTER the shift rather than before,
+	// which the linker has to be told apart: Applesoft's "(romasoft-48)>>8"
+	// shifts the sum, while Init2's "$4000+(draw_window>>16)" shifts only the
+	// label. Same fields otherwise, different arithmetic.
+	AfterShift bool
 	// defSeq orders definitions of duplicated labels (see asmState.symSeq).
 	defSeq int64
 }
@@ -118,7 +123,7 @@ outer:
 		}
 		neg = append(neg, n)
 	}
-	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift}
+	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift, AfterShift: v.AfterShift}
 }
 
 // foldPub cancels pairs that cancel() left alone because they name published
@@ -143,20 +148,53 @@ outer:
 	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift}
 }
 
+// combine carries a pending shift or deferred operation through an addition:
+// "$4000+(draw_window>>16)" adds a constant to an already-shifted label, and
+// dropping the shift here silently produced the label's low word instead of
+// its bank.
+func combine(a, b Val) (int64, []postOp, error) {
+	if a.Shift != 0 && b.Shift != 0 {
+		return 0, nil, fmt.Errorf("cannot combine two shifted values")
+	}
+	_ = a
+	if len(a.Post) > 0 && len(b.Post) > 0 {
+		return 0, nil, fmt.Errorf("cannot combine two deferred expressions")
+	}
+	post := a.Post
+	if len(post) == 0 {
+		post = b.Post
+	}
+	return a.Shift + b.Shift, post, nil
+}
+
 func (v Val) add(o Val) (Val, error) {
+	shift, post, err := combine(v, o)
+	if err != nil {
+		return Val{}, err
+	}
 	r := Val{
-		C:   v.C + o.C,
-		Pos: append(append([]term(nil), v.Pos...), o.Pos...),
-		Neg: append(append([]term(nil), v.Neg...), o.Neg...),
+		C:     v.C + o.C,
+		// a constant joining an already-shifted value lands after the shift
+		AfterShift: v.AfterShift || o.AfterShift || shift != 0,
+		Pos:   append(append([]term(nil), v.Pos...), o.Pos...),
+		Neg:   append(append([]term(nil), v.Neg...), o.Neg...),
+		Shift: shift, Post: post,
 	}
 	return r.cancel(), nil
 }
 
 func (v Val) sub(o Val) (Val, error) {
+	shift, post, err := combine(v, o)
+	if err != nil {
+		return Val{}, err
+	}
 	r := Val{
-		C:   v.C - o.C,
-		Pos: append(append([]term(nil), v.Pos...), o.Neg...),
-		Neg: append(append([]term(nil), v.Neg...), o.Pos...),
+		C:     v.C - o.C,
+		// a constant joining an already-shifted value lands after the shift
+		AfterShift: v.AfterShift || o.AfterShift || shift != 0,
+		Pos:   append(append([]term(nil), v.Pos...), o.Neg...),
+		Neg:   append(append([]term(nil), v.Neg...), o.Pos...),
+		Shift: shift, Post: post,
 	}
 	return r.cancel(), nil
 }
