@@ -373,6 +373,18 @@ func operandOnly(s string) string {
 			if j > 0 && continuesOperand(s[j-1]) {
 				continue
 			}
+			// The expression may also resume after the blanks:
+			// Device.Dispatcher has "lda |temp_load_addr<tab>+2", and the
+			// original reads it as one operand. Only a sign directly against
+			// a value counts, so a "-" or "*" opening a trailing comment
+			// still ends the field.
+			k := i
+			for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
+				k++
+			}
+			if k+1 < len(s) && (s[k] == '+' || s[k] == '-') && resumesOperand(s[k+1]) {
+				continue
+			}
 			return s[:i]
 		}
 	}
@@ -383,6 +395,13 @@ func operandOnly(s string) string {
 // that following blanks are separators rather than the end of the field.
 func continuesOperand(c byte) bool {
 	return strings.IndexByte(",+-*/&|^<>=", c) >= 0
+}
+
+// resumesOperand reports whether c can begin the value after a "+" or "-"
+// that follows blanks.
+func resumesOperand(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' ||
+		c == '$' || c == '%' || c == '(' || c == '&' || c == '_'
 }
 
 // ---------- entry points ----------
