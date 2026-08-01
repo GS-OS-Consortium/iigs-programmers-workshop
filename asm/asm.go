@@ -1226,16 +1226,18 @@ func (st *asmState) doDC(op string, l line) {
 }
 
 // exprRecFor picks the expression record for an instruction operand. BEXPR
-// asks the linker to check that the address lands in the current bank, which
-// only makes sense for a 2-byte absolute operand; everything else, including
-// long transfers and DC data, is a LEXPR.
-func (st *asmState) exprRecFor(mn string, chosen Mode) byte {
-	switch chosen {
-	case Abs, AbsX, AbsY:
-	default:
+// asks the linker to check that the address lands in the current bank, so it
+// applies to any two-byte operand -- absolute, indirect, even immediate --
+// while long transfers and DC data are always LEXPR.
+//
+// CODECHK governs a direct-absolute jmp/jsr and defaults on; DATACHK governs
+// everything else and defaults off. An indirect jmp goes with DATACHK: its
+// operand is a pointer's address, not the destination (all oracle-probed).
+func (st *asmState) exprRecFor(mn string, chosen Mode, n int) byte {
+	if n != 2 {
 		return recLexpr
 	}
-	if mn == "jmp" || mn == "jsr" {
+	if (mn == "jmp" || mn == "jsr") && chosen == Abs {
 		if st.codeChk {
 			return recBexpr
 		}
@@ -1511,7 +1513,7 @@ func (st *asmState) doInst(mn, operand string) {
 
 	switch {
 	case deferred:
-		rec := st.exprRecFor(mn, chosen)
+		rec := st.exprRecFor(mn, chosen, n)
 		if chosen == Rel8 || chosen == Rel16 {
 			st.emitBytes(info.code)
 			st.addAction(action{kind: aBranch, target: val, size: n,
@@ -1528,7 +1530,7 @@ func (st *asmState) doInst(mn, operand string) {
 		st.addAction(action{kind: aBranch, target: val, size: n, pcNext: st.pc + int64(n)})
 		st.pc += int64(n)
 	case val.isLabel():
-		rec := st.exprRecFor(mn, chosen)
+		rec := st.exprRecFor(mn, chosen, n)
 		st.emitBytes(info.code)
 		st.addAction(action{kind: aExpr, target: val, size: n, rec: rec, shift: shift + val.Shift})
 		st.pc += int64(n)
