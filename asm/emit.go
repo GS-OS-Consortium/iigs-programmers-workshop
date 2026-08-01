@@ -229,7 +229,8 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 						r.Pos[0].name = t.fwd
 						r.Pos[0].symOff = r.C
 					}
-					r.Pos[0].pub = st.entries[r.Pos[0].name] && !st.segNames[r.Pos[0].name]
+					r.Pos[0].defSeq = r.defSeq
+					r.Pos[0].pub = st.publishedAt(r.Pos[0])
 					r.Pos[0].viaFwd = true
 				}
 				tv = r
@@ -260,11 +261,11 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 // and returns how much of the value the operands already account for. The
 // caller subtracts that from the expression's constant to get the residual
 // literal addend.
-func (st *asmState) termRefs(ts []term) ([]termRef, int64) {
+func (st *asmState) termRefs(ts []term, curSeg int) ([]termRef, int64) {
 	var out []termRef
 	var covered int64
 	for _, t := range ts {
-		n, d := st.exprRef(t, t.symOff, -1) // -1: never the "current" segment
+		n, d := st.exprRef(t, t.symOff, curSeg)
 		out = append(out, termRef{name: n, disp: d})
 		covered += t.symOff
 	}
@@ -275,10 +276,22 @@ func (st *asmState) termRefs(ts []term) ([]termRef, int64) {
 // forward reference binds to the next definition, not the last). The
 // reference's own segment scope is searched before the file-wide one.
 func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
-	for _, key := range [2]string{scope + name, name} {
+	for i, key := range [2]string{scope + name, name} {
 		defs := st.symSeq[key]
 		if len(defs) == 0 {
 			continue
+		}
+		// Reaching a published name from outside its segment goes through the
+		// definition its GLOBAL record declares; same-name definitions made in
+		// other segments are private to those segments.
+		if i == 1 && scope != "" {
+			if s, ok := st.lastPubSeq[name]; ok {
+				for _, d := range defs {
+					if d.defSeq == s {
+						return d, true
+					}
+				}
+			}
 		}
 		for _, d := range defs {
 			if d.defSeq > seq {
@@ -289,6 +302,33 @@ func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
 	}
 	v, ok := st.syms[name]
 	return v, ok
+}
+
+// preferLocal rebinds a branch target to a definition in the branching
+// segment when one exists.
+//
+// A label defined anywhere in a segment covers the whole of it, so it shadows
+// a file-wide symbol of the same name even for a branch that appears earlier.
+// ProDOS.FST's fst_specific does "beq get_time" two thousand lines before its
+// own get_time label, and get_time is also the name of a PROC -- pass 1 binds
+// to the PROC, and only here is the segment being assembled known.
+func (st *asmState) preferLocal(v Val, curSeg int) Val {
+	if len(v.Pos) != 1 || len(v.Neg) != 0 {
+		return v
+	}
+	t := v.Pos[0]
+	if t.name == "" || t.fwd != "" || t.seg == curSeg {
+		return v
+	}
+	defs := st.symSeq[fmt.Sprintf("%d\x00", curSeg)+t.name]
+	for _, d := range defs {
+		if len(d.Pos) == 1 && len(d.Neg) == 0 && d.Pos[0].seg == curSeg {
+			nt := term{seg: curSeg, name: t.name, symOff: d.C, defSeq: d.defSeq}
+			nt.pub = st.publishedAt(nt)
+			return Val{C: d.C, Pos: []term{nt}, Post: v.Post, Shift: v.Shift}
+		}
+	}
+	return v
 }
 
 // branchDeferred reports whether a relative branch has to reach its target
@@ -304,7 +344,7 @@ func (st *asmState) branchDeferred(v Val, curSeg int) bool {
 	if t.fwd != "" || t.seg != curSeg {
 		return true
 	}
-	return t.name != "" && st.entries[t.name] && t.viaFwd
+	return t.blocksFold()
 }
 
 // exprRef gives the label name and displacement for an expression record
@@ -320,7 +360,16 @@ func (st *asmState) exprRef(t term, c int64, curSeg int) (string, int64) {
 	}
 	// Only ENTRY symbols can be named in an expression record; a plain
 	// cross-segment label is reached through its own segment plus offset.
-	if t.name != "" && st.entries[t.name] && (t.seg != curSeg || t.viaFwd) {
+	// Across segments a published name is always reached by name -- whichever
+	// same-name definition pass 1 happened to bind to, the linker resolves the
+	// one the GLOBAL declares. Within a segment only the published definition
+	// is named; an earlier private one of the same name is just a local label
+	// (ProDOS.FST's flush_file has its own clear_index).
+	published := t.name != "" && st.entries[t.name] && !st.segNames[t.name]
+	if published && t.seg != curSeg {
+		return t.name, c - t.symOff
+	}
+	if st.publishedAt(t) && t.viaFwd {
 		return t.name, c - t.symOff
 	}
 	return st.segs[t.seg].name, c
@@ -341,6 +390,12 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 		case aBytes:
 			e.bytes(a.bytes)
 		case aRec:
+			// A published name is declared once, at its last definition;
+			// earlier ones were provisional and are dropped now that the
+			// count is known.
+			if a.global != "" && a.gseq != st.globalNth[a.global] {
+				continue
+			}
 			e.flush()
 			e.recs = append(e.recs, a.bytes...)
 		case aOrg:
@@ -364,9 +419,10 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
+			t = st.preferLocal(t, segIdx)
 			if !t.isNum() && st.branchDeferred(t, segIdx) {
-				pos, gained := st.termRefs(t.Pos)
-				neg, lost := st.termRefs(t.Neg)
+				pos, gained := st.termRefs(t.Pos, segIdx)
+				neg, lost := st.termRefs(t.Neg, segIdx)
 				e.relexpr(a.size, pos, neg, t.C-gained+lost, t.Post)
 				continue
 			}
@@ -407,8 +463,8 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				continue
 			}
 			if len(t.Pos)+len(t.Neg) > 1 || len(t.Post) > 0 {
-				pos, gained := st.termRefs(t.Pos)
-				neg, lost := st.termRefs(t.Neg)
+				pos, gained := st.termRefs(t.Pos, segIdx)
+				neg, lost := st.termRefs(t.Neg, segIdx)
 				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post)
 				continue
 			}
@@ -430,8 +486,8 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				continue
 			}
 			if len(t.Pos)+len(t.Neg) > 1 || len(t.Post) > 0 {
-				pos, gained := st.termRefs(t.Pos)
-				neg, lost := st.termRefs(t.Neg)
+				pos, gained := st.termRefs(t.Pos, segIdx)
+				neg, lost := st.termRefs(t.Neg, segIdx)
 				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post)
 				continue
 			}

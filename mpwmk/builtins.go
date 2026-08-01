@@ -87,6 +87,33 @@ func (e *Env) dispatch(name string, args []string, out io.Writer) error {
 	return fmt.Errorf("unknown command %q", name)
 }
 
+// logAsm appends one assembly to the file named by MPWMK_TOOLLOG, with every
+// path already resolved to the host filesystem. It exists so a build can be
+// replayed against the original AsmIIGS with the arguments the makefiles
+// actually produced: assembling a source "naively" gets its include paths and
+// -d defines wrong, and a byte-diff against that is meaningless.
+//
+// Record: input, output, then "-i dir" / "-d define" pairs, tab-separated.
+func (e *Env) logAsm(input, output string, incDirs, defines []string) {
+	path := os.Getenv("MPWMK_TOOLLOG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	rec := []string{input, output}
+	for _, d := range incDirs {
+		rec = append(rec, "-i", d)
+	}
+	for _, d := range defines {
+		rec = append(rec, "-d", d)
+	}
+	fmt.Fprintln(f, strings.Join(rec, "\t"))
+}
+
 func (e *Env) duplicate(args []string) error {
 	var ps []string
 	for _, a := range args {
@@ -176,6 +203,7 @@ func (e *Env) runAsm(args []string) error {
 	if d := e.Get("aiigsincludes"); d != "" {
 		incDirs = append(incDirs, e.HostPath(d))
 	}
+	e.logAsm(input, output, incDirs, defines)
 	obj, err := asm.AssembleFileOpts(input, incDirs, defines)
 	if err != nil {
 		return fmt.Errorf("asmiigs %s: %w", filepath.Base(input), err)

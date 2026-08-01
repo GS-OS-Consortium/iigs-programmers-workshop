@@ -17,12 +17,21 @@ type term struct {
 	symOff int64  // the symbol's own offset (to recover addends by name)
 	viaFwd bool   // reference was forward (symbol undefined when referenced)
 	atSeq  int64  // definition counter when the forward reference was made
+	defSeq int64  // definition counter of the definition this resolved to
 	scope  string // symbol-table scope prefix in effect at the reference
 	// pub marks a reference to a published (ENTRY/EXPORT) symbol other than a
-	// segment's own label. The original assembler does not fold a difference
-	// involving one -- the linker resolves it -- so such terms never cancel.
+	// segment's own label.
 	pub bool
 }
+
+// blocksFold reports whether a term keeps a difference of labels from folding
+// to a constant. Only a *forward* reference to a published symbol does: the
+// one-pass assembler has not seen its offset yet and, because the symbol is
+// global, cannot resolve it at the end of the pass either -- it has to hand
+// the whole expression to the linker. A backward reference to a published
+// symbol folds like any other (oracle-probed over all four combinations of
+// forward/backward and published/local).
+func (t term) blocksFold() bool { return t.pub && t.viaFwd }
 
 // postOp is an operation the linker applies after the linear part, using the
 // OMF expression opcodes ($03 multiply, $04 divide, $05 mod, $07 shift,
@@ -99,9 +108,9 @@ func (v Val) cancel() Val {
 	var neg []term
 outer:
 	for _, n := range v.Neg {
-		if n.fwd == "" && !n.pub {
+		if n.fwd == "" && !n.blocksFold() {
 			for i, p := range pos {
-				if p.fwd == "" && p.seg == n.seg && !p.pub {
+				if p.fwd == "" && p.seg == n.seg && !p.blocksFold() {
 					pos = append(pos[:i], pos[i+1:]...)
 					continue outer
 				}

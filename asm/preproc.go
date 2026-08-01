@@ -863,14 +863,25 @@ func (pp *ppState) callFunc(name string, args []string) string {
 	return ""
 }
 
-// rawArg: single-argument text form, quoted literals unquoted but WITHOUT
-// trimming (LEN counts delimiters of raw quoted params: &LEN of a param
-// whose value is 'END' is 5).
+// rawArg: single-argument text form.
+//
+// A quoted literal written directly in the source is a string constant, so
+// its delimiters are not part of the value -- &LEN('CONSOLE') is 7. Text that
+// arrives by substitution is taken verbatim, delimiters and all, so a macro
+// parameter whose value is 'END' has &LEN 5. Both oracle-probed; the console
+// driver's DIB name padding ("dcb.b 31-&len('CONSOLE'),' '") depends on the
+// first and came out two bytes short while we counted the quotes.
 func (pp *ppState) rawArg(args []string) string {
 	if len(args) == 0 {
 		return ""
 	}
-	return strings.TrimSpace(pp.subst(args[0]))
+	a := strings.TrimSpace(args[0])
+	if isQuoted(a) {
+		if u, err := unquote(a); err == nil {
+			return pp.subst(u)
+		}
+	}
+	return strings.TrimSpace(pp.subst(a))
 }
 
 // ---------- conditionals ----------

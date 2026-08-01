@@ -39,6 +39,8 @@ type action struct {
 	expr   string // aDefer / deferred aBranch: expression text
 	pcAt   int64  // aDefer: pc for '*' during pass-2 evaluation
 	segAt  int    // aDefer: segment index for '*'
+	global string // aRec GLOBAL: the published name (see globalNth)
+	gseq   int    // aRec GLOBAL: which definition of that name this is
 	line   int
 	file   string
 }
@@ -90,10 +92,15 @@ type asmState struct {
 	// labels that name the segments themselves.
 	fileWide map[string]bool
 	segNames map[string]bool // segment labels, which do fold in differences
-	loadName string // current SEG name for new PROCs
-	segs     []*segState
-	cur      *segState
-	pc       int64
+	// globalNth counts definitions of each published name as they are seen;
+	// only the last one keeps its GLOBAL record (see defineCodeLabel), and
+	// lastPubSeq remembers which definition that was.
+	globalNth  map[string]int
+	lastPubSeq map[string]int64
+	loadName   string // current SEG name for new PROCs
+	segs       []*segState
+	cur        *segState
+	pc         int64
 
 	// pendingRecs holds records produced before any segment exists (an
 	// "export k:equ" whose equate sits at file scope); the original puts them
@@ -169,8 +176,9 @@ func (st *asmState) lookup(name string) Val {
 		// can be emitted by name; same-segment backward refs still use
 		// segment+offset (see exprRef).
 		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
-			v.Pos = []term{{seg: v.Pos[0].seg, name: name, symOff: v.C,
-				pub: st.entries[name] && !st.segNames[name]}}
+			t := term{seg: v.Pos[0].seg, name: name, symOff: v.C, defSeq: v.defSeq}
+			t.pub = st.publishedAt(t)
+			v.Pos = []term{t}
 		}
 		return v
 	}
@@ -198,10 +206,20 @@ func (st *asmState) define(name string, v Val) {
 			key = st.scopePrefix() + name
 		}
 	}
-	st.syms[key] = v
 	st.defSeq++
 	v.defSeq = st.defSeq
+	st.syms[key] = v
 	st.symSeq[key] = append(st.symSeq[key], v)
+	// A published name is also recorded under its defining segment's scope,
+	// so that a reference from inside that segment reaches the definition
+	// standing right there rather than the one the GLOBAL declares. ProDOS.FST
+	// has a local clear_index in flush_file and a published one much later;
+	// flush_file branches to its own, everyone else calls the published one.
+	if key == name && !strings.HasPrefix(name, "@") {
+		if scoped := st.scopePrefix() + name; scoped != name {
+			st.symSeq[scoped] = append(st.symSeq[scoped], v)
+		}
+	}
 }
 
 // symbolList splits an IMPORT/EXPORT operand into its symbols. The list may
@@ -400,23 +418,25 @@ func AssembleSource(src, dir string) (*Object, error) {
 
 func newState() *asmState {
 	st := &asmState{
-		cpu:       cpu65816,
-		longA:     true,
-		longI:     true,
-		msb:       false,
-		strMode:   "ASIS",
-		syms:      map[string]Val{},
-		symSeq:    map[string][]Val{},
-		imports:   map[string]bool{},
-		entries:   map[string]bool{},
-		entryPriv: map[string]byte{},
-		fileWide:  map[string]bool{},
-		segNames:  map[string]bool{},
-		scopeSeg:  -1,
-		recSize:   map[string]int64{},
-		recFields: map[string]map[string]int64{},
-		entryEqu:  map[string]bool{},
-		loadName:  "main",
+		cpu:        cpu65816,
+		longA:      true,
+		longI:      true,
+		msb:        false,
+		strMode:    "ASIS",
+		syms:       map[string]Val{},
+		symSeq:     map[string][]Val{},
+		imports:    map[string]bool{},
+		entries:    map[string]bool{},
+		entryPriv:  map[string]byte{},
+		globalNth:  map[string]int{},
+		lastPubSeq: map[string]int64{},
+		fileWide:   map[string]bool{},
+		segNames:   map[string]bool{},
+		scopeSeg:   -1,
+		recSize:    map[string]int64{},
+		recFields:  map[string]map[string]int64{},
+		entryEqu:   map[string]bool{},
+		loadName:   "main",
 	}
 	st.pp = newPP(st)
 	return st
@@ -878,9 +898,30 @@ func (st *asmState) defineCodeLabel(name string) {
 	if st.cur.kind == 0x4001 && u != st.cur.name {
 		st.define(st.cur.name+"."+u, segVal(st.curSegIndex(), st.pc))
 	}
-	if st.entries[u] && !st.entryEqu[u] {
-		st.addAction(action{kind: aRec, bytes: globalRec(u, st.entryPriv[u])})
+	// A published name yields exactly ONE GLOBAL record, at its last
+	// definition -- ProDOS.FST defines clear_index twice and the original
+	// publishes only the second. A name that also names a segment yields
+	// none: the export shows up as the segment's KIND instead (get_time is
+	// both a PROC and, much later, a plain label).
+	if st.entries[u] && !st.entryEqu[u] && !st.segNames[u] {
+		st.globalNth[u]++
+		st.lastPubSeq[u] = st.defSeq
+		st.addAction(action{kind: aRec, bytes: globalRec(u, st.entryPriv[u]),
+			global: u, gseq: st.globalNth[u]})
 	}
+}
+
+// publishedAt reports whether a term names the definition that a published
+// symbol's GLOBAL record actually declares. Publication attaches to one
+// definition, not to the name: ProDOS.FST's file-scope "ENTRY clear_index"
+// covers only the second of the two definitions, so the earlier local one
+// still folds into a branch displacement like any other label.
+func (st *asmState) publishedAt(t term) bool {
+	if t.name == "" || !st.entries[t.name] || st.segNames[t.name] {
+		return false
+	}
+	seq, ok := st.lastPubSeq[t.name]
+	return !ok || t.defSeq == seq
 }
 
 // globalRec builds a GLOBAL record for a published label (oracle-verified:
@@ -898,6 +939,26 @@ func gequRec(name string, private byte, v int64) []byte {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], uint32(v))
 	return append(append(rec, b[:]...), 0x00)
+}
+
+// recField places one field of `size` bytes in the open RECORD template and
+// binds its label to the field's own offset.
+//
+// In a "RECORD start,decrement" template the fields build downward, so a
+// field's offset is the template pointer *after* the subtraction, not before
+// -- the field occupies the bytes below the pointer, not above it. The
+// console driver's direct page is built this way, and getting it backwards
+// slid every field one slot (drvr_parm_ptr came out $E6 instead of $E2).
+func (st *asmState) recField(label string, size int64, def func(string, Val)) {
+	if st.recDown {
+		st.recPC -= size
+	}
+	if label != "" {
+		def(label, num(st.recPC))
+	}
+	if !st.recDown {
+		st.recPC += size
+	}
 }
 
 // doRecordLine handles lines inside RECORD ... ENDR: a template that only
@@ -957,19 +1018,12 @@ func (st *asmState) doRecordLine(op string, l line) {
 		case "ds.l":
 			size = 4
 		}
-		if l.label != "" {
-			defField(l.label, num(st.recPC))
-		}
 		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("RECORD DS: %v", err)
 			return
 		}
-		if st.recDown {
-			st.recPC -= n * size
-		} else {
-			st.recPC += n * size
-		}
+		st.recField(l.label, n*size, defField)
 		return
 	case "equ", "set":
 		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
@@ -989,10 +1043,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 		return
 	case "dc", "dc.b", "dc.w", "dc.l", "dc.a", "dcb", "dcb.b":
 		// Inside a RECORD template, DC directives only size the field: the
-		// label takes the current template offset and no bytes are emitted.
-		if l.label != "" {
-			defField(l.label, num(st.recPC))
-		}
+		// label takes the field's template offset and no bytes are emitted.
 		unit := int64(1)
 		switch op {
 		case "dc.w":
@@ -1021,11 +1072,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 				}
 			}
 		}
-		if st.recDown {
-			st.recPC -= n * unit
-		} else {
-			st.recPC += n * unit
-		}
+		st.recField(l.label, n*unit, defField)
 		return
 	case "title", "eject", "print", "with", "endwith":
 		return
