@@ -3,6 +3,7 @@ package asm
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // Expression evaluator for MPW IIgs assembler operands, producing linear
@@ -402,8 +403,20 @@ func (p *exprParser) parseTerm() (Val, error) {
 				}
 				break
 			}
-			v = v<<8 | (int64(p.s[p.pos]) | hi)
-			p.pos++
+			if b := p.s[p.pos]; b < 0x80 {
+				v = v<<8 | (int64(b) | hi)
+				p.pos++
+			} else {
+				// The tree is UTF-8; the object wants the MacRoman byte the
+				// original assembler read (Init2's `pea '“'` is $D2).
+				r, size := utf8.DecodeRuneInString(p.s[p.pos:])
+				for _, mb := range macRomanBytes(string(r)) {
+					v = v<<8 | (int64(mb) | hi)
+					n++
+				}
+				p.pos += size
+				n--
+			}
 			n++
 		}
 		if p.pos >= len(p.s) || n == 0 || n > 4 {

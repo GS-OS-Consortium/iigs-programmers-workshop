@@ -1179,7 +1179,7 @@ func (st *asmState) doDC(op string, l line) {
 				st.errf("DC: %v", err)
 				return
 			}
-			b := []byte(s)
+			b := macRomanBytes(s)
 			if st.msb {
 				for i := range b {
 					b[i] |= 0x80
@@ -1236,7 +1236,7 @@ func (st *asmState) doDCB(op string, l line) {
 			st.errf("DCB: %v", err)
 			return
 		}
-		b := []byte(s)
+		b := macRomanBytes(s)
 		if st.msb {
 			for i := range b {
 				b[i] |= 0x80
