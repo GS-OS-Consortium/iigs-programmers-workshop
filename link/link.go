@@ -71,7 +71,8 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 					off += int64(r.Op)
 				case r.Op == omf.RecLconst, r.Op == omf.RecDS:
 					off += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
-				case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr:
+				case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr,
+					r.Op == omf.RecRelexpr:
 					off += int64(r.Raw[1])
 				case r.Op == omf.RecOrg:
 					off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
@@ -129,6 +130,14 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 					patches = append(patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 				}
 				pc += int64(size)
+			case r.Op == omf.RecRelexpr:
+				size := int(r.Raw[1])
+				v, err := relBranch(r.Raw, pc, org, byName, globals, absolutes, os)
+				if err != nil {
+					return nil, fmt.Errorf("segment %s: %w", os.name, err)
+				}
+				putLE(image[pc:], v, size)
+				pc += int64(size)
 			case r.Op == omf.RecOrg:
 				pc += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
@@ -171,7 +180,8 @@ func segImage(s *omf.Segment) ([]byte, error) {
 			if pos > len(img) {
 				img = append(img, make([]byte, pos-len(img))...)
 			}
-		case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
+		case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr ||
+			r.Op == omf.RecRelexpr:
 			put(make([]byte, r.Raw[1]))
 		case r.Op == omf.RecOrg:
 			pos += int(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
@@ -184,6 +194,30 @@ func segImage(s *omf.Segment) ([]byte, error) {
 		}
 	}
 	return img, nil
+}
+
+// relBranch resolves a RELEXPR record into the displacement stored at the
+// branch site. The record's origin field says how far past the displacement
+// the CPU measures from, so the result is target - (here + origin). Both are
+// image-relative, so a load-address-dependent target cancels against the
+// branch's own address and the site never needs a relocation record; an
+// absolute target has to give the load address back before subtracting.
+func relBranch(raw []byte, pc, org int64, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, error) {
+	origin := int64(int32(binary.LittleEndian.Uint32(raw[2:])))
+	val, shift, reloc, err := evalOMFExprReloc(raw[6:], byName, globals, absolutes, cur)
+	if err != nil {
+		return 0, err
+	}
+	if !reloc {
+		val -= org
+	}
+	v := val - (pc + origin)
+	if shift < 0 {
+		v >>= uint(-shift)
+	} else if shift > 0 {
+		v <<= uint(shift)
+	}
+	return v, nil
 }
 
 // evalOMFExpr evaluates an OMF expression (label +- consts, optional final
@@ -560,6 +594,14 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 						b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 					}
 					pc += int64(size)
+				case r.Op == omf.RecRelexpr:
+					size := int(r.Raw[1])
+					v, err := relBranch(r.Raw, pc, b.org, byName, globals, absolutes, os)
+					if err != nil {
+						return nil, fmt.Errorf("segment %s: %w", os.name, err)
+					}
+					putLE(b.image[pc:], v, size)
+					pc += int64(size)
 				case r.Op == omf.RecOrg:
 					pc += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 				case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
@@ -588,7 +630,8 @@ func collectSymbols(s *omf.Segment, base int64, globals, absolutes map[string]in
 			off += int64(r.Op)
 		case r.Op == omf.RecLconst, r.Op == omf.RecDS:
 			off += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
-		case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr:
+		case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr,
+			r.Op == omf.RecRelexpr:
 			off += int64(r.Raw[1])
 		case r.Op == omf.RecOrg:
 			off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))

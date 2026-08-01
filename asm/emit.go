@@ -9,12 +9,13 @@ import (
 // OMF record opcodes emitted by the assembler (kept local to avoid a
 // dependency on the omf package).
 const (
-	recEnd    = 0x00
-	recDS     = 0xF1
-	recLconst = 0xF2
-	recLexpr  = 0xF3
-	recBexpr  = 0xED
-	recExpr   = 0xEB // general expression (more than one label term)
+	recEnd     = 0x00
+	recDS      = 0xF1
+	recLconst  = 0xF2
+	recLexpr   = 0xF3
+	recBexpr   = 0xED
+	recExpr    = 0xEB // general expression (more than one label term)
+	recRelexpr = 0xEE // relative branch the linker resolves
 )
 
 // segEmitter builds a segment's record stream with the original assembler's
@@ -107,6 +108,28 @@ type termRef struct {
 // offset 2 of P2 emits ELAB, P2, 2, add, subtract).
 func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64, post []postOp) {
 	e.flush()
+	body := exprBody(pos, neg, c, post)
+	e.recs = append(e.recs, recExpr, byte(size))
+	e.recs = append(e.recs, body...)
+}
+
+// relexpr emits a RELEXPR record: a relative branch whose target the linker
+// must resolve (a published symbol, or a label in another segment). The
+// origin field is the width of the displacement itself, so the linker
+// measures from the byte just past it -- the next instruction. Layout
+// (oracle-verified against "bra error_exit" across PROCs):
+//
+//	$EE <size> <origin:4> $83 <pstr name> $00
+func (e *segEmitter) relexpr(size int, pos, neg []termRef, c int64, post []postOp) {
+	e.flush()
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(size))
+	e.recs = append(e.recs, recRelexpr, byte(size), b[0], b[1], b[2], b[3])
+	e.recs = append(e.recs, exprBody(pos, neg, c, post)...)
+}
+
+// exprBody builds the RPN token stream shared by the expression records.
+func exprBody(pos, neg []termRef, c int64, post []postOp) []byte {
 	body := []byte{}
 	pushConst := func(v int64) {
 		var b [4]byte
@@ -147,8 +170,7 @@ func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64, post []p
 		body = append(body, o.Op)
 	}
 	body = append(body, recEnd)
-	e.recs = append(e.recs, recExpr, byte(size))
-	e.recs = append(e.recs, body...)
+	return body
 }
 
 func (e *segEmitter) end() []byte {
@@ -269,6 +291,22 @@ func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
 	return v, ok
 }
 
+// branchDeferred reports whether a relative branch has to reach its target
+// through the linker rather than as a folded displacement. That is exactly
+// when the target cannot be named as an offset into this segment: a label in
+// another segment, or a published symbol the one-pass assembler had to refer
+// to by name (see exprRef, which the criterion mirrors).
+func (st *asmState) branchDeferred(v Val, curSeg int) bool {
+	if len(v.Pos) != 1 || len(v.Neg) != 0 || len(v.Post) > 0 {
+		return true
+	}
+	t := v.Pos[0]
+	if t.fwd != "" || t.seg != curSeg {
+		return true
+	}
+	return t.name != "" && st.entries[t.name] && t.viaFwd
+}
+
 // exprRef gives the label name and displacement for an expression record
 // (oracle-verified one-pass rules):
 //   - external (IMPORT) symbols: by name
@@ -325,6 +363,12 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			t, err := st.resolveAll(t)
 			if err != nil {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
+			}
+			if !t.isNum() && st.branchDeferred(t, segIdx) {
+				pos, gained := st.termRefs(t.Pos)
+				neg, lost := st.termRefs(t.Neg)
+				e.relexpr(a.size, pos, neg, t.C-gained+lost, t.Post)
+				continue
 			}
 			var disp int64
 			if t.isNum() {
