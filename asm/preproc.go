@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/charmap"
@@ -593,6 +594,19 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 	// with them: "if &SysSeg <> 'Loader    ' then AError ...", so SysSeg is
 	// blank-padded to the 10-character OMF load-segment name.
 	switch name {
+	case "SYSDATE", "SYSTIME":
+		// The build timestamp, which RAM5 and P8 stamp into their binaries.
+		// Only expanded inside a macro body: at file scope the original
+		// leaves the reference as literal text (oracle-verified). Set
+		// SOURCE_DATE_EPOCH to pin it and make those builds reproducible.
+		if len(pp.frames) == 0 {
+			return "", false
+		}
+		t := buildTime()
+		if name == "SYSDATE" {
+			return t.Format("02-Jan-06"), true
+		}
+		return t.Format("15:04:05"), true
 	case "SYSSEG":
 		return fmt.Sprintf("%-10s", strings.Trim(pp.st.loadName, "'")), true
 	case "SYSMOD":
@@ -1167,4 +1181,15 @@ func mpwPath(dir, spec string) string {
 	}
 	spec = strings.TrimPrefix(spec, ":")
 	return filepath.Join(dir, strings.ReplaceAll(spec, ":", "/"))
+}
+
+// buildTime is the timestamp &SYSDATE/&SYSTIME report. SOURCE_DATE_EPOCH
+// pins it so a build that stamps its own date stays reproducible.
+func buildTime() time.Time {
+	if v := os.Getenv("SOURCE_DATE_EPOCH"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return time.Unix(n, 0).UTC()
+		}
+	}
+	return time.Now()
 }
