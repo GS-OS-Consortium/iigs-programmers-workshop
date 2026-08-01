@@ -268,6 +268,34 @@ func (p *exprParser) parseMul() (Val, error) {
 			if v, err = numOrDefer("*", 0x03, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x * y, nil }); err != nil {
 				return Val{}, err
 			}
+		case p.peekWord("MOD"): // word form of "//"
+			p.pos += 3
+			r, err := p.parseUnary()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("MOD", 0x05, p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
+				if y == 0 {
+					return 0, fmt.Errorf("division by zero")
+				}
+				return x % y, nil
+			}); err != nil {
+				return Val{}, err
+			}
+		case p.peekWord("DIV"): // word form of "/"
+			p.pos += 3
+			r, err := p.parseUnary()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("DIV", 0x04, p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
+				if y == 0 {
+					return 0, fmt.Errorf("division by zero")
+				}
+				return x / y, nil
+			}); err != nil {
+				return Val{}, err
+			}
 		case p.peek2() == "//": // integer remainder (MPW asm)
 			p.pos += 2
 			r, err := p.parseUnary()
@@ -448,7 +476,12 @@ func (p *exprParser) parseTerm() (Val, error) {
 		for p.pos < len(p.s) && isSymChar(p.s[p.pos]) {
 			p.pos++
 		}
-		name := strings.ToUpper(p.s[start:p.pos])
+		name := p.s[start:p.pos]
+		if p.ctx.st != nil {
+			name = p.ctx.st.sym(name)
+		} else {
+			name = strings.ToUpper(name)
+		}
 		if p.ctx.st == nil {
 			return Val{}, fmt.Errorf("undefined symbol %s", name)
 		}

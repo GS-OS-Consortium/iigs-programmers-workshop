@@ -134,6 +134,8 @@ type asmState struct {
 	// (oracle-probed); CODECHK defaults on, DATACHK off.
 	dataChk bool
 	codeChk bool
+	// caseSens is CASE ON: symbols are case-sensitive and keep their spelling.
+	caseSens bool
 	// skipMode is PROC SKIP: a sticky mode, not a per-segment attribute --
 	// once a PROC carries SKIP every later segment keeps the KIND bit until a
 	// PROC carries NOSKIP (oracle-probed).
@@ -153,6 +155,18 @@ func (st *asmState) errf(format string, args ...any) {
 }
 
 func (st *asmState) curSegIndex() int { return len(st.segs) - 1 }
+
+// sym canonicalises a symbol name. Names fold to upper case unless CASE ON is
+// in effect, which makes the assembler case-sensitive and preserves the
+// spelling in the object's GLOBAL and segment names. Only the System Loader
+// asks for it, and it does: its call table publishes "LoaderInit", not
+// "LOADERINIT".
+func (st *asmState) sym(name string) string {
+	if st.caseSens {
+		return name
+	}
+	return strings.ToUpper(name)
+}
 
 // scopePrefix is the symbol-table prefix for definitions made at this point.
 //
@@ -219,7 +233,7 @@ func (st *asmState) scopedLocal(name string) string {
 }
 
 func (st *asmState) define(name string, v Val) {
-	name = strings.ToUpper(name)
+	name = st.sym(name)
 	key := name
 	if strings.HasPrefix(name, "@") {
 		key = st.scopedLocal(name)
@@ -527,7 +541,7 @@ func (st *asmState) doLine(l line) {
 	case "proc", "func":
 		// FUNC is PROC under another name: the original emits the same
 		// KIND $4000 segment for both.
-		name := strings.ToUpper(l.label)
+		name := st.sym(l.label)
 		if name == "" {
 			st.errf("%s requires a label", strings.ToUpper(op))
 			return
@@ -630,7 +644,7 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		st.define(l.label, v)
-		if u := strings.ToUpper(l.label); st.entryEqu[u] && v.isNum() {
+		if u := st.sym(l.label); st.entryEqu[u] && v.isNum() {
 			rec := gequRec(u, st.entryPriv[u], v.C)
 			if st.cur == nil && len(st.segs) == 0 {
 				st.pendingRecs = append(st.pendingRecs, rec)
@@ -690,7 +704,7 @@ func (st *asmState) doLine(l line) {
 		st.inRecord = true
 		st.recHigh = v
 		st.recPC = v
-		st.recName = strings.ToUpper(l.label)
+		st.recName = st.sym(l.label)
 		if l.label != "" {
 			st.define(l.label, num(v))
 		}
@@ -721,8 +735,11 @@ func (st *asmState) doLine(l line) {
 	case "string":
 		st.strMode = strings.ToUpper(operandOnly(l.rest))
 		return
+	case "case":
+		st.caseSens = strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "on")
+		return
 	case "title", "eject", "print", "space", "page", "pagesize", "blanks",
-		"list", "nolist", "case", "trace", "err", "obj", "noobj", "ttl":
+		"list", "nolist", "trace", "err", "obj", "noobj", "ttl":
 		return // listing/diagnostic control: no object-file effect
 	case "datachk", "codechk":
 		on := strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "on")
@@ -757,7 +774,7 @@ func (st *asmState) doLine(l line) {
 	case "import":
 		for _, a := range symbolList(operandOnly(l.rest)) {
 			name, kind, _ := strings.Cut(a, ":")
-			nm := strings.ToUpper(strings.TrimSpace(name))
+			nm := st.sym(strings.TrimSpace(name))
 			if nm == "" {
 				continue
 			}
@@ -768,7 +785,7 @@ func (st *asmState) doLine(l line) {
 			// The ":TYPE" suffix may name a RECORD template, which makes the
 			// external symbol's fields reachable as NAME.FIELD (Start.aii
 			// does "import FSTInfoParms:tFSTInfo" then "FSTInfoParms.fst_num").
-			rec := strings.ToUpper(strings.TrimSpace(kind))
+			rec := st.sym(strings.TrimSpace(kind))
 			for f, off := range st.recFields[rec] {
 				v := fwdVal(nm)
 				v.C = off
@@ -790,7 +807,7 @@ func (st *asmState) doLine(l line) {
 		for _, a := range symbolList(operandOnly(l.rest)) {
 			// optional ":TYPE" suffix, e.g. "cmd_tbl:data" or "c_len_len:EQU"
 			name, kind, _ := strings.Cut(a, ":")
-			nm := strings.ToUpper(strings.TrimSpace(name))
+			nm := st.sym(strings.TrimSpace(name))
 			if nm == "" {
 				continue
 			}
@@ -878,11 +895,11 @@ func (st *asmState) doLine(l line) {
 		}
 		// "POpen ds openParms" reserves one instance of a RECORD template and
 		// makes its fields reachable as POpen.field.
-		if rec := strings.ToUpper(operandOnly(l.rest)); st.recSize[rec] != 0 {
+		if rec := st.sym(operandOnly(l.rest)); st.recSize[rec] != 0 {
 			base := st.pc
 			if l.label != "" {
 				for f, off := range st.recFields[rec] {
-					st.define(strings.ToUpper(l.label)+"."+f,
+					st.define(st.sym(l.label)+"."+f,
 						segVal(st.curSegIndex(), base+off))
 				}
 			}
@@ -948,7 +965,7 @@ func (st *asmState) resumeSegment() bool {
 
 // beginSegment opens a segment with no options beyond its OMF kind.
 func (st *asmState) beginSegment(label string, kind uint16) {
-	name := strings.ToUpper(label)
+	name := st.sym(label)
 	if name == "" {
 		st.errf("segment requires a label")
 		return
@@ -958,6 +975,12 @@ func (st *asmState) beginSegment(label string, kind uint16) {
 }
 
 func (st *asmState) openSegment(seg *segState) {
+	// A PROC closes whatever was still open: ExpressLoad's get_seg_base has
+	// no ENDP at all, and leaving its length at zero produced a segment whose
+	// records were right but whose header said it was empty.
+	if st.cur != nil {
+		st.cur.endPC = st.pc
+	}
 	st.withs = nil // WITH scoping does not cross a segment boundary
 	// A segment whose own label is EXPORTed is not private: UniDisk3.5 says
 	// "EXPORT driver_data" before "driver_data PROC" and its segment is
@@ -990,10 +1013,10 @@ func (st *asmState) defineCodeLabel(name string) {
 		return
 	}
 	if outside {
-		st.fileWide[strings.ToUpper(name)] = true
+		st.fileWide[st.sym(name)] = true
 	}
 	st.define(name, segVal(st.curSegIndex(), st.pc))
-	u := strings.ToUpper(name)
+	u := st.sym(name)
 	// Fields of a RECORD data segment are also reachable through the
 	// qualified "record.field" form, as a template's fields are.
 	if st.cur.kind&0x1F == 0x01 && u != st.cur.name {
@@ -1075,12 +1098,12 @@ func (st *asmState) doRecordLine(op string, l line) {
 	defField := func(name string, v Val) {
 		st.define(name, v)
 		if st.recName != "" && name != "" {
-			st.define(st.recName+"."+strings.ToUpper(name), v)
+			st.define(st.recName+"."+st.sym(name), v)
 			if v.isNum() {
 				if st.recFields[st.recName] == nil {
 					st.recFields[st.recName] = map[string]int64{}
 				}
-				st.recFields[st.recName][strings.ToUpper(name)] = v.C
+				st.recFields[st.recName][st.sym(name)] = v.C
 			}
 		}
 	}
