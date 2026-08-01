@@ -127,6 +127,9 @@ type asmState struct {
 	recSize   map[string]int64
 	recFields map[string]map[string]int64
 	recDown   bool // RECORD ...,decrement: fields grow downward
+	// recBare are the unqualified field names of the open template, dropped
+	// again at ENDR (see doRecordLine).
+	recBare []string
 	// withs are the record instances named by WITH, innermost last; a bare
 	// field name is looked up through them before the plain symbol table.
 	withs []string
@@ -756,7 +759,7 @@ func (st *asmState) doLine(l line) {
 		// jn_parms:jn_parmBlock" then "with jn_parms" -- a bare field name has
 		// to mean jn_parms.field, an external reference, not the bare offset.
 		for _, a := range splitArgs(operandOnly(l.rest)) {
-			if a = strings.ToUpper(strings.TrimSpace(a)); a != "" {
+			if a = st.sym(strings.TrimSpace(a)); a != "" {
 				st.withs = append(st.withs, a)
 			}
 		}
@@ -1094,9 +1097,17 @@ func (st *asmState) recField(label string, size int64, def func(string, Val)) {
 // doRecordLine handles lines inside RECORD ... ENDR: a template that only
 // defines constants (field offsets); nothing is emitted.
 func (st *asmState) doRecordLine(op string, l line) {
-	// field labels are visible plain and as RECORD.FIELD
+	// A template's fields are reachable as RECORD.FIELD from anywhere, and
+	// unqualified only inside the template itself -- DP.a pads with
+	// "if (dp_end MOD 2) <> 0" right where dp_end is declared, but a bare
+	// field name outside is "Undefined ID" (oracle-probed). Leaving them
+	// defined globally let a template field shadow a PROC of the same name:
+	// the loader's call table folded "DC.L LoadName-1" to a constant.
 	defField := func(name string, v Val) {
 		st.define(name, v)
+		if key := st.sym(name); key != "" {
+			st.recBare = append(st.recBare, key)
+		}
 		if st.recName != "" && name != "" {
 			st.define(st.recName+"."+st.sym(name), v)
 			if v.isNum() {
@@ -1114,6 +1125,11 @@ func (st *asmState) doRecordLine(op string, l line) {
 		if st.recName != "" {
 			st.recSize[st.recName] = st.recPC
 		}
+		for _, k := range st.recBare {
+			delete(st.syms, k)
+			delete(st.symSeq, k)
+		}
+		st.recBare = nil
 		st.inRecord = false
 		st.recName = ""
 		if op == "end" {
@@ -1605,12 +1621,19 @@ func (st *asmState) doInst(mn, operand string) {
 		st.addAction(action{kind: aExpr, target: val, size: n, rec: rec, shift: shift + val.Shift})
 		st.pc += int64(n)
 	default:
-		b := []byte{info.code}
+		// The opcode and its operand are separate emission units, which is
+		// what lets a CONST run end between them: the loader's Process_Reloc
+		// has an "lsr $60" whose opcode fills one LCONST to 255 and whose
+		// operand opens the next.
+		st.emitBytes(info.code)
 		c := applyShift(val.C, shift)
+		var b []byte
 		for i := 0; i < n; i++ {
 			b = append(b, byte(c>>(8*i)))
 		}
-		st.emitBytes(b...)
+		if len(b) > 0 {
+			st.emitBytes(b...)
+		}
 	}
 }
 

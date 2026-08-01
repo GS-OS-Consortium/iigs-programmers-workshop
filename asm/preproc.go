@@ -259,6 +259,12 @@ func (pp *ppState) processLine(raw string) {
 	if st.ended {
 		return
 	}
+	// A whole-line comment is not scanned for & references. Ours were being
+	// substituted, so a comment that merely mentioned "&s2i(&n)" raised an
+	// error about an undefined macro parameter.
+	if raw != "" && (raw[0] == ';' || raw[0] == '*') {
+		return
+	}
 
 	// macro capture mode
 	if pp.capturing != nil {
@@ -623,7 +629,7 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
-	"ORD": true, "SUBSTR": true, "TYPE": true,
+	"ORD": true, "SUBSTR": true, "TYPE": true, "S2I": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -760,6 +766,14 @@ func (pp *ppState) argNum(a string) int64 {
 
 func (pp *ppState) callFunc(name string, args []string) string {
 	switch name {
+	case "S2I":
+		// String to integer: the loader's Stack_Cleanup sizes its pops with
+		// "&s2i(&param_bytes)". Without it the condition read as non-numeric
+		// and always took the tsc/tcs branch.
+		if len(args) == 0 {
+			return "0"
+		}
+		return strconv.FormatInt(pp.argNum(args[0]), 10)
 	case "EVAL", "ORD":
 		// &ORD yields the numeric value of its argument; the gsos macros use
 		// "&segment_pc seta &segment_pc+&ord(*)" to total a segment's size.
