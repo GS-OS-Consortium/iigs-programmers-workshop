@@ -1,42 +1,97 @@
 // Package asm is a from-scratch reimplementation of the Apple MPW IIGS
-// assembler (AsmIIGS): MPW-syntax 65816/65C02 macro assembler emitting OMF v2
-// object files.
-//
-// First-light scope: PROC/ENDP/END, EQU, ANOP, DC.B/W/L, MACHINE,
-// LONGA/LONGI, full 65816 instruction encoding with constant operands.
-// Label-reference operands (which the real assembler emits as OMF expression
-// records) and macros come next; behavior is developed by byte-diffing
-// against the original assembler under emulation.
+// assembler (AsmIIGS): MPW-syntax 65816 macro assembler emitting OMF v2
+// object files. Behavior is developed by byte-diffing against the original
+// assembler running under emulation; oracle-established rules are noted
+// throughout.
 package asm
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
-type Segment struct {
-	Name string
-	Code []byte
+// ---------- actions (pass 1 output, pass 2 input) ----------
+
+type actKind int
+
+const (
+	aBytes  actKind = iota // fully resolved bytes
+	aBranch                // relative branch to a label (resolved in pass 2)
+	aExpr                  // OMF expression record reference (label +- const)
+	aDS                    // reserve space (DS record)
+)
+
+type action struct {
+	kind   actKind
+	bytes  []byte
+	target Val   // aBranch/aExpr: label value (possibly forward)
+	size   int   // aBranch: displacement width; aExpr: value width
+	rec    byte  // aExpr: omf.RecLexpr or omf.RecBexpr
+	shift  int64 // aExpr: shift amount (e.g. -8 for high byte), 0 = none
+	count  int64 // aDS
+	pcNext int64 // aBranch: pc after the instruction (for displacement)
+	line   int
+	file   string
 }
 
-type Object struct {
-	Segments []Segment
+type segState struct {
+	name    string
+	org     int64 // segment header ORG (from "PROC ORG expr")
+	actions []action
+	endPC   int64
+}
+
+// ---------- assembler state ----------
+
+type symEntry struct {
+	val Val
 }
 
 type asmState struct {
-	cpu    int
-	longA  bool
-	longI  bool
-	syms   map[string]int64
-	obj    *Object
-	cur    *Segment
-	errs   []string
-	lineNo int
+	cpu     int
+	longA   bool
+	longI   bool
+	msb     bool
+	strMode string // "ASIS" or "PASCAL"
+
+	syms map[string]Val
+	segs []*segState
+	cur  *segState
+	pc   int64
+
+	// RECORD ... ENDR template mode
+	inRecord bool
+	recPC    int64
+
+	// preprocessor state (conditionals, macros, set-vars) lives in preproc.go
+	pp *ppState
+
+	curFile string
+	curLine int
+	ended   bool
+	errs    []string
 }
 
 func (st *asmState) errf(format string, args ...any) {
-	st.errs = append(st.errs, fmt.Sprintf("line %d: %s", st.lineNo, fmt.Sprintf(format, args...)))
+	st.errs = append(st.errs, fmt.Sprintf("%s:%d: %s", st.curFile, st.curLine, fmt.Sprintf(format, args...)))
 }
+
+func (st *asmState) curSegIndex() int { return len(st.segs) - 1 }
+
+func (st *asmState) lookup(name string) Val {
+	if v, ok := st.syms[name]; ok {
+		return v
+	}
+	return fwdVal(name)
+}
+
+func (st *asmState) define(name string, v Val) {
+	st.syms[strings.ToUpper(name)] = v
+}
+
+// ---------- line model ----------
 
 type line struct {
 	label string
@@ -44,10 +99,12 @@ type line struct {
 	rest  string
 }
 
-// splitLine parses "[label] op operands ; comment". A label starts in column
-// one; an optional trailing ':' is stripped.
+// splitLine parses "[label] op operands-and-comment". Column-one '*' or ';'
+// lines are comments; ';' begins a comment anywhere outside a string.
 func splitLine(s string) line {
-	// strip comment (';' not inside a quoted string)
+	if s != "" && (s[0] == '*' || s[0] == ';') {
+		return line{}
+	}
 	inStr := false
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\'' {
@@ -57,7 +114,7 @@ func splitLine(s string) line {
 			break
 		}
 	}
-	if s == "" {
+	if strings.TrimSpace(s) == "" {
 		return line{}
 	}
 	var l line
@@ -76,6 +133,18 @@ func splitLine(s string) line {
 		j++
 	}
 	l.op = s[i:j]
+	// an indented token ending in ':' is a label, not an opcode
+	if l.label == "" && strings.HasSuffix(l.op, ":") {
+		l.label = strings.TrimSuffix(l.op, ":")
+		for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+			j++
+		}
+		i = j
+		for j < len(s) && s[j] != ' ' && s[j] != '\t' {
+			j++
+		}
+		l.op = s[i:j]
+	}
 	for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
 		j++
 	}
@@ -83,68 +152,176 @@ func splitLine(s string) line {
 	return l
 }
 
-// Assemble assembles MPW IIgs assembler source (already LF-terminated,
-// MacRoman semantics are the caller's concern for now).
-func Assemble(src string) (*Object, error) {
-	st := &asmState{
-		cpu:   cpu65816,
-		longA: true,
-		longI: true,
-		syms:  map[string]int64{},
-		obj:   &Object{},
-	}
-	for n, raw := range strings.Split(src, "\n") {
-		st.lineNo = n + 1
-		l := splitLine(raw)
-		if l.op == "" && l.label == "" {
-			continue
+// operandOnly trims a trailing bare comment: the operand field ends at the
+// first whitespace outside quotes/parens/brackets.
+func operandOnly(s string) string {
+	depth := 0
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			inStr = !inStr
+		case '(', '[':
+			if !inStr {
+				depth++
+			}
+		case ')', ']':
+			if !inStr {
+				depth--
+			}
+		case ' ', '\t':
+			if !inStr && depth == 0 {
+				return s[:i]
+			}
 		}
-		st.doLine(l)
 	}
-	if len(st.errs) > 0 {
-		return st.obj, fmt.Errorf("%s", strings.Join(st.errs, "\n"))
-	}
-	return st.obj, nil
+	return s
 }
 
+// ---------- entry points ----------
+
+// AssembleFile assembles a source file (CR or LF line endings).
+func AssembleFile(path string) (*Object, error) {
+	st := newState()
+	if err := st.pp.processFile(path); err != nil {
+		return nil, err
+	}
+	return st.finish()
+}
+
+// AssembleSource assembles in-memory source; dir is used for INCLUDE resolution.
+func AssembleSource(src, dir string) (*Object, error) {
+	st := newState()
+	st.pp.processSource(src, filepath.Join(dir, "(source)"))
+	return st.finish()
+}
+
+func newState() *asmState {
+	st := &asmState{
+		cpu:     cpu65816,
+		longA:   true,
+		longI:   true,
+		msb:     false,
+		strMode: "ASIS",
+		syms:    map[string]Val{},
+	}
+	st.pp = newPP(st)
+	return st
+}
+
+func (st *asmState) finish() (*Object, error) {
+	obj := &Object{}
+	for _, seg := range st.segs {
+		s, err := st.emitSegment(seg)
+		if err != nil {
+			st.errs = append(st.errs, err.Error())
+			continue
+		}
+		obj.Segments = append(obj.Segments, *s)
+	}
+	if len(st.errs) > 0 {
+		max := len(st.errs)
+		if max > 25 {
+			max = 25
+		}
+		return obj, fmt.Errorf("%s", strings.Join(st.errs[:max], "\n"))
+	}
+	return obj, nil
+}
+
+// ---------- pass-1 line dispatch (called by the preprocessor) ----------
+
 func (st *asmState) doLine(l line) {
+	if st.ended {
+		return
+	}
 	op := strings.ToLower(l.op)
+
+	if st.inRecord {
+		st.doRecordLine(op, l)
+		return
+	}
+
 	switch op {
 	case "proc":
-		if l.label == "" {
+		name := strings.ToUpper(l.label)
+		if name == "" {
 			st.errf("PROC requires a label")
 			return
 		}
-		st.obj.Segments = append(st.obj.Segments, Segment{Name: strings.ToUpper(l.label)})
-		st.cur = &st.obj.Segments[len(st.obj.Segments)-1]
+		seg := &segState{name: name}
+		// "label PROC ORG expr" sets the segment header ORG
+		if rest := strings.TrimSpace(l.rest); rest != "" {
+			f := strings.Fields(rest)
+			if len(f) >= 2 && strings.EqualFold(f[0], "org") {
+				v, err := evalNum(strings.Join(f[1:], " "), &exprCtx{st: st})
+				if err != nil {
+					st.errf("PROC ORG: %v", err)
+				} else {
+					seg.org = v
+				}
+			} else {
+				st.errf("unsupported PROC operand %q", rest)
+			}
+		}
+		st.segs = append(st.segs, seg)
+		st.cur = seg
+		st.pc = 0
+		st.define(name, segVal(st.curSegIndex(), 0))
 		return
 	case "endp":
+		if st.cur != nil {
+			st.cur.endPC = st.pc
+		}
 		st.cur = nil
 		return
 	case "end":
-		st.cur = nil
+		if st.cur != nil {
+			st.cur.endPC = st.pc
+			st.cur = nil
+		}
+		st.ended = true
+		return
+	case "":
+		if l.label != "" {
+			st.defineCodeLabel(l.label)
+		}
 		return
 	case "anop":
 		if l.label != "" {
-			st.errf("a label is not allowed on ANOP") // matches AsmIIGS error 24
-		}
-		return
-	case "":
-		// label-only line defines a code label at the current offset
-		if l.label != "" && st.cur != nil {
-			st.syms[strings.ToUpper(l.label)] = int64(len(st.cur.Code))
+			st.errf("a label is not allowed on ANOP")
 		}
 		return
 	case "equ":
-		v, err := evalExpr(l.rest, &exprCtx{syms: st.syms})
+		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("EQU: %v", err)
 			return
 		}
-		st.syms[strings.ToUpper(l.label)] = v
+		if v.hasFwd() {
+			st.errf("EQU: undefined forward symbol in %q", l.rest)
+			return
+		}
+		st.define(l.label, v)
+		return
+	case "record":
+		st.inRecord = true
+		v := int64(0)
+		if r := operandOnly(l.rest); r != "" {
+			n, err := evalNum(r, &exprCtx{st: st})
+			if err != nil {
+				st.errf("RECORD: %v", err)
+			} else {
+				v = n
+			}
+		}
+		st.recPC = v
+		if l.label != "" {
+			st.define(l.label, num(v))
+		}
 		return
 	case "machine":
-		switch strings.ToLower(l.rest) {
+		switch strings.ToLower(operandOnly(l.rest)) {
 		case "m6502":
 			st.cpu = cpu6502
 			st.longA, st.longI = false, false
@@ -158,36 +335,175 @@ func (st *asmState) doLine(l line) {
 		}
 		return
 	case "longa":
-		st.longA = strings.EqualFold(l.rest, "on")
+		st.longA = strings.EqualFold(operandOnly(l.rest), "on")
 		return
 	case "longi":
-		st.longI = strings.EqualFold(l.rest, "on")
+		st.longI = strings.EqualFold(operandOnly(l.rest), "on")
+		return
+	case "msb":
+		st.msb = strings.EqualFold(operandOnly(l.rest), "on")
+		return
+	case "string":
+		st.strMode = strings.ToUpper(operandOnly(l.rest))
+		return
+	case "title", "eject", "print", "space", "page":
+		return // listing control: no object-file effect
+	case "with", "endwith":
+		return // record fields are defined globally here
+	case "writeln":
+		fmt.Fprintln(os.Stderr, l.rest)
+		return
+	case "org":
+		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		if err != nil {
+			st.errf("ORG: %v", err)
+			return
+		}
+		if st.cur == nil {
+			st.errf("ORG outside PROC")
+			return
+		}
+		if v < st.pc {
+			st.errf("ORG backwards ($%X < $%X)", v, st.pc)
+			return
+		}
+		if v > st.pc {
+			st.addAction(action{kind: aDS, count: v - st.pc})
+			st.pc = v
+		}
+		return
+	case "ds", "ds.b", "ds.w", "ds.l":
+		size := int64(1)
+		switch op {
+		case "ds.w":
+			size = 2
+		case "ds.l":
+			size = 4
+		}
+		if l.label != "" {
+			st.defineCodeLabel(l.label)
+		}
+		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		if err != nil {
+			st.errf("DS: %v", err)
+			return
+		}
+		if n > 0 {
+			st.addAction(action{kind: aDS, count: n * size})
+			st.pc += n * size
+		}
 		return
 	case "dc", "dc.b", "dc.w", "dc.l":
 		st.doDC(op, l)
 		return
-	}
-	if _, isInst := opTable[op]; isInst {
-		if l.label != "" && st.cur != nil {
-			st.syms[strings.ToUpper(l.label)] = int64(len(st.cur.Code))
+	case "dcb", "dcb.b":
+		st.doDCB(l)
+		return
+	case "dci", "endr":
+		if op == "endr" {
+			st.errf("ENDR without RECORD")
+		} else {
+			st.errf("undefined macro or opcode: %s", strings.ToUpper(l.op))
 		}
-		st.doInst(op, l.rest)
+		return
+	}
+
+	if _, isInst := opTable[op]; isInst {
+		if l.label != "" {
+			st.defineCodeLabel(l.label)
+		}
+		st.doInst(op, operandOnly(l.rest))
 		return
 	}
 	st.errf("unknown opcode/directive %q", l.op)
 }
 
-func (st *asmState) emit(b ...byte) {
+func (st *asmState) defineCodeLabel(name string) {
+	if st.cur == nil {
+		st.errf("label %q outside PROC", name)
+		return
+	}
+	st.define(name, segVal(st.curSegIndex(), st.pc))
+}
+
+// doRecordLine handles lines inside RECORD ... ENDR: a template that only
+// defines constants (field offsets); nothing is emitted.
+func (st *asmState) doRecordLine(op string, l line) {
+	switch op {
+	case "endr":
+		st.inRecord = false
+		return
+	case "org":
+		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		if err != nil {
+			st.errf("RECORD ORG: %v", err)
+			return
+		}
+		st.recPC = v
+		return
+	case "ds", "ds.b", "ds.w", "ds.l":
+		size := int64(1)
+		switch op {
+		case "ds.w":
+			size = 2
+		case "ds.l":
+			size = 4
+		}
+		if l.label != "" {
+			st.define(l.label, num(st.recPC))
+		}
+		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		if err != nil {
+			st.errf("RECORD DS: %v", err)
+			return
+		}
+		st.recPC += n * size
+		return
+	case "equ":
+		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
+		if err != nil {
+			st.errf("EQU: %v", err)
+			return
+		}
+		st.define(l.label, v)
+		return
+	case "", "anop":
+		if l.label != "" {
+			st.define(l.label, num(st.recPC))
+		}
+		return
+	case "title", "eject", "print", "with", "endwith":
+		return
+	}
+	st.errf("unsupported directive %q inside RECORD", l.op)
+}
+
+func (st *asmState) addAction(a action) {
 	if st.cur == nil {
 		st.errf("code outside PROC")
 		return
 	}
-	st.cur.Code = append(st.cur.Code, b...)
+	a.line, a.file = st.curLine, st.curFile
+	st.cur.actions = append(st.cur.actions, a)
 }
 
+// emitBytes appends one emission unit (an instruction or one DC item).
+// Units are kept separate: the original assembler's CONST/LCONST chunking
+// flushes at unit boundaries when the next unit would cross 255 bytes.
+func (st *asmState) emitBytes(b ...byte) {
+	if st.cur == nil {
+		st.errf("code outside PROC")
+		return
+	}
+	st.addAction(action{kind: aBytes, bytes: b})
+	st.pc += int64(len(b))
+}
+
+// ---------- DC / DCB ----------
+
 func (st *asmState) doDC(op string, l line) {
-	if l.label != "" && st.cur != nil {
-		st.syms[strings.ToUpper(l.label)] = int64(len(st.cur.Code))
+	if l.label != "" {
+		st.defineCodeLabel(l.label)
 	}
 	size := 1
 	switch op {
@@ -198,21 +514,115 @@ func (st *asmState) doDC(op string, l line) {
 	}
 	for _, item := range splitArgs(l.rest) {
 		item = strings.TrimSpace(item)
-		if len(item) >= 2 && item[0] == '\'' && item[len(item)-1] == '\'' {
-			for _, c := range []byte(item[1 : len(item)-1]) {
-				st.emit(c)
-			}
+		if item == "" {
 			continue
 		}
-		v, err := evalExpr(item, &exprCtx{syms: st.syms})
+		if item[0] == '\'' { // string constant
+			s, err := unquote(item)
+			if err != nil {
+				st.errf("DC: %v", err)
+				return
+			}
+			b := []byte(s)
+			if st.msb {
+				for i := range b {
+					b[i] |= 0x80
+				}
+			}
+			if st.strMode == "PASCAL" {
+				b = append([]byte{byte(len(b))}, b...)
+			}
+			st.emitBytes(b...)
+			continue
+		}
+		shift, expr := splitExtractor(item)
+		v, err := evalExpr(expr, &exprCtx{st: st})
 		if err != nil {
 			st.errf("DC: %v", err)
 			return
 		}
-		for i := 0; i < size; i++ {
-			st.emit(byte(v >> (8 * i)))
+		if v.isNum() {
+			c := applyShift(v.C, shift)
+			var b []byte
+			for i := 0; i < size; i++ {
+				b = append(b, byte(c>>(8*i)))
+			}
+			st.emitBytes(b...)
+		} else {
+			st.addAction(action{kind: aExpr, target: v, size: size, rec: byte(recLexpr), shift: shift})
+			st.pc += int64(size)
 		}
 	}
+}
+
+func (st *asmState) doDCB(l line) {
+	if l.label != "" {
+		st.defineCodeLabel(l.label)
+	}
+	args := splitArgs(l.rest)
+	if len(args) != 2 {
+		st.errf("DCB.B needs count,value")
+		return
+	}
+	n, err1 := evalNum(strings.TrimSpace(args[0]), &exprCtx{st: st})
+	v, err2 := evalNum(strings.TrimSpace(args[1]), &exprCtx{st: st})
+	if err1 != nil || err2 != nil {
+		st.errf("DCB.B: bad operands")
+		return
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(v)
+	}
+	st.emitBytes(b...)
+}
+
+func unquote(s string) (string, error) {
+	if len(s) < 2 || s[0] != '\'' {
+		return "", fmt.Errorf("bad string %q", s)
+	}
+	var out []byte
+	i := 1
+	for i < len(s) {
+		if s[i] == '\'' {
+			if i+1 < len(s) && s[i+1] == '\'' {
+				out = append(out, '\'')
+				i += 2
+				continue
+			}
+			return string(out), nil
+		}
+		out = append(out, s[i])
+		i++
+	}
+	return "", fmt.Errorf("unterminated string %q", s)
+}
+
+// splitExtractor strips a leading byte-extraction operator from an operand
+// expression: < (low), > (high, shift -8), ^ (bank, shift -16).
+func splitExtractor(s string) (int64, string) {
+	if s == "" {
+		return 0, s
+	}
+	switch s[0] {
+	case '>':
+		return -8, s[1:]
+	case '^':
+		return -16, s[1:]
+	case '<':
+		return 0, s[1:] // low byte: truncation via record size
+	}
+	return 0, s
+}
+
+func applyShift(v, shift int64) int64 {
+	switch {
+	case shift < 0:
+		return v >> uint(-shift)
+	case shift > 0:
+		return v << uint(shift)
+	}
+	return v
 }
 
 // splitArgs splits on commas not inside quotes or parens/brackets.
@@ -239,9 +649,10 @@ func splitArgs(s string) []string {
 			}
 		}
 	}
-	out = append(out, s[start:])
-	return out
+	return append(out, s[start:])
 }
+
+// ---------- instructions ----------
 
 func (st *asmState) doInst(mn, operand string) {
 	mode, exprStr, err := parseOperand(mn, operand)
@@ -249,11 +660,30 @@ func (st *asmState) doInst(mn, operand string) {
 		st.errf("%s: %v", mn, err)
 		return
 	}
-	// Evaluate the operand first: mode selection is value-driven (the
-	// original assembler picks DP/Abs/AbsL by operand magnitude).
-	var val int64
+
+	var shift int64
+	forced := 0
+	if mode == ImmM {
+		shift, exprStr = splitExtractor(exprStr)
+	} else if exprStr != "" {
+		switch exprStr[0] {
+		case '|', '!':
+			forced = 2
+			exprStr = exprStr[1:]
+		case '>':
+			forced = 3
+			exprStr = exprStr[1:]
+		case '<':
+			forced = 1
+			exprStr = exprStr[1:]
+		}
+	}
+
+	// Evaluate the operand: mode selection is value-driven for constants;
+	// label references always use the 2-byte absolute form (oracle rule).
+	val := num(0)
 	if exprStr != "" && mode != Move {
-		v, err := evalExpr(exprStr, &exprCtx{syms: st.syms, pc: int64(len(st.curCode()))})
+		v, err := evalExpr(exprStr, &exprCtx{st: st})
 		if err != nil {
 			st.errf("%s: %v", mn, err)
 			return
@@ -264,11 +694,17 @@ func (st *asmState) doInst(mn, operand string) {
 	if exprStr != "" {
 		sizeNeeded = 1
 	}
-	if val >= 0x10000 || val < -0x8000 {
+	if val.isLabel() {
+		sizeNeeded = 2
+	} else if val.C >= 0x10000 || val.C < -0x8000 {
 		sizeNeeded = 3
-	} else if val >= 0x100 || val < -0x80 {
+	} else if val.C >= 0x100 || val.C < -0x80 {
 		sizeNeeded = 2
 	}
+	if forced != 0 {
+		sizeNeeded = forced
+	}
+
 	chain := modeChain(mode)
 	var info opInfo
 	var found bool
@@ -277,7 +713,6 @@ func (st *asmState) doInst(mn, operand string) {
 		if oi, ok := ops[opKey{mn, m}]; ok && oi.cpu <= st.cpu {
 			switch m {
 			case Rel8, Rel16, ImmM, ImmX, Imm8, Move:
-				// size handled at emit time
 			default:
 				if modeLen(m) < sizeNeeded {
 					continue
@@ -291,24 +726,26 @@ func (st *asmState) doInst(mn, operand string) {
 		st.errf("%s does not support this addressing mode", mn)
 		return
 	}
+
 	if chosen == Move {
-		// MVN/MVP src,dst: operands are addresses; the bank bytes are
-		// emitted as opcode, dstbank, srcbank (oracle-verified).
+		// MVN/MVP src,dst: operands are addresses; bank bytes emitted as
+		// opcode, dstbank, srcbank (oracle-verified).
 		parts := splitArgs(exprStr)
 		if len(parts) != 2 {
 			st.errf("%s: need two operands", mn)
 			return
 		}
-		src, err1 := evalExpr(parts[0], &exprCtx{syms: st.syms})
-		dst, err2 := evalExpr(parts[1], &exprCtx{syms: st.syms})
+		src, err1 := evalNum(parts[0], &exprCtx{st: st})
+		dst, err2 := evalNum(parts[1], &exprCtx{st: st})
 		if err1 != nil || err2 != nil {
 			st.errf("%s: bad operands", mn)
 			return
 		}
-		st.emit(info.code, byte(dst>>16), byte(src>>16))
+		st.emitBytes(info.code, byte(dst>>16), byte(src>>16))
 		return
 	}
-	st.emit(info.code)
+
+	// operand width
 	n := modeLen(chosen)
 	switch chosen {
 	case ImmM:
@@ -321,20 +758,30 @@ func (st *asmState) doInst(mn, operand string) {
 		if st.longI {
 			n = 2
 		}
-	case Rel8, Rel16:
-		// constant branch targets are relative to PC after the instruction
-		val = val - int64(len(st.curCode())+n)
 	}
-	for i := 0; i < n; i++ {
-		st.emit(byte(val >> (8 * i)))
-	}
-}
 
-func (st *asmState) curCode() []byte {
-	if st.cur == nil {
-		return nil
+	switch {
+	case chosen == Rel8 || chosen == Rel16:
+		st.emitBytes(info.code)
+		st.addAction(action{kind: aBranch, target: val, size: n, pcNext: st.pc + int64(n)})
+		st.pc += int64(n)
+	case val.isLabel():
+		// expression record: BEXPR for jmp/jsr-class targets, LEXPR for data
+		rec := byte(recLexpr)
+		if mn == "jmp" || mn == "jsr" || mn == "jml" || mn == "jsl" {
+			rec = recBexpr
+		}
+		st.emitBytes(info.code)
+		st.addAction(action{kind: aExpr, target: val, size: n, rec: rec, shift: shift})
+		st.pc += int64(n)
+	default:
+		b := []byte{info.code}
+		c := applyShift(val.C, shift)
+		for i := 0; i < n; i++ {
+			b = append(b, byte(c>>(8*i)))
+		}
+		st.emitBytes(b...)
 	}
-	return st.cur.Code
 }
 
 // modeChain returns candidate table modes in preference order for a
@@ -360,7 +807,7 @@ func modeChain(m Mode) []Mode {
 }
 
 // parseOperand classifies operand syntax; returns the syntactic mode and the
-// expression text (forced-size prefixes < | > handled by the caller later).
+// expression text.
 func parseOperand(mn, s string) (Mode, string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -370,7 +817,7 @@ func parseOperand(mn, s string) (Mode, string, error) {
 		return Accum, "", nil
 	}
 	if s[0] == '#' {
-		return ImmM, s[1:], nil // sized later; ImmX/Imm8 chosen via table chain
+		return ImmM, s[1:], nil
 	}
 	low := strings.ToLower(s)
 	switch {
@@ -412,7 +859,7 @@ func parseOperand(mn, s string) (Mode, string, error) {
 	if mn == "mvn" || mn == "mvp" {
 		return Move, s, nil
 	}
-	return DP, s, nil // plain: chain resolves DP/Abs/AbsL/branch
+	return DP, s, nil
 }
 
 // matchParen returns the text inside the leading balanced parens of s.

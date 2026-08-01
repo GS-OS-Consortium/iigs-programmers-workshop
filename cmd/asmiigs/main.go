@@ -36,13 +36,7 @@ func main() {
 	if len(inputs) != 1 || out == "" {
 		die("usage: asmiigs [options] file.aii -o file.obj")
 	}
-	data, err := os.ReadFile(inputs[0])
-	if err != nil {
-		die("%v", err)
-	}
-	// Accept classic-Mac CR or LF line endings.
-	src := strings.ReplaceAll(string(data), "\r", "\n")
-	obj, err := asm.Assemble(src)
+	obj, err := asm.AssembleFile(inputs[0])
 	if err != nil {
 		die("%s:\n%v", inputs[0], err)
 	}
