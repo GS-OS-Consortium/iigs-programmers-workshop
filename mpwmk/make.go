@@ -3,6 +3,7 @@ package mpwmk
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -21,6 +22,25 @@ type Makefile struct {
 	Rules []*Rule
 	Vars  map[string]string
 	byTgt map[string]*Rule // lowercased expanded target -> rule
+	// suffix rules: ".oii ƒ .aii" supplies the recipe for any target whose
+	// name ends in .oii built from the matching .aii
+	suffix []*Rule
+}
+
+// suffixPair reports the target and dependency suffixes of a rule like
+// ".oii ƒ .aii", or ok=false if it is an ordinary rule.
+func suffixPair(r *Rule) (tgt, dep string, ok bool) {
+	if len(r.Targets) != 1 || len(r.Deps) != 1 {
+		return "", "", false
+	}
+	t, d := r.Targets[0], r.Deps[0]
+	if !strings.HasPrefix(t, ".") || !strings.HasPrefix(d, ".") {
+		return "", "", false
+	}
+	if strings.ContainsAny(t[1:], ".:/ ") || strings.ContainsAny(d[1:], ".:/ ") {
+		return "", "", false
+	}
+	return t, d, true
 }
 
 // ParseMakefile parses MPW Make syntax: "target ƒ deps" rule lines, tab-
@@ -180,6 +200,10 @@ func NewBuilder(env *Env, mf *Makefile) *Builder {
 	}
 	b := &Builder{Env: env, MF: mf, Made: map[string]bool{}}
 	for _, r := range mf.Rules {
+		if _, _, ok := suffixPair(r); ok {
+			mf.suffix = append(mf.suffix, r)
+			continue
+		}
 		for _, t := range r.Targets {
 			b.MF.byTgt[strings.ToLower(env.HostPath(t))] = r
 		}
@@ -205,13 +229,31 @@ func (b *Builder) Build(target string) error {
 	b.Made[key] = true
 
 	rule := b.MF.byTgt[key]
-	if rule == nil {
+	// An explicit rule may name the dependency but leave the recipe to a
+	// suffix rule (".oii ƒ .aii"), so fall back whenever no commands apply.
+	var sfx *Rule
+	var sfxDep string
+	if rule == nil || len(rule.Cmds) == 0 {
+		sfx, sfxDep = b.matchSuffix(host)
+	}
+	if rule == nil && sfx == nil {
 		if _, err := os.Stat(host); err != nil {
 			return fmt.Errorf("no rule to make %q (%s)", target, host)
 		}
 		return nil // an existing source file
 	}
 	var newest time.Time
+	if sfx != nil {
+		if err := b.Build(sfxDep); err != nil {
+			return err
+		}
+		if fi, err := os.Stat(b.Env.HostPath(sfxDep)); err == nil {
+			newest = fi.ModTime()
+		}
+	}
+	if rule == nil {
+		rule = &Rule{}
+	}
 	for _, d := range rule.Deps {
 		// A dependency that is nothing but a variable reference may hold a
 		// whole list of files -- make.os builds the loader from "{Files}".
@@ -239,11 +281,73 @@ func (b *Builder) Build(target string) error {
 	if b.Env.Verbose {
 		fmt.Fprintf(b.Env.Out, "  %s\n", target)
 	}
-	if err := b.Env.RunBlock(rule.Cmds); err != nil {
+	cmds := rule.Cmds
+	if len(cmds) == 0 && sfx != nil {
+		// {Default} is the base name shared by target and dependency;
+		// {TargDir} and {DepDir} are their directories.
+		saved := map[string]string{}
+		for _, k := range []string{"default", "targdir", "depdir"} {
+			saved[k] = b.Env.Get(k)
+		}
+		b.Env.Set("Default", baseNoExt(host))
+		b.Env.Set("TargDir", dirWithSlash(host))
+		b.Env.Set("DepDir", dirWithSlash(b.Env.HostPath(sfxDep)))
+		defer func() {
+			for k, v := range saved {
+				b.Env.Set(k, v)
+			}
+		}()
+		cmds = sfx.Cmds
+	}
+	if err := b.Env.RunBlock(cmds); err != nil {
 		return fmt.Errorf("%s: %w", target, err)
 	}
 	return nil
 }
+
+// matchSuffix finds a suffix rule producing host, returning it and the host
+// path of the implied dependency.
+func (b *Builder) matchSuffix(host string) (*Rule, string) {
+	for _, r := range b.MF.suffix {
+		tgtSfx, depSfx, _ := suffixPair(r)
+		if !strings.EqualFold(filepath.Ext(host), tgtSfx) {
+			continue
+		}
+		dep := strings.TrimSuffix(host, filepath.Ext(host)) + depSfx
+		if _, err := os.Stat(dep); err != nil {
+			// MPW file names are case-insensitive; the makefiles are not
+			// consistent about it.
+			if alt, ok := findCaseInsensitive(dep); ok {
+				dep = alt
+			} else {
+				continue
+			}
+		}
+		return r, dep
+	}
+	return nil, ""
+}
+
+func findCaseInsensitive(path string) (string, bool) {
+	ents, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return "", false
+	}
+	want := strings.ToLower(filepath.Base(path))
+	for _, e := range ents {
+		if strings.ToLower(e.Name()) == want {
+			return filepath.Join(filepath.Dir(path), e.Name()), true
+		}
+	}
+	return "", false
+}
+
+func baseNoExt(p string) string {
+	b := filepath.Base(p)
+	return strings.TrimSuffix(b, filepath.Ext(b))
+}
+
+func dirWithSlash(p string) string { return filepath.Dir(p) + "/" }
 
 // Targets lists all rule targets in file order (for -list).
 func (b *Builder) Targets() []string {
