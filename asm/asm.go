@@ -436,8 +436,9 @@ func (st *asmState) doLine(l line) {
 	case "string":
 		st.strMode = strings.ToUpper(operandOnly(l.rest))
 		return
-	case "title", "eject", "print", "space", "page":
-		return // listing control: no object-file effect
+	case "title", "eject", "print", "space", "page", "blanks", "list", "nolist",
+		"case", "trace", "err", "obj", "noobj":
+		return // listing/diagnostic control: no object-file effect
 	case "with", "endwith":
 		return // record fields are defined globally here
 	case "seg":
@@ -565,9 +566,14 @@ func (st *asmState) doRecordLine(op string, l line) {
 		}
 	}
 	switch op {
-	case "endr":
+	case "endr", "endp", "end":
+		// MPW closes a RECORD template with ENDR or ENDP (both appear in the
+		// GS/OS sources); END closes everything.
 		st.inRecord = false
 		st.recName = ""
+		if op == "end" {
+			st.ended = true
+		}
 		return
 	case "org":
 		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})

@@ -115,11 +115,15 @@ func (e *Env) HostPath(p string) string {
 		return ""
 	}
 	if strings.HasPrefix(p, "/") { // already a host path
-		return filepath.Clean(p)
+		// MPW directory values keep a trailing ':' and may use ':' separators
+		p = strings.TrimSuffix(p, ":")
+		return filepath.Clean(strings.ReplaceAll(p, ":", "/"))
 	}
 	if !strings.Contains(p, ":") {
 		return filepath.Join(e.Dir, p)
 	}
+	// A single trailing ':' just marks the name as a directory.
+	p = strings.TrimSuffix(p, ":")
 	base := e.Dir
 	for strings.HasPrefix(p, ":") {
 		if strings.HasPrefix(p, "::") {

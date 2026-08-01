@@ -31,6 +31,7 @@ func Link(objs []*omf.File) ([]byte, error) {
 	// place object segments sequentially
 	var segs []*objSeg
 	byName := map[string]*objSeg{}
+	globals := map[string]int64{} // ENTRY symbols -> offset in the image
 	var image []byte
 	var org int64
 	var kind uint16 = 0x4000
@@ -66,7 +67,7 @@ func Link(objs []*omf.File) ([]byte, error) {
 				pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 			case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 				size := int(r.Raw[1])
-				val, shift, err := evalOMFExpr(r.Raw[2:], byName, os)
+				val, shift, err := evalOMFExpr(r.Raw[2:], byName, globals, os)
 				if err != nil {
 					return nil, fmt.Errorf("segment %s: %w", os.name, err)
 				}
@@ -118,7 +119,7 @@ func segImage(s *omf.Segment) ([]byte, error) {
 
 // evalOMFExpr evaluates an OMF expression (label +- consts, optional final
 // shift) against object-segment bases. Returns (value, shift).
-func evalOMFExpr(b []byte, byName map[string]*objSeg, cur *objSeg) (int64, int64, error) {
+func evalOMFExpr(b []byte, byName map[string]*objSeg, globals map[string]int64, cur *objSeg) (int64, int64, error) {
 	var stack []int64
 	var shift int64
 	pos := 0
@@ -139,11 +140,13 @@ func evalOMFExpr(b []byte, byName map[string]*objSeg, cur *objSeg) (int64, int64
 			n := int(b[pos])
 			name := string(b[pos+1 : pos+1+n])
 			pos += 1 + n
-			os, ok := byName[name]
-			if !ok {
+			if os, ok := byName[name]; ok {
+				stack = append(stack, os.base)
+			} else if off, ok := globals[name]; ok {
+				stack = append(stack, off)
+			} else {
 				return 0, 0, fmt.Errorf("undefined label %q", name)
 			}
-			stack = append(stack, os.base)
 		case tok == 0x01: // +
 			if len(stack) < 2 {
 				return 0, 0, fmt.Errorf("stack underflow")
