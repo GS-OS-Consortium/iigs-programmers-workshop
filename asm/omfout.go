@@ -11,6 +11,7 @@ type Segment struct {
 	TempOrg    int64
 	HasTempOrg bool
 	Kind       uint16 // OMF KIND: $4000 private code, $4001 private data
+	KindSet    bool   // Kind is explicit, so a zero value means KIND $0000
 	Length     int64
 	Records    []byte
 }
@@ -52,7 +53,7 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	hdr[0x0E] = 4                              // NUMLEN
 	hdr[0x0F] = 2                              // VERSION
 	kind := s.Kind
-	if kind == 0 {
+	if kind == 0 && !s.KindSet {
 		kind = 0x4000 // private code
 	}
 	if kind != 0x4001 {

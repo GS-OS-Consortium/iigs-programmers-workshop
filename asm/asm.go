@@ -53,6 +53,7 @@ type segState struct {
 	hasTempOrg bool
 	align      int64  // PROC ALIGN n (segment alignment)
 	kind       uint16 // OMF KIND ($4001 for a data segment from bare RECORD)
+	kindSet    bool   // kind was set explicitly (PROC EXPORT clears to $0000)
 	actions    []action
 	endPC      int64
 }
@@ -470,7 +471,13 @@ func (st *asmState) doLine(l line) {
 			kw := strings.ToLower(f[0])
 			if len(f) == 1 {
 				switch kw {
-				case "export", "private", "entry", "dynamic", "skip", "noskip":
+				case "export":
+					// clears the segment's PRIVATE bit (oracle-verified:
+					// plain PROC is KIND $4000, PROC EXPORT is $0000)
+					seg.kind = 0x0000
+					seg.kindSet = true
+					continue
+				case "private", "entry", "dynamic", "skip", "noskip":
 					continue // no effect on the emitted object
 				}
 				st.errf("unsupported %s operand %q", strings.ToUpper(op), opt)
@@ -797,6 +804,12 @@ func (st *asmState) beginSegment(label string, kind uint16) {
 }
 
 func (st *asmState) openSegment(seg *segState) {
+	// A segment whose own label is EXPORTed is not private: UniDisk3.5 says
+	// "EXPORT driver_data" before "driver_data PROC" and its segment is
+	// KIND $0000 (oracle-verified), the same as writing "PROC EXPORT".
+	if !seg.kindSet && st.entries[seg.name] && st.entryPriv[seg.name] == 0 {
+		seg.kind, seg.kindSet = 0x0000, true
+	}
 	st.segs = append(st.segs, seg)
 	st.cur = seg
 	st.pc = 0

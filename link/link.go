@@ -301,21 +301,25 @@ func buildLoadFile(image []byte, org int64, kind uint16, patches []relocPatch) (
 	return out, nil
 }
 
-// relocRecords emits shifted patches as cRELOC records followed by one SUPER
-// RELOC2 record for plain 2-byte patches (LinkIIGS 1.2 order).
+// relocRecords emits the patch list the way LinkIIGS 1.2 does: unshifted 2-
+// and 3-byte patches are packed into SUPER RELOC2 and RELOC3 records, and
+// what is left becomes a cRELOC when its offset and value both fit in two
+// bytes, or a full RELOC otherwise. Width does not decide cRELOC -- a 4-byte
+// patch at a low offset still compresses (oracle-verified).
 func relocRecords(patches []relocPatch) []byte {
 	var out []byte
-	var super []relocPatch
+	var super2, super3 []relocPatch
 	for _, p := range patches {
-		if p.shift == 0 && p.size == 2 {
-			super = append(super, p)
-			continue
-		}
-		if p.size == 2 && p.offset < 0x10000 && p.value < 0x10000 {
+		switch {
+		case p.shift == 0 && p.size == 2:
+			super2 = append(super2, p)
+		case p.shift == 0 && p.size == 3:
+			super3 = append(super3, p)
+		case p.offset < 0x10000 && p.value < 0x10000:
 			out = append(out, 0xF5, byte(p.size), byte(int8(p.shift)))
 			out = append(out, byte(p.offset), byte(p.offset>>8))
 			out = append(out, byte(p.value), byte(p.value>>8))
-		} else {
+		default:
 			out = append(out, 0xE2, byte(p.size), byte(int8(p.shift)))
 			var b [4]byte
 			binary.LittleEndian.PutUint32(b[:], uint32(p.offset))
@@ -324,41 +328,46 @@ func relocRecords(patches []relocPatch) []byte {
 			out = append(out, b[:]...)
 		}
 	}
-	if len(super) > 0 {
-		// SUPER RELOC2: per-256-byte-page subrecords: count-1 then offsets
-		var body []byte
-		body = append(body, 0x00) // type RELOC2
-		page := int64(0)
-		var pageOffsets []byte
-		flushPage := func() {
-			if len(pageOffsets) > 0 {
-				body = append(body, byte(len(pageOffsets)-1))
-				body = append(body, pageOffsets...)
-				pageOffsets = nil
-			}
-		}
-		for _, p := range super {
-			pg := p.offset >> 8
-			for page < pg {
-				flushPage()
-				// skip to next page: SUPER uses $80|skipcount to skip pages
-				skip := pg - page
-				if skip > 0x7F {
-					skip = 0x7F
-				}
-				body = append(body, byte(0x80|skip))
-				page += skip
-			}
-			pageOffsets = append(pageOffsets, byte(p.offset&0xFF))
-		}
-		flushPage()
-		out = append(out, 0xF7)
-		var b [4]byte
-		binary.LittleEndian.PutUint32(b[:], uint32(len(body)))
-		out = append(out, b[:]...)
-		out = append(out, body...)
+	out = append(out, superReloc(super2, 0)...)
+	return append(out, superReloc(super3, 1)...)
+}
+
+// superReloc packs unshifted patches of one width into a SUPER record. The
+// body is a type byte then, per 256-byte page, the count-1 of patches in that
+// page followed by their low offset bytes. A subrecord implicitly advances to
+// the next page, so a $80|n byte skips n pages BEYOND that advance.
+func superReloc(super []relocPatch, typ byte) []byte {
+	if len(super) == 0 {
+		return nil
 	}
-	return out
+	body := []byte{typ}
+	page := int64(0)
+	for i := 0; i < len(super); {
+		pg := super[i].offset >> 8
+		for page < pg {
+			skip := pg - page
+			if skip > 0x7F {
+				skip = 0x7F
+			}
+			body = append(body, byte(0x80|skip))
+			page += skip
+		}
+		j := i
+		for j < len(super) && super[j].offset>>8 == pg {
+			j++
+		}
+		body = append(body, byte(j-i-1))
+		for k := i; k < j; k++ {
+			body = append(body, byte(super[k].offset&0xFF))
+		}
+		i = j
+		page++
+	}
+	out := []byte{0xF7}
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(len(body)))
+	out = append(out, b[:]...)
+	return append(out, body...)
 }
 
 // ---------- multi-segment (-lseg) linking ----------
