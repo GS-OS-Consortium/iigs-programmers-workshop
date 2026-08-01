@@ -828,8 +828,15 @@ func (pp *ppState) callFunc(name string, args []string) string {
 		} else {
 			s = strconv.FormatInt(n, 10)
 		}
+		// A negative width zero-fills, a positive one blank-fills, and a
+		// value too wide for the field is not truncated (oracle-probed).
+		// gquit builds "v4.02" with &i2s(&minor,-2).
+		pad := " "
+		if width < 0 {
+			width, pad = -width, "0"
+		}
 		for int64(len(s)) < width {
-			s = " " + s
+			s = pad + s
 		}
 		return s
 	case "SETTING":

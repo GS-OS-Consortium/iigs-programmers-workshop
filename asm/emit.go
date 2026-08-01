@@ -183,8 +183,15 @@ func exprBody(pos, neg []termRef, c int64, post []postOp) []byte {
 		body = append(body, 0x02)
 	}
 	if c != 0 {
-		pushConst(c)
-		body = append(body, 0x01)
+		// A negative addend is pushed positive and subtracted, not pushed
+		// negative and added (oracle-verified in gquit's launch_app).
+		if c < 0 {
+			pushConst(-c)
+			body = append(body, 0x02)
+		} else {
+			pushConst(c)
+			body = append(body, 0x01)
+		}
 	}
 	for _, o := range post {
 		pushConst(o.Val)
