@@ -1161,6 +1161,14 @@ func splitCompareIn(s string, brackets bool) (string, string, string) {
 					continue
 				}
 			}
+			// A bare "<" needs a left-hand side to be a comparison. With none
+			// it is the direct-page prefix of a substituted operand, as in
+			// "IF &addr1='' THEN" with &addr1 = "<s_temp1" -- reading that as
+			// a comparison took the wrong branch of gsos.macros' pulllong and
+			// dropped the stores entirely.
+			if strings.TrimSpace(s[:i]) == "" {
+				continue
+			}
 			return strings.TrimSpace(s[:i]), "<", strings.TrimSpace(s[i+1:])
 		case '>':
 			if inStr || depth != 0 {
@@ -1174,6 +1182,9 @@ func splitCompareIn(s string, brackets bool) (string, string, string) {
 					i++
 					continue
 				}
+			}
+			if strings.TrimSpace(s[:i]) == "" {
+				continue // long-addressing prefix, not a comparison
 			}
 			return strings.TrimSpace(s[:i]), ">", strings.TrimSpace(s[i+1:])
 		case '=':
