@@ -609,7 +609,7 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
-	"ORD": true, "SUBSTR": true,
+	"ORD": true, "SUBSTR": true, "TYPE": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -753,6 +753,28 @@ func (pp *ppState) callFunc(name string, args []string) string {
 			return "0"
 		}
 		return strconv.FormatInt(pp.argNum(args[0]), 10)
+	case "TYPE":
+		// &TYPE names a symbol's kind, or 'UNDEFINED' when it has none.
+		// AD3.5 guards its defaults with
+		// "if &TYPE('VERSION6X') = 'UNDEFINED' then".
+		if len(args) != 1 {
+			return "UNDEFINED"
+		}
+		nm := strings.ToUpper(strings.Trim(strings.TrimSpace(pp.rawArg(args)), "'"))
+		if _, ok := pp.lookupVar(nm); ok {
+			return "SETC"
+		}
+		if pp.st != nil {
+			for _, key := range [2]string{pp.st.scopePrefix() + nm, nm} {
+				if v, ok := pp.st.syms[key]; ok {
+					if v.isNum() {
+						return "EQU"
+					}
+					return "LABEL"
+				}
+			}
+		}
+		return "UNDEFINED"
 	case "SUBSTR":
 		// &SUBSTR(str, start, length) -- the function form of the &var[a:b]
 		// substring syntax.

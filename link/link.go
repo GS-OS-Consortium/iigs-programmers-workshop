@@ -69,6 +69,8 @@ func Link(objs []*omf.File) ([]byte, error) {
 					off += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 				case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr:
 					off += int64(r.Raw[1])
+				case r.Op == omf.RecOrg:
+					off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 				case r.Op == omf.RecGlobal:
 					n := int(r.Raw[1])
 					globals[string(r.Raw[2:2+n])] = off
@@ -119,6 +121,8 @@ func Link(objs []*omf.File) ([]byte, error) {
 					patches = append(patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 				}
 				pc += int64(size)
+			case r.Op == omf.RecOrg:
+				pc += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
 			default:
 				return nil, fmt.Errorf("segment %s: unsupported record %s in linker", os.name, omf.RecName(r.Op))
@@ -132,17 +136,37 @@ func Link(objs []*omf.File) ([]byte, error) {
 // segImage extracts the raw code image of an object segment (expression
 // bytes left as zeros to be patched).
 func segImage(s *omf.Segment) ([]byte, error) {
+	// An ORG record moves the write position, so bytes are placed at a
+	// cursor rather than appended: a backwards ORG overlays what is there.
 	var img []byte
+	pos := 0
+	put := func(b []byte) {
+		if need := pos + len(b); need > len(img) {
+			img = append(img, make([]byte, need-len(img))...)
+		}
+		copy(img[pos:], b)
+		pos += len(b)
+	}
 	for _, r := range s.Records {
 		switch {
 		case r.Op >= 0x01 && r.Op <= 0xDF:
-			img = append(img, r.Raw[1:]...)
+			put(r.Raw[1:])
 		case r.Op == omf.RecLconst:
-			img = append(img, r.Raw[5:]...)
+			put(r.Raw[5:])
 		case r.Op == omf.RecDS:
-			img = append(img, make([]byte, binary.LittleEndian.Uint32(r.Raw[1:]))...)
+			// DS reserves space rather than writing: after a backwards ORG
+			// the bytes it skips over must keep what is already there.
+			pos += int(binary.LittleEndian.Uint32(r.Raw[1:]))
+			if pos > len(img) {
+				img = append(img, make([]byte, pos-len(img))...)
+			}
 		case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
-			img = append(img, make([]byte, r.Raw[1])...)
+			put(make([]byte, r.Raw[1]))
+		case r.Op == omf.RecOrg:
+			pos += int(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
+			if pos < 0 {
+				return nil, fmt.Errorf("segment %s: ORG before segment start", s.SegName)
+			}
 		case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
 		default:
 			return nil, fmt.Errorf("unsupported record %s", omf.RecName(r.Op))
@@ -475,6 +499,8 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 						b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 					}
 					pc += int64(size)
+				case r.Op == omf.RecOrg:
+					pc += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 				case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
 				default:
 					return nil, fmt.Errorf("segment %s: unsupported record %s in linker",
@@ -503,6 +529,8 @@ func collectSymbols(s *omf.Segment, base int64, globals, absolutes map[string]in
 			off += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 		case r.Op == omf.RecLexpr, r.Op == omf.RecBexpr, r.Op == omf.RecExpr:
 			off += int64(r.Raw[1])
+		case r.Op == omf.RecOrg:
+			off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 		case r.Op == omf.RecGlobal:
 			n := int(r.Raw[1])
 			globals[string(r.Raw[2:2+n])] = off

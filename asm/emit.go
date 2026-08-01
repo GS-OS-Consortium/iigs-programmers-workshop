@@ -295,6 +295,11 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 		case aRec:
 			e.flush()
 			e.recs = append(e.recs, a.bytes...)
+		case aOrg:
+			e.flush()
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], uint32(int32(a.count)))
+			e.recs = append(e.recs, 0xE1, b[0], b[1], b[2], b[3])
 		case aDS:
 			e.ds(a.count)
 		case aBranch:

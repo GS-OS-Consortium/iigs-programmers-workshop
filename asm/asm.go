@@ -24,6 +24,7 @@ const (
 	aDefer                 // expression that failed pass-1 eval (forward refs
 	//                        in non-linear contexts); re-evaluated in pass 2
 	aRec // raw OMF record bytes (e.g. GLOBAL from ENTRY), zero code size
+	aOrg // OMF ORG record: move the location counter by a signed amount
 )
 
 type action struct {
@@ -108,6 +109,7 @@ type asmState struct {
 	recPC    int64
 	recName  string // RECORD label, for qualified RECORD.FIELD references
 	recHigh  int64  // highest offset reached, for a bare ORG "reset to max"
+	segHigh  int64  // same, for the location counter inside a segment
 	// recSize/recFields describe finished RECORD templates so that
 	// "label DS <record>" can reserve the right size and alias the fields.
 	recSize   map[string]int64
@@ -693,17 +695,45 @@ func (st *asmState) doLine(l line) {
 		// listing-directed output; no effect on the object
 		return
 	case "org":
-		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
-		if err != nil {
-			st.errf("ORG: %v", err)
-			return
-		}
 		if st.cur == nil {
 			st.errf("ORG outside PROC")
 			return
 		}
+		// A bare ORG restores the location counter to its high-water mark.
+		if operandOnly(l.rest) == "" {
+			if st.pc > st.segHigh {
+				st.segHigh = st.pc
+			}
+			if st.segHigh > st.pc {
+				st.addAction(action{kind: aDS, count: st.segHigh - st.pc})
+				st.pc = st.segHigh
+			}
+			return
+		}
+		// The operand may name a label in this segment: AD3.5.data does
+		// "ORG trk_ctr" to overlay a later field on earlier storage.
+		val, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
+		if err != nil {
+			st.errf("ORG: %v", err)
+			return
+		}
+		v := val.C
+		if !val.isNum() {
+			if len(val.Pos) != 1 || len(val.Neg) != 0 || val.Pos[0].fwd != "" ||
+				val.Pos[0].seg != st.curSegIndex() {
+				st.errf("ORG: expression must be constant: %q", l.rest)
+				return
+			}
+		}
+		if st.pc > st.segHigh {
+			st.segHigh = st.pc
+		}
 		if v < st.pc {
-			st.errf("ORG backwards ($%X < $%X)", v, st.pc)
+			// Moving back to overlay storage already reserved: the original
+			// emits an OMF ORG record carrying the signed displacement
+			// rather than rewriting the bytes.
+			st.addAction(action{kind: aOrg, count: v - st.pc})
+			st.pc = v
 			return
 		}
 		if v > st.pc {
@@ -813,6 +843,7 @@ func (st *asmState) openSegment(seg *segState) {
 	st.segs = append(st.segs, seg)
 	st.cur = seg
 	st.pc = 0
+	st.segHigh = 0
 	for _, rec := range st.pendingRecs {
 		seg.actions = append(seg.actions, action{kind: aRec, bytes: rec})
 	}
