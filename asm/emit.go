@@ -90,25 +90,40 @@ func (e *segEmitter) expr(rec byte, size int, segName string, disp int64, shift 
 	e.recs = append(e.recs, recEnd)
 }
 
+// termRef is one operand of a general expression record: a label and the
+// displacement to add to it. A symbol published by name carries its offset
+// in the name itself, so its displacement is zero.
+type termRef struct {
+	name string
+	disp int64
+}
+
 // exprGeneral emits a general EXPR record for a value that does not reduce
 // to a single label plus a constant (e.g. the difference of labels in two
 // different segments). The body is an RPN token stream: $83 pushes a label,
-// $81 pushes a constant, $01 adds, $02 subtracts, $00 ends.
-func (e *segEmitter) exprGeneral(size int, pos, neg []string, c int64) {
+// $81 pushes a constant, $01 adds, $02 subtracts, $00 ends. Each operand is
+// pushed with its own displacement, and only a literal addend left over from
+// the source expression is applied at the end (oracle-verified: "elab-*" at
+// offset 2 of P2 emits ELAB, P2, 2, add, subtract).
+func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64) {
 	e.flush()
 	body := []byte{}
-	pushLabel := func(name string) {
-		body = append(body, 0x83, byte(len(name)))
-		body = append(body, name...)
-	}
 	pushConst := func(v int64) {
 		var b [4]byte
 		binary.LittleEndian.PutUint32(b[:], uint32(v))
 		body = append(body, 0x81, b[0], b[1], b[2], b[3])
 	}
+	pushTerm := func(t termRef) {
+		body = append(body, 0x83, byte(len(t.name)))
+		body = append(body, t.name...)
+		if t.disp != 0 {
+			pushConst(t.disp)
+			body = append(body, 0x01)
+		}
+	}
 	first := true
-	for _, n := range pos {
-		pushLabel(n)
+	for _, t := range pos {
+		pushTerm(t)
 		if !first {
 			body = append(body, 0x01)
 		}
@@ -119,8 +134,8 @@ func (e *segEmitter) exprGeneral(size int, pos, neg []string, c int64) {
 		c = 0
 		first = false
 	}
-	for _, n := range neg {
-		pushLabel(n)
+	for _, t := range neg {
+		pushTerm(t)
 		body = append(body, 0x02)
 	}
 	if c != 0 {
@@ -166,7 +181,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					}
 					return
 				}
-				r, ok := st.nextDef(t.fwd, t.atSeq)
+				r, ok := st.nextDef(t.fwd, t.scope, t.atSeq)
 				if !ok {
 					// unresolvable (e.g. branch to an external): hard error,
 					// never loop
@@ -209,26 +224,35 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 	return v.cancel(), nil
 }
 
-// termNames maps resolved terms to the names an expression record uses.
-func (st *asmState) termNames(ts []term) []string {
-	var out []string
+// termRefs maps resolved terms to the operands an expression record uses,
+// and returns how much of the value the operands already account for. The
+// caller subtracts that from the expression's constant to get the residual
+// literal addend.
+func (st *asmState) termRefs(ts []term) ([]termRef, int64) {
+	var out []termRef
+	var covered int64
 	for _, t := range ts {
-		n, _ := st.exprRef(t, 0, -1) // -1: never the "current" segment
-		out = append(out, n)
+		n, d := st.exprRef(t, t.symOff, -1) // -1: never the "current" segment
+		out = append(out, termRef{name: n, disp: d})
+		covered += t.symOff
 	}
-	return out
+	return out, covered
 }
 
 // nextDef returns the first definition of name made after seq (a one-pass
-// forward reference binds to the next definition, not the last).
-func (st *asmState) nextDef(name string, seq int64) (Val, bool) {
-	defs := st.symSeq[name]
-	for _, d := range defs {
-		if d.defSeq > seq {
-			return d, true
+// forward reference binds to the next definition, not the last). The
+// reference's own segment scope is searched before the file-wide one.
+func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
+	for _, key := range [2]string{scope + name, name} {
+		defs := st.symSeq[key]
+		if len(defs) == 0 {
+			continue
 		}
-	}
-	if len(defs) > 0 {
+		for _, d := range defs {
+			if d.defSeq > seq {
+				return d, true
+			}
+		}
 		return defs[len(defs)-1], true
 	}
 	v, ok := st.syms[name]
@@ -322,7 +346,9 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				continue
 			}
 			if len(t.Pos)+len(t.Neg) > 1 {
-				e.exprGeneral(a.size, st.termNames(t.Pos), st.termNames(t.Neg), t.C)
+				pos, gained := st.termRefs(t.Pos)
+				neg, lost := st.termRefs(t.Neg)
+				e.exprGeneral(a.size, pos, neg, t.C-gained+lost)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
@@ -343,7 +369,9 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				continue
 			}
 			if len(t.Pos)+len(t.Neg) > 1 {
-				e.exprGeneral(a.size, st.termNames(t.Pos), st.termNames(t.Neg), t.C)
+				pos, gained := st.termRefs(t.Pos)
+				neg, lost := st.termRefs(t.Neg)
+				e.exprGeneral(a.size, pos, neg, t.C-gained+lost)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)

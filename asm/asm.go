@@ -84,10 +84,13 @@ type asmState struct {
 	// to a constant and so are published as GEQU rather than GLOBAL.
 	entryPriv map[string]byte
 	entryEqu  map[string]bool
-	loadName  string // current SEG name for new PROCs
-	segs      []*segState
-	cur       *segState
-	pc        int64
+	// fileWide names escape segment scope: ENTRY/EXPORT symbols and the PROC
+	// labels that name the segments themselves.
+	fileWide map[string]bool
+	loadName string // current SEG name for new PROCs
+	segs     []*segState
+	cur      *segState
+	pc       int64
 
 	// RECORD ... ENDR template mode
 	inRecord bool
@@ -110,6 +113,21 @@ func (st *asmState) errf(format string, args ...any) {
 
 func (st *asmState) curSegIndex() int { return len(st.segs) - 1 }
 
+// scopePrefix is the symbol-table prefix for definitions made at this point.
+//
+// Labels and equates declared inside a PROC belong to that segment alone --
+// the original assembler reports "Undefined ID" for them in a second PROC,
+// which is how a file can reuse a name like "done" in every routine. Symbols
+// defined outside a PROC are visible file-wide, as are RECORD fields (a
+// template defines offsets, not storage) and anything published with
+// ENTRY/EXPORT.
+func (st *asmState) scopePrefix() string {
+	if st.cur == nil || st.inRecord {
+		return ""
+	}
+	return fmt.Sprintf("%d\x00", st.curSegIndex())
+}
+
 func (st *asmState) lookup(name string) Val {
 	if strings.HasPrefix(name, "@") {
 		name = st.scopedLocal(name)
@@ -119,7 +137,12 @@ func (st *asmState) lookup(name string) Val {
 	if st.cur != nil && st.cur.imports[name] {
 		return fwdVal(name)
 	}
-	if v, ok := st.syms[name]; ok {
+	scope := st.scopePrefix()
+	for _, key := range [2]string{scope + name, name} {
+		v, ok := st.syms[key]
+		if !ok {
+			continue
+		}
 		// Tag with the symbol's own name/offset so cross-segment references
 		// can be emitted by name; same-segment backward refs still use
 		// segment+offset (see exprRef).
@@ -129,6 +152,7 @@ func (st *asmState) lookup(name string) Val {
 		return v
 	}
 	f := fwdVal(name)
+	f.Pos[0].scope = scope
 	f.Pos[0].atSeq = st.defSeq // bind to the next definition after this point
 	return f
 }
@@ -139,16 +163,22 @@ func (st *asmState) scopedLocal(name string) string {
 
 func (st *asmState) define(name string, v Val) {
 	name = strings.ToUpper(name)
+	key := name
 	if strings.HasPrefix(name, "@") {
-		name = st.scopedLocal(name)
+		key = st.scopedLocal(name)
 	} else {
 		// any non-local label delimits @local scopes (incl. X EQU *)
 		st.localScope++
+		// ENTRY/EXPORT symbols stay file-wide; everything else is scoped to
+		// the segment being assembled.
+		if !st.entries[name] && !st.fileWide[name] {
+			key = st.scopePrefix() + name
+		}
 	}
-	st.syms[name] = v
+	st.syms[key] = v
 	st.defSeq++
 	v.defSeq = st.defSeq
-	st.symSeq[name] = append(st.symSeq[name], v)
+	st.symSeq[key] = append(st.symSeq[key], v)
 }
 
 // ---------- line model ----------
@@ -300,6 +330,7 @@ func newState() *asmState {
 		imports:   map[string]bool{},
 		entries:   map[string]bool{},
 		entryPriv: map[string]byte{},
+		fileWide:  map[string]bool{},
 		entryEqu:  map[string]bool{},
 		loadName:  "main",
 	}
@@ -385,6 +416,9 @@ func (st *asmState) doLine(l line) {
 		st.segs = append(st.segs, seg)
 		st.cur = seg
 		st.pc = 0
+		// The PROC's own label names the segment, so it stays visible to the
+		// whole file even though the labels inside it do not.
+		st.fileWide[strings.ToUpper(name)] = true
 		st.define(name, segVal(st.curSegIndex(), 0))
 		return
 	case "endp", "endproc":
@@ -532,6 +566,7 @@ func (st *asmState) doLine(l line) {
 				continue
 			}
 			st.entries[nm] = true
+			st.fileWide[nm] = true
 			st.entryPriv[nm] = priv
 			if strings.EqualFold(strings.TrimSpace(kind), "equ") {
 				st.entryEqu[nm] = true

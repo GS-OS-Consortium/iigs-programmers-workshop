@@ -17,6 +17,7 @@ type term struct {
 	symOff int64  // the symbol's own offset (to recover addends by name)
 	viaFwd bool   // reference was forward (symbol undefined when referenced)
 	atSeq  int64  // definition counter when the forward reference was made
+	scope  string // symbol-table scope prefix in effect at the reference
 }
 
 type Val struct {
@@ -34,7 +35,13 @@ type Val struct {
 
 func num(c int64) Val { return Val{C: c} }
 
-func segVal(seg int, off int64) Val { return Val{C: off, Pos: []term{{seg: seg}}} }
+// segVal is a location in a segment. The offset is recorded on the term as
+// well as in C: a general expression record emits each operand as its own
+// label-plus-displacement pair, so the operands' offsets must stay separable
+// from any literal addend in the expression.
+func segVal(seg int, off int64) Val {
+	return Val{C: off, Pos: []term{{seg: seg, symOff: off}}}
+}
 
 func fwdVal(name string) Val { return Val{Pos: []term{{seg: -1, fwd: name}}} }
 
