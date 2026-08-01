@@ -21,26 +21,33 @@ const (
 	aBranch                // relative branch to a label (resolved in pass 2)
 	aExpr                  // OMF expression record reference (label +- const)
 	aDS                    // reserve space (DS record)
+	aDefer                 // expression that failed pass-1 eval (forward refs
+	//                        in non-linear contexts); re-evaluated in pass 2
+	aRec // raw OMF record bytes (e.g. GLOBAL from ENTRY), zero code size
 )
 
 type action struct {
 	kind   actKind
 	bytes  []byte
-	target Val   // aBranch/aExpr: label value (possibly forward)
-	size   int   // aBranch: displacement width; aExpr: value width
-	rec    byte  // aExpr: omf.RecLexpr or omf.RecBexpr
-	shift  int64 // aExpr: shift amount (e.g. -8 for high byte), 0 = none
-	count  int64 // aDS
-	pcNext int64 // aBranch: pc after the instruction (for displacement)
+	target Val    // aBranch/aExpr: label value (possibly forward)
+	size   int    // aBranch: displacement width; aExpr/aDefer: value width
+	rec    byte   // aExpr/aDefer: omf.RecLexpr or omf.RecBexpr
+	shift  int64  // aExpr/aDefer: shift amount (negative = right), 0 = none
+	count  int64  // aDS
+	pcNext int64  // aBranch: pc after the instruction (for displacement)
+	expr   string // aDefer / deferred aBranch: expression text
+	pcAt   int64  // aDefer: pc for '*' during pass-2 evaluation
+	segAt  int    // aDefer: segment index for '*'
 	line   int
 	file   string
 }
 
 type segState struct {
-	name    string
-	org     int64 // segment header ORG (from "PROC ORG expr")
-	actions []action
-	endPC   int64
+	name     string
+	loadName string
+	org      int64 // segment header ORG (from "PROC ORG expr")
+	actions  []action
+	endPC    int64
 }
 
 // ---------- assembler state ----------
@@ -50,16 +57,20 @@ type symEntry struct {
 }
 
 type asmState struct {
-	cpu     int
-	longA   bool
-	longI   bool
-	msb     bool
-	strMode string // "ASIS" or "PASCAL"
+	localScope int // bumped at each non-local code label; scopes @locals
+	cpu        int
+	longA      bool
+	longI      bool
+	msb        bool
+	strMode    string // "ASIS" or "PASCAL"
 
-	syms map[string]Val
-	segs []*segState
-	cur  *segState
-	pc   int64
+	syms     map[string]Val
+	imports  map[string]bool // IMPORTed external symbols
+	entries  map[string]bool // ENTRY labels awaiting definition
+	loadName string          // current SEG name for new PROCs
+	segs     []*segState
+	cur      *segState
+	pc       int64
 
 	// RECORD ... ENDR template mode
 	inRecord bool
@@ -81,14 +92,32 @@ func (st *asmState) errf(format string, args ...any) {
 func (st *asmState) curSegIndex() int { return len(st.segs) - 1 }
 
 func (st *asmState) lookup(name string) Val {
+	if strings.HasPrefix(name, "@") {
+		name = st.scopedLocal(name)
+	}
+	if st.entries[name] || st.imports[name] {
+		// ENTRY/IMPORT symbols are referenced by name in expression records
+		return fwdVal(name)
+	}
 	if v, ok := st.syms[name]; ok {
 		return v
 	}
 	return fwdVal(name)
 }
 
+func (st *asmState) scopedLocal(name string) string {
+	return fmt.Sprintf("%s#%d", name, st.localScope)
+}
+
 func (st *asmState) define(name string, v Val) {
-	st.syms[strings.ToUpper(name)] = v
+	name = strings.ToUpper(name)
+	if strings.HasPrefix(name, "@") {
+		name = st.scopedLocal(name)
+	} else {
+		// any non-local label delimits @local scopes (incl. X EQU *)
+		st.localScope++
+	}
+	st.syms[name] = v
 }
 
 // ---------- line model ----------
@@ -180,9 +209,15 @@ func operandOnly(s string) string {
 
 // ---------- entry points ----------
 
-// AssembleFile assembles a source file (CR or LF line endings).
-func AssembleFile(path string) (*Object, error) {
+// AssembleFile assembles a source file (CR or LF line endings); incDirs are
+// searched for INCLUDE files after the including file's own directory.
+func AssembleFile(path string, incDirs ...string) (*Object, error) {
 	st := newState()
+	st.pp.incDirs = incDirs
+	// absolutize so MPW '::' (parent-dir) include paths resolve correctly
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
 	if err := st.pp.processFile(path); err != nil {
 		return nil, err
 	}
@@ -198,12 +233,15 @@ func AssembleSource(src, dir string) (*Object, error) {
 
 func newState() *asmState {
 	st := &asmState{
-		cpu:     cpu65816,
-		longA:   true,
-		longI:   true,
-		msb:     false,
-		strMode: "ASIS",
-		syms:    map[string]Val{},
+		cpu:      cpu65816,
+		longA:    true,
+		longI:    true,
+		msb:      false,
+		strMode:  "ASIS",
+		syms:     map[string]Val{},
+		imports:  map[string]bool{},
+		entries:  map[string]bool{},
+		loadName: "main",
 	}
 	st.pp = newPP(st)
 	return st
@@ -249,7 +287,7 @@ func (st *asmState) doLine(l line) {
 			st.errf("PROC requires a label")
 			return
 		}
-		seg := &segState{name: name}
+		seg := &segState{name: name, loadName: st.loadName}
 		// "label PROC ORG expr" sets the segment header ORG
 		if rest := strings.TrimSpace(l.rest); rest != "" {
 			f := strings.Fields(rest)
@@ -350,6 +388,32 @@ func (st *asmState) doLine(l line) {
 		return // listing control: no object-file effect
 	case "with", "endwith":
 		return // record fields are defined globally here
+	case "seg":
+		name := operandOnly(l.rest)
+		if u, err := unquote(name); err == nil && strings.HasPrefix(name, "'") {
+			name = u
+		}
+		st.loadName = name
+		return
+	case "import":
+		for _, a := range splitArgs(operandOnly(l.rest)) {
+			// strip an optional :TYPE suffix
+			nm := strings.ToUpper(strings.TrimSpace(strings.SplitN(a, ":", 2)[0]))
+			if nm != "" {
+				st.imports[nm] = true
+			}
+		}
+		return
+	case "export":
+		return // exports don't change our object output yet (oracle TBD)
+	case "entry":
+		for _, a := range splitArgs(operandOnly(l.rest)) {
+			nm := strings.ToUpper(strings.TrimSpace(a))
+			if nm != "" {
+				st.entries[nm] = true
+			}
+		}
+		return
 	case "writeln":
 		fmt.Fprintln(os.Stderr, l.rest)
 		return
@@ -393,7 +457,7 @@ func (st *asmState) doLine(l line) {
 			st.pc += n * size
 		}
 		return
-	case "dc", "dc.b", "dc.w", "dc.l":
+	case "dc", "dc.b", "dc.w", "dc.l", "dc.a":
 		st.doDC(op, l)
 		return
 	case "dcb", "dcb.b":
@@ -424,6 +488,14 @@ func (st *asmState) defineCodeLabel(name string) {
 		return
 	}
 	st.define(name, segVal(st.curSegIndex(), st.pc))
+	if u := strings.ToUpper(name); st.entries[u] {
+		// ENTRY label definition emits a GLOBAL record (oracle-verified:
+		// name, length=0, type 'M', attr 1)
+		rec := []byte{0xE6, byte(len(u))}
+		rec = append(rec, u...)
+		rec = append(rec, 0x00, 0x00, 'M', 0x01)
+		st.addAction(action{kind: aRec, bytes: rec})
+	}
 }
 
 // doRecordLine handles lines inside RECORD ... ENDR: a template that only
@@ -509,6 +581,8 @@ func (st *asmState) doDC(op string, l line) {
 	switch op {
 	case "dc.w":
 		size = 2
+	case "dc.a":
+		size = 3
 	case "dc.l":
 		size = 4
 	}
@@ -538,8 +612,10 @@ func (st *asmState) doDC(op string, l line) {
 		shift, expr := splitExtractor(item)
 		v, err := evalExpr(expr, &exprCtx{st: st})
 		if err != nil {
-			st.errf("DC: %v", err)
-			return
+			st.addAction(action{kind: aDefer, expr: expr, size: size,
+				rec: byte(recLexpr), shift: shift, pcAt: st.pc, segAt: st.curSegIndex()})
+			st.pc += int64(size)
+			continue
 		}
 		if v.isNum() {
 			c := applyShift(v.C, shift)
@@ -568,6 +644,13 @@ func (st *asmState) doDCB(l line) {
 	v, err2 := evalNum(strings.TrimSpace(args[1]), &exprCtx{st: st})
 	if err1 != nil || err2 != nil {
 		st.errf("DCB.B: bad operands")
+		return
+	}
+	if v == 0 && n > 5 {
+		// zero fills longer than a DS record (5 bytes) are emitted as DS
+		// (oracle-verified space optimization)
+		st.addAction(action{kind: aDS, count: n})
+		st.pc += n
 		return
 	}
 	b := make([]byte, n)
@@ -681,12 +764,15 @@ func (st *asmState) doInst(mn, operand string) {
 
 	// Evaluate the operand: mode selection is value-driven for constants;
 	// label references always use the 2-byte absolute form (oracle rule).
+	// Expressions that fail because of forward symbols in non-linear
+	// contexts (e.g. FWDLABEL*256) are deferred to pass 2.
 	val := num(0)
+	deferred := false
 	if exprStr != "" && mode != Move {
 		v, err := evalExpr(exprStr, &exprCtx{st: st})
 		if err != nil {
-			st.errf("%s: %v", mn, err)
-			return
+			deferred = true
+			v = fwdVal("") // treat as label-like for sizing
 		}
 		val = v
 	}
@@ -720,6 +806,16 @@ func (st *asmState) doInst(mn, operand string) {
 			}
 			info, found, chosen = oi, true, m
 			break
+		}
+	}
+	if !found {
+		// no mode is wide enough: the original truncates to the widest
+		// available (e.g. LDA $E1xxxx,y -> 16-bit abs,y with DBR)
+		for i := len(chain) - 1; i >= 0; i-- {
+			if oi, ok := ops[opKey{mn, chain[i]}]; ok && oi.cpu <= st.cpu {
+				info, found, chosen = oi, true, chain[i]
+				break
+			}
 		}
 	}
 	if !found {
@@ -761,14 +857,31 @@ func (st *asmState) doInst(mn, operand string) {
 	}
 
 	switch {
+	case deferred:
+		rec := byte(recLexpr)
+		if (mn == "jmp" || mn == "jsr") && chosen == Abs {
+			rec = recBexpr // bank-truncated; indirect/long forms use LEXPR
+		}
+		if chosen == Rel8 || chosen == Rel16 {
+			st.emitBytes(info.code)
+			st.addAction(action{kind: aBranch, target: val, size: n,
+				pcNext: st.pc + int64(n), expr: exprStr, pcAt: st.pc - 1, segAt: st.curSegIndex()})
+			st.pc += int64(n)
+			return
+		}
+		st.emitBytes(info.code)
+		st.addAction(action{kind: aDefer, expr: exprStr, size: n, rec: rec,
+			shift: shift, pcAt: st.pc - 1, segAt: st.curSegIndex()})
+		st.pc += int64(n)
 	case chosen == Rel8 || chosen == Rel16:
 		st.emitBytes(info.code)
 		st.addAction(action{kind: aBranch, target: val, size: n, pcNext: st.pc + int64(n)})
 		st.pc += int64(n)
 	case val.isLabel():
-		// expression record: BEXPR for jmp/jsr-class targets, LEXPR for data
+		// expression record: BEXPR for 2-byte jmp/jsr targets (bank-
+		// truncated), LEXPR for data refs and long transfers
 		rec := byte(recLexpr)
-		if mn == "jmp" || mn == "jsr" || mn == "jml" || mn == "jsl" {
+		if (mn == "jmp" || mn == "jsr") && chosen == Abs {
 			rec = recBexpr
 		}
 		st.emitBytes(info.code)

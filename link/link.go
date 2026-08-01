@@ -84,7 +84,7 @@ func Link(objs []*omf.File) ([]byte, error) {
 					patches = append(patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 				}
 				pc += int64(size)
-			case r.Op == omf.RecEnd:
+			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal:
 			default:
 				return nil, fmt.Errorf("segment %s: unsupported record %s in linker", os.name, omf.RecName(r.Op))
 			}
@@ -108,7 +108,7 @@ func segImage(s *omf.Segment) ([]byte, error) {
 			img = append(img, make([]byte, binary.LittleEndian.Uint32(r.Raw[1:]))...)
 		case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 			img = append(img, make([]byte, r.Raw[1])...)
-		case r.Op == omf.RecEnd:
+		case r.Op == omf.RecEnd || r.Op == omf.RecGlobal:
 		default:
 			return nil, fmt.Errorf("unsupported record %s", omf.RecName(r.Op))
 		}

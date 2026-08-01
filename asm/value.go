@@ -30,6 +30,22 @@ func fwdVal(name string) Val { return Val{Pos: []term{{seg: -1, fwd: name}}} }
 func (v Val) isNum() bool   { return len(v.Pos) == 0 && len(v.Neg) == 0 }
 func (v Val) isLabel() bool { return !v.isNum() }
 
+// hasUnresolvedFwd: any forward term that could still resolve from syms
+// (external IMPORTs never resolve and are kept symbolic).
+func (v Val) hasUnresolvedFwd(st *asmState) bool {
+	for _, t := range v.Pos {
+		if t.fwd != "" && !st.imports[t.fwd] {
+			return true
+		}
+	}
+	for _, t := range v.Neg {
+		if t.fwd != "" && !st.imports[t.fwd] {
+			return true
+		}
+	}
+	return false
+}
+
 func (v Val) hasFwd() bool {
 	for _, t := range v.Pos {
 		if t.fwd != "" {

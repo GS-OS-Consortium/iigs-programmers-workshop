@@ -5,10 +5,11 @@ import "encoding/binary"
 // Segment is one assembled OMF segment: header parameters plus the finished
 // record stream (which already ends with the END record).
 type Segment struct {
-	Name    string
-	Org     int64
-	Length  int64
-	Records []byte
+	Name     string
+	LoadName string
+	Org      int64
+	Length   int64
+	Records  []byte
 }
 
 // Object is a finished assembly: one segment per PROC.
@@ -53,7 +54,12 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	le.PutUint32(hdr[0x24:], 0)                // ENTRY
 	le.PutUint16(hdr[0x28:], uint16(dispName))
 	le.PutUint16(hdr[0x2A:], uint16(dispData))
-	copy(hdr[dispName:], "main      ")
+	ln := s.LoadName
+	if ln == "" {
+		ln = "main"
+	}
+	copy(hdr[dispName:], "          ")
+	copy(hdr[dispName:], ln)
 	hdr[dispName+10] = byte(len(name))
 	copy(hdr[dispName+11:], name)
 

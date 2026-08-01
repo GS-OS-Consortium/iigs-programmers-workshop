@@ -40,6 +40,8 @@ type ppState struct {
 
 	capturing *macroDef
 	protoNext bool // next line is the macro prototype
+
+	incDirs []string
 }
 
 func newPP(st *asmState) *ppState {
@@ -175,6 +177,15 @@ func (pp *ppState) processLine(raw string) {
 			spec = s
 		}
 		path := mpwPath(filepath.Dir(st.curFile), spec)
+		if _, serr := os.Stat(path); serr != nil {
+			for _, d := range pp.incDirs {
+				cand := filepath.Join(d, strings.ReplaceAll(strings.TrimPrefix(spec, ":"), ":", "/"))
+				if _, serr2 := os.Stat(cand); serr2 == nil {
+					path = cand
+					break
+				}
+			}
+		}
 		if err := pp.processFile(path); err != nil {
 			st.errf("INCLUDE %s: %v", spec, err)
 		}
@@ -230,8 +241,15 @@ func (pp *ppState) findMacro(op string) (*macroDef, string) {
 		return def, ""
 	}
 	for pre, def := range pp.macros {
-		if def.nameVar != "" && strings.HasPrefix(op, pre) {
+		if def.nameVar == "" {
+			continue
+		}
+		if strings.HasPrefix(op, pre) {
 			return def, op[len(pre):]
+		}
+		// "equds.&siz" also matches bare "equds" (empty suffix)
+		if strings.HasSuffix(pre, ".") && op == pre[:len(pre)-1] {
+			return def, ""
 		}
 	}
 	return nil, ""
@@ -248,7 +266,7 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	if def.nameVar != "" {
 		frame.vars[def.nameVar] = nameSuffix
 	}
-	args := splitArgs(inv.rest)
+	args := splitArgs(operandOnly(inv.rest))
 	for i, p := range def.params {
 		v := ""
 		if i < len(args) {
@@ -296,10 +314,10 @@ func (pp *ppState) declareVars(op, rest string) {
 
 func (pp *ppState) setVar(op string, l line) {
 	name := strings.ToUpper(strings.TrimPrefix(l.label, "&"))
-	rest := pp.subst(l.rest)
+	rest := pp.subst(operandOnly(l.rest))
 	var val string
 	if op == "seta" {
-		n, err := evalNum(strings.TrimSpace(rest), &exprCtx{st: pp.st})
+		n, err := evalNumLenient(strings.TrimSpace(rest), &exprCtx{st: pp.st})
 		if err != nil {
 			pp.st.errf("SETA &%s: %v", name, err)
 			return
@@ -468,7 +486,7 @@ func (pp *ppState) argText(a string) string {
 }
 
 func (pp *ppState) argNum(a string) int64 {
-	n, err := evalNum(strings.TrimSpace(pp.subst(a)), &exprCtx{st: pp.st})
+	n, err := evalNumLenient(strings.TrimSpace(pp.subst(a)), &exprCtx{st: pp.st})
 	if err != nil {
 		pp.st.errf("bad numeric argument %q: %v", a, err)
 		return 0

@@ -16,6 +16,16 @@ import (
 
 type exprCtx struct {
 	st *asmState // symbol resolution + location counter; nil in pure-numeric contexts
+	// pass-2 deferred evaluation: override the location counter
+	pcOverride  int64
+	segOverride int
+	overridePC  bool
+	// treat resolved labels as absolute numbers (org+offset) in arithmetic
+	// contexts, matching the one-pass original where labels are plain values
+	absLabels bool
+	// macro-language contexts (SETA, &EVAL): labels are absolute numbers at
+	// the term level
+	macroTerms bool
 }
 
 type exprParser struct {
@@ -35,6 +45,28 @@ func evalExpr(s string, ctx *exprCtx) (Val, error) {
 		return Val{}, fmt.Errorf("junk after expression: %q", p.s[p.pos:])
 	}
 	return v, nil
+}
+
+// evalNumLenient evaluates in macro-language contexts (SETA, &EVAL) where
+// the one-pass original assembler sees code labels as plain numbers: a
+// single-label result yields its segment offset.
+func evalNumLenient(s string, ctx *exprCtx) (int64, error) {
+	ctx.absLabels = true
+	ctx.macroTerms = true
+	v, err := evalExpr(s, ctx)
+	if err != nil {
+		return 0, err
+	}
+	if v.isNum() {
+		return v.C, nil
+	}
+	if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && ctx.st != nil {
+		seg := v.Pos[0].seg
+		if seg >= 0 && seg < len(ctx.st.segs) {
+			return ctx.st.segs[seg].org + v.C, nil
+		}
+	}
+	return 0, fmt.Errorf("expression must be constant: %q", s)
 }
 
 // evalNum evaluates and requires a plain numeric result.
@@ -101,6 +133,21 @@ func (p *exprParser) parseAdd() (Val, error) {
 	}
 }
 
+// absify converts a single resolved label into its absolute numeric value
+// when the context allows it (deferred pass-2 / macro-language arithmetic).
+func (p *exprParser) absify(v Val) Val {
+	if !p.ctx.absLabels || p.ctx.st == nil {
+		return v
+	}
+	if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" {
+		seg := v.Pos[0].seg
+		if seg >= 0 && seg < len(p.ctx.st.segs) {
+			return num(p.ctx.st.segs[seg].org + v.C)
+		}
+	}
+	return v
+}
+
 func (p *exprParser) parseShift() (Val, error) {
 	v, err := p.parseMul()
 	if err != nil {
@@ -115,7 +162,7 @@ func (p *exprParser) parseShift() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp(">>", v, r, func(x, y int64) (int64, error) { return x >> uint(y), nil }); err != nil {
+			if v, err = numOp(">>", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x >> uint(y), nil }); err != nil {
 				return Val{}, err
 			}
 		case "<<":
@@ -124,7 +171,7 @@ func (p *exprParser) parseShift() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("<<", v, r, func(x, y int64) (int64, error) { return x << uint(y), nil }); err != nil {
+			if v, err = numOp("<<", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x << uint(y), nil }); err != nil {
 				return Val{}, err
 			}
 		default:
@@ -147,7 +194,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("**", v, r, func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
+			if v, err = numOp("**", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek() == '*' && !p.atLocCounter():
@@ -156,7 +203,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("*", v, r, func(x, y int64) (int64, error) { return x * y, nil }); err != nil {
+			if v, err = numOp("*", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x * y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek() == '/':
@@ -165,7 +212,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("/", v, r, func(x, y int64) (int64, error) {
+			if v, err = numOp("/", p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
 				if y == 0 {
 					return 0, fmt.Errorf("division by zero")
 				}
@@ -232,17 +279,21 @@ func (p *exprParser) parseTerm() (Val, error) {
 		p.pos++
 		var v int64
 		n := 0
+		hi := int64(0)
+		if p.ctx.st != nil && p.ctx.st.msb {
+			hi = 0x80 // MSB ON sets the high bit of character constants
+		}
 		for p.pos < len(p.s) {
 			if p.s[p.pos] == '\'' {
 				if p.pos+1 < len(p.s) && p.s[p.pos+1] == '\'' { // escaped quote
-					v = v<<8 | '\''
+					v = v<<8 | ('\'' | hi)
 					p.pos += 2
 					n++
 					continue
 				}
 				break
 			}
-			v = v<<8 | int64(p.s[p.pos])
+			v = v<<8 | (int64(p.s[p.pos]) | hi)
 			p.pos++
 			n++
 		}
@@ -253,6 +304,9 @@ func (p *exprParser) parseTerm() (Val, error) {
 		return num(v), nil
 	case c == '*':
 		p.pos++
+		if p.ctx.overridePC {
+			return segVal(p.ctx.segOverride, p.ctx.pcOverride), nil
+		}
 		if p.ctx.st == nil {
 			return Val{}, fmt.Errorf("* outside code")
 		}
@@ -272,7 +326,11 @@ func (p *exprParser) parseTerm() (Val, error) {
 		if p.ctx.st == nil {
 			return Val{}, fmt.Errorf("undefined symbol %s", name)
 		}
-		return p.ctx.st.lookup(name), nil
+		v := p.ctx.st.lookup(name)
+		if p.ctx.macroTerms {
+			v = p.absify(v)
+		}
+		return v, nil
 	}
 	return Val{}, fmt.Errorf("unexpected %q", string(c))
 }
