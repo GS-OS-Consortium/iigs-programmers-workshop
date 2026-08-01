@@ -89,6 +89,7 @@ type asmState struct {
 	// fileWide names escape segment scope: ENTRY/EXPORT symbols and the PROC
 	// labels that name the segments themselves.
 	fileWide map[string]bool
+	segNames map[string]bool // segment labels, which do fold in differences
 	loadName string // current SEG name for new PROCs
 	segs     []*segState
 	cur      *segState
@@ -168,7 +169,8 @@ func (st *asmState) lookup(name string) Val {
 		// can be emitted by name; same-segment backward refs still use
 		// segment+offset (see exprRef).
 		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
-			v.Pos = []term{{seg: v.Pos[0].seg, name: name, symOff: v.C}}
+			v.Pos = []term{{seg: v.Pos[0].seg, name: name, symOff: v.C,
+				pub: st.entries[name] && !st.segNames[name]}}
 		}
 		return v
 	}
@@ -409,6 +411,7 @@ func newState() *asmState {
 		entries:   map[string]bool{},
 		entryPriv: map[string]byte{},
 		fileWide:  map[string]bool{},
+		segNames:  map[string]bool{},
 		scopeSeg:  -1,
 		recSize:   map[string]int64{},
 		recFields: map[string]map[string]int64{},
@@ -546,6 +549,7 @@ func (st *asmState) doLine(l line) {
 			st.errf("%s: undefined forward symbol in %q", strings.ToUpper(op), l.rest)
 			return
 		}
+		v = v.foldPub()
 		if op == "set" {
 			st.redefine(l.label, v)
 			return
@@ -851,6 +855,7 @@ func (st *asmState) openSegment(seg *segState) {
 	// The segment's own label names it, so the label stays visible to the
 	// whole file even though the labels inside it do not.
 	st.fileWide[seg.name] = true
+	st.segNames[seg.name] = true
 	st.define(seg.name, segVal(st.curSegIndex(), 0))
 }
 

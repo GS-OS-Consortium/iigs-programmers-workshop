@@ -105,7 +105,7 @@ type termRef struct {
 // pushed with its own displacement, and only a literal addend left over from
 // the source expression is applied at the end (oracle-verified: "elab-*" at
 // offset 2 of P2 emits ELAB, P2, 2, add, subtract).
-func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64) {
+func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64, post []postOp) {
 	e.flush()
 	body := []byte{}
 	pushConst := func(v int64) {
@@ -142,6 +142,10 @@ func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64) {
 		pushConst(c)
 		body = append(body, 0x01)
 	}
+	for _, o := range post {
+		pushConst(o.Val)
+		body = append(body, o.Op)
+	}
 	body = append(body, recEnd)
 	e.recs = append(e.recs, recExpr, byte(size))
 	e.recs = append(e.recs, body...)
@@ -163,6 +167,11 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 			return v.hasFwd()
 		}
 		return v.hasUnresolvedFwd(st)
+	}
+	post, shift := v.Post, v.Shift
+	restore := func(r Val) Val {
+		r.Post, r.Shift = post, shift
+		return r
 	}
 	for guard := 0; pending(); guard++ {
 		if guard > 64 {
@@ -198,6 +207,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 						r.Pos[0].name = t.fwd
 						r.Pos[0].symOff = r.C
 					}
+					r.Pos[0].pub = st.entries[r.Pos[0].name] && !st.segNames[r.Pos[0].name]
 					r.Pos[0].viaFwd = true
 				}
 				tv = r
@@ -221,7 +231,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		}
 		v = next
 	}
-	return v.cancel(), nil
+	return restore(v.cancel()), nil
 }
 
 // termRefs maps resolved terms to the operands an expression record uses,
@@ -344,7 +354,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			if t.isNum() {
-				c := applyShift(t.C, a.shift)
+				c := applyShift(applyPost(t.C, t.Post), a.shift)
 				var b []byte
 				for i := 0; i < a.size; i++ {
 					b = append(b, byte(c>>(8*i)))
@@ -352,10 +362,10 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
-			if len(t.Pos)+len(t.Neg) > 1 {
+			if len(t.Pos)+len(t.Neg) > 1 || len(t.Post) > 0 {
 				pos, gained := st.termRefs(t.Pos)
 				neg, lost := st.termRefs(t.Neg)
-				e.exprGeneral(a.size, pos, neg, t.C-gained+lost)
+				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
@@ -367,7 +377,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			}
 			if t.isNum() {
 				// resolved to a constant after all (e.g. forward EQU)
-				c := applyShift(t.C, a.shift)
+				c := applyShift(applyPost(t.C, t.Post), a.shift)
 				var b []byte
 				for i := 0; i < a.size; i++ {
 					b = append(b, byte(c>>(8*i)))
@@ -375,10 +385,10 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				e.bytes(b)
 				continue
 			}
-			if len(t.Pos)+len(t.Neg) > 1 {
+			if len(t.Pos)+len(t.Neg) > 1 || len(t.Post) > 0 {
 				pos, gained := st.termRefs(t.Pos)
 				neg, lost := st.termRefs(t.Neg)
-				e.exprGeneral(a.size, pos, neg, t.C-gained+lost)
+				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)

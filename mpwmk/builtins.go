@@ -210,6 +210,7 @@ func (e *Env) runLink(args []string) error {
 	var output string
 	var groups []link.Group
 	apw := false
+	express := true
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
 		case "-o":
@@ -223,7 +224,9 @@ func (e *Env) runLink(args []string) error {
 			apw = true
 		case "-t", "-at", "-org", "-lib", "-s":
 			i++ // consume the option's argument (type/aux stamping is metadata)
-		case "-x", "-w", "-l":
+		case "-x":
+			express = false // no ~ExpressLoad segment
+		case "-w", "-l":
 		default:
 			if strings.HasPrefix(a, "-") {
 				return fmt.Errorf("linkiigs: unsupported option %q", a)
@@ -264,7 +267,7 @@ func (e *Env) runLink(args []string) error {
 		}
 		objs = append(objs, f)
 	}
-	res, err := link.Link(objs)
+	res, err := link.LinkOpts(objs, express)
 	if err != nil {
 		return fmt.Errorf("linkiigs: %w", err)
 	}

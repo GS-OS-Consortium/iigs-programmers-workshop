@@ -18,12 +18,27 @@ type term struct {
 	viaFwd bool   // reference was forward (symbol undefined when referenced)
 	atSeq  int64  // definition counter when the forward reference was made
 	scope  string // symbol-table scope prefix in effect at the reference
+	// pub marks a reference to a published (ENTRY/EXPORT) symbol other than a
+	// segment's own label. The original assembler does not fold a difference
+	// involving one -- the linker resolves it -- so such terms never cancel.
+	pub bool
+}
+
+// postOp is an operation the linker applies after the linear part, using the
+// OMF expression opcodes ($03 multiply, $04 divide, $05 mod, $07 shift,
+// $08 AND, $09 OR, $0A EOR). It exists because an expression over published
+// symbols cannot be folded here -- "(past_offset_tbl-offset_tbl)/4" reaches
+// the object as PAST, OFFSET, subtract, 4, divide.
+type postOp struct {
+	Op  byte
+	Val int64
 }
 
 type Val struct {
-	C   int64
-	Pos []term
-	Neg []term
+	C    int64
+	Pos  []term
+	Neg  []term
+	Post []postOp
 	// Shift is a pending shift on a relocatable value (negative = right), as
 	// in `pushlong #label>>16` to extract a label's bank. The amount cannot be
 	// applied here because the segment base is not known until link time, so
@@ -84,6 +99,28 @@ func (v Val) cancel() Val {
 	var neg []term
 outer:
 	for _, n := range v.Neg {
+		if n.fwd == "" && !n.pub {
+			for i, p := range pos {
+				if p.fwd == "" && p.seg == n.seg && !p.pub {
+					pos = append(pos[:i], pos[i+1:]...)
+					continue outer
+				}
+			}
+		}
+		neg = append(neg, n)
+	}
+	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift}
+}
+
+// foldPub cancels pairs that cancel() left alone because they name published
+// symbols. An EQU must produce an absolute value -- ProDOS.FST publishes
+// "Max_call equ end_tbl-cmd_tbl" as a GEQU -- so its operands fold even
+// though the same expression in a DC would stay symbolic.
+func (v Val) foldPub() Val {
+	pos := append([]term(nil), v.Pos...)
+	var neg []term
+outer:
+	for _, n := range v.Neg {
 		if n.fwd == "" {
 			for i, p := range pos {
 				if p.fwd == "" && p.seg == n.seg {
@@ -94,7 +131,7 @@ outer:
 		}
 		neg = append(neg, n)
 	}
-	return Val{C: v.C, Pos: pos, Neg: neg}
+	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift}
 }
 
 func (v Val) add(o Val) (Val, error) {
@@ -117,6 +154,22 @@ func (v Val) sub(o Val) (Val, error) {
 
 func (v Val) negate() Val {
 	return Val{C: -v.C, Pos: append([]term(nil), v.Neg...), Neg: append([]term(nil), v.Pos...)}
+}
+
+// numOrDefer folds when both sides are constant, and otherwise defers the
+// operation to the linker when the right side is constant and the OMF
+// expression grammar has an opcode for it.
+func numOrDefer(name string, code byte, a, b Val, f func(x, y int64) (int64, error)) (Val, error) {
+	if a.isNum() && b.isNum() {
+		c, err := f(a.C, b.C)
+		return num(c), err
+	}
+	if !b.isNum() || !a.isLabel() {
+		return Val{}, fmt.Errorf("%s requires constant operands", name)
+	}
+	r := a
+	r.Post = append(append([]postOp(nil), a.Post...), postOp{Op: code, Val: b.C})
+	return r, nil
 }
 
 // numOp applies an operator that only makes sense on plain numbers.
@@ -144,4 +197,32 @@ func shiftOp(name string, a, b Val, amount int64) (Val, error) {
 	r := a
 	r.Shift = amount
 	return r, nil
+}
+
+// applyPost folds the deferred operations into a value that turned out to be
+// constant after all (a forward reference that resolved within the segment).
+func applyPost(c int64, post []postOp) int64 {
+	for _, o := range post {
+		switch o.Op {
+		case 0x03:
+			c *= o.Val
+		case 0x04:
+			if o.Val != 0 {
+				c /= o.Val
+			}
+		case 0x05:
+			if o.Val != 0 {
+				c %= o.Val
+			}
+		case 0x07:
+			c = applyShift(c, o.Val)
+		case 0x08:
+			c &= o.Val
+		case 0x09:
+			c |= o.Val
+		case 0x0A:
+			c ^= o.Val
+		}
+	}
+	return c
 }

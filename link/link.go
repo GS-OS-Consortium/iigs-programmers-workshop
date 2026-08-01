@@ -28,7 +28,11 @@ type relocPatch struct {
 // Link links object segments (currently: one load segment named "main",
 // which is what every GS/OS-era makefile default produces for single-file
 // links) into a load file.
-func Link(objs []*omf.File) ([]byte, error) {
+// Link produces an ExpressLoad-style load file. LinkOpts is the same with
+// express=false selecting the plain form that LinkIIGS -x emits.
+func Link(objs []*omf.File) ([]byte, error) { return LinkOpts(objs, true) }
+
+func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	// Object segments merge into load segments by their load name (the SEG
 	// directive). The loader is built from two -- 'Loader' and 'Loader_LC' --
 	// and becomes Loader.bin and Loader.bin.2.
@@ -103,13 +107,17 @@ func Link(objs []*omf.File) ([]byte, error) {
 				pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 			case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 				size := int(r.Raw[1])
-				val, shift, err := evalOMFExpr(r.Raw[2:], byName, globals, absolutes, os)
+				val, shift, reloc, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, os)
 				if err != nil {
 					return nil, fmt.Errorf("segment %s: %w", os.name, err)
 				}
-				if org != 0 {
-					// absolute segment: patch statically
-					v := org + val
+				if org != 0 || !reloc {
+					// absolute segment, or a value that does not depend on
+					// the load address: patch statically
+					v := val
+					if reloc {
+						v += org
+					}
 					if shift < 0 {
 						v >>= uint(-shift)
 					} else if shift > 0 {
@@ -130,6 +138,9 @@ func Link(objs []*omf.File) ([]byte, error) {
 		}
 	}
 
+	if !express {
+		return loadSegment(mainName, 1, image, org, kind, patches), nil
+	}
 	return buildLoadFile(image, org, kind, patches)
 }
 
@@ -177,9 +188,31 @@ func segImage(s *omf.Segment) ([]byte, error) {
 
 // evalOMFExpr evaluates an OMF expression (label +- consts, optional final
 // shift) against object-segment bases. Returns (value, shift).
+//
+// relocatable reports whether the result still depends on the load address:
+// a difference of two labels in the same segment cancels the base and needs
+// no relocation, which is how "end_of_perm_msgs-error_data" is a plain
+// constant in the load file.
 func evalOMFExpr(b []byte, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, int64, error) {
+	v, sh, _, err := evalOMFExprReloc(b, byName, globals, absolutes, cur)
+	return v, sh, err
+}
+
+func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, int64, bool, error) {
 	var stack []int64
+	var base []int64 // per-entry coefficient of the load address
 	var shift int64
+	push := func(v, c int64) { stack = append(stack, v); base = append(base, c) }
+	pop2 := func() (int64, int64, int64, int64, bool) {
+		if len(stack) < 2 {
+			return 0, 0, 0, 0, false
+		}
+		x, y := stack[len(stack)-2], stack[len(stack)-1]
+		cx, cy := base[len(base)-2], base[len(base)-1]
+		stack, base = stack[:len(stack)-1], base[:len(base)-1]
+		return x, y, cx, cy, true
+	}
+	set := func(v, c int64) { stack[len(stack)-1], base[len(base)-1] = v, c }
 	pos := 0
 	for pos < len(b) {
 		tok := b[pos]
@@ -187,49 +220,74 @@ func evalOMFExpr(b []byte, byName map[string]*objSeg, globals, absolutes map[str
 		switch {
 		case tok == 0x00:
 			if len(stack) != 1 {
-				return 0, 0, fmt.Errorf("bad expression stack depth %d", len(stack))
+				return 0, 0, false, fmt.Errorf("bad expression stack depth %d", len(stack))
 			}
-			return stack[0], shift, nil
+			return stack[0], shift, base[0] != 0, nil
 		case tok == 0x81 || tok == 0x80 || tok == 0x87: // numeric operand
-			v := int64(int32(binary.LittleEndian.Uint32(b[pos:])))
+			push(int64(int32(binary.LittleEndian.Uint32(b[pos:]))), 0)
 			pos += 4
-			stack = append(stack, v)
 		case tok == 0x82 || tok == 0x83: // label reference
 			n := int(b[pos])
 			name := string(b[pos+1 : pos+1+n])
 			pos += 1 + n
 			if os, ok := byName[name]; ok {
-				stack = append(stack, os.base)
+				push(os.base, 1)
 			} else if off, ok := globals[name]; ok {
-				stack = append(stack, off)
+				push(off, 1)
 			} else if v, ok := absolutes[name]; ok {
-				stack = append(stack, v)
+				push(v, 0) // an EQU symbol is absolute, not a location
 			} else {
-				return 0, 0, fmt.Errorf("undefined label %q", name)
+				return 0, 0, false, fmt.Errorf("undefined label %q", name)
 			}
-		case tok == 0x01: // +
-			if len(stack) < 2 {
-				return 0, 0, fmt.Errorf("stack underflow")
+		case tok == 0x01, tok == 0x02: // + -
+			x, y, cx, cy, ok := pop2()
+			if !ok {
+				return 0, 0, false, fmt.Errorf("stack underflow")
 			}
-			stack[len(stack)-2] += stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-		case tok == 0x02: // -
-			if len(stack) < 2 {
-				return 0, 0, fmt.Errorf("stack underflow")
+			if tok == 0x01 {
+				set(x+y, cx+cy)
+			} else {
+				set(x-y, cx-cy)
 			}
-			stack[len(stack)-2] -= stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-		case tok == 0x07: // shift (negative = right); operand is shift count
+		case tok >= 0x03 && tok <= 0x05, tok == 0x08, tok == 0x09, tok == 0x0A:
+			// multiply, divide, mod, AND, OR, EOR
+			x, y, cx, cy, ok := pop2()
+			if !ok {
+				return 0, 0, false, fmt.Errorf("stack underflow")
+			}
+			c := cx | cy // still address-dependent if either side was
+			switch tok {
+			case 0x03:
+				x *= y
+			case 0x04:
+				if y == 0 {
+					return 0, 0, false, fmt.Errorf("division by zero")
+				}
+				x /= y
+			case 0x05:
+				if y == 0 {
+					return 0, 0, false, fmt.Errorf("division by zero")
+				}
+				x %= y
+			case 0x08:
+				x &= y
+			case 0x09:
+				x |= y
+			case 0x0A:
+				x ^= y
+			}
+			set(x, c)
+		case tok == 0x07: // shift (negative = right); operand is the count
 			if len(stack) < 2 {
-				return 0, 0, fmt.Errorf("stack underflow")
+				return 0, 0, false, fmt.Errorf("stack underflow")
 			}
 			shift = stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
+			stack, base = stack[:len(stack)-1], base[:len(base)-1]
 		default:
-			return 0, 0, fmt.Errorf("unsupported expression token $%02X", tok)
+			return 0, 0, false, fmt.Errorf("unsupported expression token $%02X", tok)
 		}
 	}
-	return 0, 0, fmt.Errorf("unterminated expression")
+	return 0, 0, false, fmt.Errorf("unterminated expression")
 }
 
 func putLE(b []byte, v int64, size int) {
@@ -482,12 +540,15 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 					pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 				case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 					size := int(r.Raw[1])
-					val, shift, err := evalOMFExpr(r.Raw[2:], byName, globals, absolutes, os)
+					val, shift, reloc, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, os)
 					if err != nil {
 						return nil, fmt.Errorf("segment %s: %w", os.name, err)
 					}
-					if b.org != 0 {
-						v := b.org + val
+					if b.org != 0 || !reloc {
+						v := val
+						if reloc {
+							v += b.org
+						}
 						if shift < 0 {
 							v >>= uint(-shift)
 						} else if shift > 0 {

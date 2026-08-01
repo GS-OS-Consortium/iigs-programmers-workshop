@@ -127,7 +127,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("AND", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
+			if v, err = numOrDefer("AND", 0x08, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peekWord("OR"):
@@ -136,7 +136,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("OR", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+			if v, err = numOrDefer("OR", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peekWord("EOR"), p.peekWord("XOR"):
@@ -145,7 +145,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("EOR", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
+			if v, err = numOrDefer("EOR", 0x0A, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek2() == "--": // bitwise XOR (MPW asm)
@@ -154,7 +154,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("--", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
+			if v, err = numOrDefer("--", 0x0A, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek2() == "++": // bitwise OR (MPW asm)
@@ -163,7 +163,7 @@ func (p *exprParser) parseAdd() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("++", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+			if v, err = numOrDefer("++", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek() == '+':
@@ -251,7 +251,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("**", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
+			if v, err = numOrDefer("**", 0x08, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek() == '*' && !p.atLocCounter():
@@ -260,7 +260,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("*", p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x * y, nil }); err != nil {
+			if v, err = numOrDefer("*", 0x03, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x * y, nil }); err != nil {
 				return Val{}, err
 			}
 		case p.peek2() == "//": // integer remainder (MPW asm)
@@ -269,7 +269,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("//", p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
+			if v, err = numOrDefer("//", 0x05, p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
 				if y == 0 {
 					return 0, fmt.Errorf("division by zero")
 				}
@@ -283,7 +283,7 @@ func (p *exprParser) parseMul() (Val, error) {
 			if err != nil {
 				return Val{}, err
 			}
-			if v, err = numOp("/", p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
+			if v, err = numOrDefer("/", 0x04, p.absify(v), p.absify(r), func(x, y int64) (int64, error) {
 				if y == 0 {
 					return 0, fmt.Errorf("division by zero")
 				}

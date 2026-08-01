@@ -16,6 +16,7 @@ func main() {
 	var out string
 	var groups []link.Group
 	var apw bool
+	express := true
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
@@ -34,8 +35,10 @@ func main() {
 			groups = append(groups, link.Group{Name: args[i]})
 		case a == "-apw":
 			apw = true
-		case a == "-x" || a == "-l":
-			// listing / no-ExpressLoad flags: no effect on the image
+		case a == "-x":
+			express = false // no ~ExpressLoad segment
+		case a == "-l":
+			// listing flag: no effect on the image
 		case strings.HasPrefix(a, "-"):
 			die("unsupported option %q", a)
 		case len(groups) > 0:
@@ -73,7 +76,7 @@ func main() {
 		}
 		objs = append(objs, f)
 	}
-	res, err := link.Link(objs)
+	res, err := link.LinkOpts(objs, express)
 	if err != nil {
 		die("%v", err)
 	}
