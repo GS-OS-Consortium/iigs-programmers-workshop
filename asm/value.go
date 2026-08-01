@@ -53,6 +53,9 @@ type Val struct {
 	// applied here because the segment base is not known until link time, so
 	// it rides along and the linker performs it via an expression record.
 	Shift int64
+	// ConstFirst records that the constant stood to the LEFT of the shifted
+	// label in the source; the original emits the operands in source order.
+	ConstFirst bool
 	// AfterShift records that C was added AFTER the shift rather than before,
 	// which the linker has to be told apart: Applesoft's "(romasoft-48)>>8"
 	// shifts the sum, while Init2's "$4000+(draw_window>>16)" shifts only the
@@ -123,7 +126,8 @@ outer:
 		}
 		neg = append(neg, n)
 	}
-	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift, AfterShift: v.AfterShift}
+	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift,
+		AfterShift: v.AfterShift, ConstFirst: v.ConstFirst}
 }
 
 // foldPub cancels pairs that cancel() left alone because they name published
@@ -167,34 +171,58 @@ func combine(a, b Val) (int64, []postOp, error) {
 	return a.Shift + b.Shift, post, nil
 }
 
+// addConst appends a constant to a value that already carries deferred
+// operations, so that it is applied after them rather than folded into the
+// linear part. "cst_size*2-2" is (cst_size*2)-2; folding the -2 into C and
+// then multiplying gives (cst_size-2)*2.
+func (v Val) addConst(op byte, c int64) Val {
+	r := v
+	r.Post = append(append([]postOp(nil), v.Post...), postOp{Op: op, Val: c})
+	return r
+}
+
 func (v Val) add(o Val) (Val, error) {
+	if len(v.Post) > 0 && o.isNum() {
+		if o.C == 0 {
+			return v, nil
+		}
+		return v.addConst(0x01, o.C), nil
+	}
 	shift, post, err := combine(v, o)
 	if err != nil {
 		return Val{}, err
 	}
 	r := Val{
-		C:     v.C + o.C,
-		// a constant joining an already-shifted value lands after the shift
+		C: v.C + o.C,
+		// a constant joining an already-shifted value lands after the shift,
+		// and on whichever side of the operator it stood in the source
 		AfterShift: v.AfterShift || o.AfterShift || shift != 0,
-		Pos:   append(append([]term(nil), v.Pos...), o.Pos...),
-		Neg:   append(append([]term(nil), v.Neg...), o.Neg...),
-		Shift: shift, Post: post,
+		ConstFirst: v.ConstFirst || o.ConstFirst || (v.isNum() && o.Shift != 0),
+		Pos:        append(append([]term(nil), v.Pos...), o.Pos...),
+		Neg:        append(append([]term(nil), v.Neg...), o.Neg...),
+		Shift:      shift, Post: post,
 	}
 	return r.cancel(), nil
 }
 
 func (v Val) sub(o Val) (Val, error) {
+	if len(v.Post) > 0 && o.isNum() {
+		if o.C == 0 {
+			return v, nil
+		}
+		return v.addConst(0x02, o.C), nil
+	}
 	shift, post, err := combine(v, o)
 	if err != nil {
 		return Val{}, err
 	}
 	r := Val{
-		C:     v.C - o.C,
+		C: v.C - o.C,
 		// a constant joining an already-shifted value lands after the shift
 		AfterShift: v.AfterShift || o.AfterShift || shift != 0,
-		Pos:   append(append([]term(nil), v.Pos...), o.Neg...),
-		Neg:   append(append([]term(nil), v.Neg...), o.Pos...),
-		Shift: shift, Post: post,
+		Pos:        append(append([]term(nil), v.Pos...), o.Neg...),
+		Neg:        append(append([]term(nil), v.Neg...), o.Pos...),
+		Shift:      shift, Post: post,
 	}
 	return r.cancel(), nil
 }
@@ -251,6 +279,10 @@ func shiftOp(name string, a, b Val, amount int64) (Val, error) {
 func applyPost(c int64, post []postOp) int64 {
 	for _, o := range post {
 		switch o.Op {
+		case 0x01:
+			c += o.Val
+		case 0x02:
+			c -= o.Val
 		case 0x03:
 			c *= o.Val
 		case 0x04:

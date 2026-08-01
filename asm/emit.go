@@ -132,7 +132,7 @@ func (e *segEmitter) relexpr(size int, pos, neg []termRef, c int64, post []postO
 // constant first, then the label, then the shift, and adds -- source order --
 // rather than folding the constant into the label's displacement, which would
 // apply the shift to the sum. Init2's "pea $4000+(draw_window>>16)".
-func (e *segEmitter) exprConstPlusShifted(size int, name string, c, shift int64) {
+func (e *segEmitter) exprConstPlusShifted(size int, name string, c, shift int64, constFirst bool) {
 	e.flush()
 	body := []byte{}
 	push := func(v int64) {
@@ -140,11 +140,20 @@ func (e *segEmitter) exprConstPlusShifted(size int, name string, c, shift int64)
 		binary.LittleEndian.PutUint32(b[:], uint32(v))
 		body = append(body, 0x81, b[0], b[1], b[2], b[3])
 	}
-	push(c)
-	body = append(body, 0x83, byte(len(name)))
-	body = append(body, name...)
-	push(shift)
-	body = append(body, 0x07, 0x01, recEnd)
+	pushLabel := func() {
+		body = append(body, 0x83, byte(len(name)))
+		body = append(body, name...)
+		push(shift)
+		body = append(body, 0x07)
+	}
+	if constFirst {
+		push(c)
+		pushLabel()
+	} else {
+		pushLabel()
+		push(c)
+	}
+	body = append(body, 0x01, recEnd)
 	e.recs = append(e.recs, recExpr, byte(size))
 	e.recs = append(e.recs, body...)
 }
@@ -218,9 +227,9 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		}
 		return v.hasUnresolvedFwd(st)
 	}
-	post, shift, after := v.Post, v.Shift, v.AfterShift
+	post, shift, after, cf := v.Post, v.Shift, v.AfterShift, v.ConstFirst
 	restore := func(r Val) Val {
-		r.Post, r.Shift, r.AfterShift = post, shift, after
+		r.Post, r.Shift, r.AfterShift, r.ConstFirst = post, shift, after, cf
 		return r
 	}
 	for guard := 0; pending(); guard++ {
@@ -332,14 +341,15 @@ func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
 	return v, ok
 }
 
-// preferLocal rebinds a branch target to a definition in the branching
-// segment when one exists.
+// preferLocal rebinds a reference to a definition in the referencing segment
+// when one exists.
 //
 // A label defined anywhere in a segment covers the whole of it, so it shadows
-// a file-wide symbol of the same name even for a branch that appears earlier.
-// ProDOS.FST's fst_specific does "beq get_time" two thousand lines before its
-// own get_time label, and get_time is also the name of a PROC -- pass 1 binds
-// to the PROC, and only here is the segment being assembled known.
+// a file-wide symbol of the same name even for a reference that appears
+// earlier. ProDOS.FST's fst_specific does "beq get_time" two thousand lines
+// before its own get_time label, and scm's do_alert_window reads a save_y it
+// declares at the end of itself rather than the published one. Pass 1 binds
+// to whatever it has seen; only here is the segment being assembled known.
 func (st *asmState) preferLocal(v Val, curSeg int) Val {
 	if len(v.Pos) != 1 || len(v.Neg) != 0 {
 		return v
@@ -481,6 +491,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
+			t = st.preferLocal(t, segIdx)
 			if t.isNum() {
 				c := applyShift(applyPost(t.C, t.Post), a.shift)
 				var b []byte
@@ -501,7 +512,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			// const-plus-shifted form; a label's own offset within its
 			// segment is part of the reference, not an addend.
 			if a.shift != 0 && t.AfterShift && t.C-t.Pos[0].symOff != 0 {
-				e.exprConstPlusShifted(a.size, nm, disp, a.shift)
+				e.exprConstPlusShifted(a.size, nm, disp, a.shift, t.ConstFirst)
 				continue
 			}
 			e.expr(a.rec, a.size, nm, disp, a.shift)
@@ -510,6 +521,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
+			t = st.preferLocal(t, segIdx)
 			if t.isNum() {
 				// resolved to a constant after all (e.g. forward EQU)
 				c := applyShift(applyPost(t.C, t.Post), a.shift)
@@ -531,7 +543,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			// const-plus-shifted form; a label's own offset within its
 			// segment is part of the reference, not an addend.
 			if a.shift != 0 && t.AfterShift && t.C-t.Pos[0].symOff != 0 {
-				e.exprConstPlusShifted(a.size, nm, disp, a.shift)
+				e.exprConstPlusShifted(a.size, nm, disp, a.shift, t.ConstFirst)
 				continue
 			}
 			e.expr(a.rec, a.size, nm, disp, a.shift)
