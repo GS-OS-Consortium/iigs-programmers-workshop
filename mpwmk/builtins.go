@@ -104,7 +104,7 @@ func (e *Env) logAsm(input, output string, incDirs, defines []string) {
 		return
 	}
 	defer f.Close()
-	rec := []string{input, output}
+	rec := []string{"asm", input, output}
 	for _, d := range incDirs {
 		rec = append(rec, "-i", d)
 	}
@@ -112,6 +112,23 @@ func (e *Env) logAsm(input, output string, incDirs, defines []string) {
 		rec = append(rec, "-d", d)
 	}
 	fmt.Fprintln(f, strings.Join(rec, "\t"))
+}
+
+// logLink records a link the same way as logAsm, with every input path
+// resolved and the "-lseg NAME file(@seg)" grouping preserved: the GS/OS
+// kernel's shape comes entirely from that grouping, so replaying it verbatim
+// is the only way to check our linker against the original.
+func (e *Env) logLink(rec []string) {
+	path := os.Getenv("MPWMK_TOOLLOG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintln(f, strings.Join(append([]string{"link"}, rec...), "\t"))
 }
 
 func (e *Env) duplicate(args []string) error {
@@ -237,6 +254,7 @@ func (e *Env) runLink(args []string) error {
 	var inputs []string
 	var output string
 	var groups []link.Group
+	var log []string
 	apw := false
 	express := true
 	for i := 0; i < len(args); i++ {
@@ -244,16 +262,20 @@ func (e *Env) runLink(args []string) error {
 		case "-o":
 			i++
 			output = e.HostPath(args[i])
+			log = append(log, "-o", output)
 		case "-lseg":
 			// "-lseg NAME obj..." starts a named load segment
 			i++
 			groups = append(groups, link.Group{Name: args[i]})
+			log = append(log, "-lseg", args[i])
 		case "-apw":
 			apw = true
+			log = append(log, "-apw")
 		case "-t", "-at", "-org", "-lib", "-s":
 			i++ // consume the option's argument (type/aux stamping is metadata)
 		case "-x":
 			express = false // no ~ExpressLoad segment
+			log = append(log, "-x")
 		case "-w", "-l":
 		default:
 			if strings.HasPrefix(a, "-") {
@@ -265,11 +287,18 @@ func (e *Env) runLink(args []string) error {
 					return fmt.Errorf("linkiigs: %w", err)
 				}
 				groups[len(groups)-1].Sels = append(groups[len(groups)-1].Sels, sel)
+				name, seg := a, ""
+				if j := strings.Index(a, "("); j >= 0 && strings.HasSuffix(a, ")") {
+					name, seg = a[:j], a[j:]
+				}
+				log = append(log, e.HostPath(name)+seg)
 				continue
 			}
 			inputs = append(inputs, e.HostPath(a))
+			log = append(log, e.HostPath(a))
 		}
 	}
+	e.logLink(log)
 	if output == "" || (len(inputs) == 0 && len(groups) == 0) {
 		return fmt.Errorf("linkiigs: need inputs and -o output")
 	}

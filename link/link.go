@@ -15,7 +15,14 @@ import (
 type objSeg struct {
 	name string
 	base int64 // offset within the merged load segment image
-	seg  *omf.Segment
+	// abs is the load segment's ORG when it is absolute. A symbol in an
+	// absolute load segment resolves to a fixed address, which is the only
+	// way a reference from ANOTHER load segment can be right: the loader is
+	// two of them, 'Loader' at $01A5D0 and 'Loader_LC' at $01CFD0, and
+	// resolving across them against the referrer's own org put every such
+	// call $2A00 out.
+	abs int64
+	seg *omf.Segment
 }
 
 type relocPatch struct {
@@ -265,7 +272,11 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes ma
 			name := string(b[pos+1 : pos+1+n])
 			pos += 1 + n
 			if os, ok := byName[name]; ok {
-				push(os.base, 1)
+				if os.abs != 0 {
+					push(os.base+os.abs, 0)
+				} else {
+					push(os.base, 1)
+				}
 			} else if off, ok := globals[name]; ok {
 				push(off, 1)
 			} else if v, ok := absolutes[name]; ok {
@@ -530,6 +541,7 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 	for _, g := range groups {
 		b := built{name: g.Name}
 		var segs []*objSeg
+		pos := int64(0)
 		for _, sel := range g.Sels {
 			for i := range sel.File.Segments {
 				s := &sel.File.Segments[i]
@@ -538,20 +550,57 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 					!strings.EqualFold(s.SegName, sel.Seg) {
 					continue
 				}
-				os := &objSeg{name: s.SegName, base: int64(len(b.image)), seg: s}
+				// A SKIP segment ($0200 in KIND) is an assembly-time guard,
+				// not content: b00segR's overflow check is an empty segment
+				// ORGed at the top of its region purely so the link fails if
+				// the code runs past it. It contributes no bytes and nothing
+				// pads out to it -- but it still publishes its symbols, which
+				// the loader's header segment refers to.
+				skip := s.Kind&0x0200 != 0
+				at := pos
+				if len(segs) == 0 {
+					b.org, b.kind = int64(s.Org), s.Kind
+				} else if s.Org != 0 && skip {
+					at = int64(s.Org) - b.org
+				} else if s.Org != 0 {
+					// An object segment carrying an ORG sits at that address
+					// within the load segment, padding out from the one
+					// before. The GS/OS kernel builds every load segment as
+					// "start_segN, body, end_segN", and the start stub's
+					// SEG_N_PAD is an empty segment ORGed past the header
+					// purely to leave that gap.
+					pos = int64(s.Org) - b.org
+					at = pos
+				}
+				os := &objSeg{name: s.SegName, base: at, abs: b.org, seg: s}
 				segs = append(segs, os)
 				byName[s.SegName] = os
-				if len(segs) == 1 {
-					b.org, b.kind = int64(s.Org), s.Kind
-				}
 				img, err := segImage(s)
 				if err != nil {
 					return nil, err
 				}
-				if err := collectSymbols(s, os.base, globals, absolutes); err != nil {
+				// In an absolute load segment a published symbol has a fixed
+				// address, so record it as one.
+				symBase, into := os.base, globals
+				if b.org != 0 {
+					symBase, into = os.base+b.org, absolutes
+				}
+				if err := collectSymbols(s, symBase, into, absolutes); err != nil {
 					return nil, err
 				}
-				b.image = append(b.image, img...)
+				if skip {
+					continue
+				}
+				if pos > int64(len(b.image)) {
+					b.image = append(b.image, make([]byte, pos-int64(len(b.image)))...)
+				}
+				if len(img) > 0 {
+					if need := pos + int64(len(img)); need > int64(len(b.image)) {
+						b.image = append(b.image, make([]byte, need-int64(len(b.image)))...)
+					}
+					copy(b.image[pos:], img)
+					pos += int64(len(img))
+				}
 			}
 		}
 		if len(segs) == 0 {
