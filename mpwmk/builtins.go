@@ -93,8 +93,10 @@ func (e *Env) dispatch(name string, args []string, out io.Writer) error {
 // actually produced: assembling a source "naively" gets its include paths and
 // -d defines wrong, and a byte-diff against that is meaningless.
 //
-// Record: input, output, then "-i dir" / "-d define" pairs, tab-separated.
-func (e *Env) logAsm(input, output string, incDirs, defines []string) {
+// Record: input, output, then "-i dir" / "-d define" pairs and any other
+// flags verbatim, tab-separated. The other flags matter: hfs.fst.main only
+// assembles under "-unsafe".
+func (e *Env) logAsm(input, output string, incDirs, defines, extras []string) {
 	path := os.Getenv("MPWMK_TOOLLOG")
 	if path == "" {
 		return
@@ -111,6 +113,7 @@ func (e *Env) logAsm(input, output string, incDirs, defines []string) {
 	for _, d := range defines {
 		rec = append(rec, "-d", d)
 	}
+	rec = append(rec, extras...)
 	fmt.Fprintln(f, strings.Join(rec, "\t"))
 }
 
@@ -185,6 +188,7 @@ func (e *Env) runAsm(args []string) error {
 	var input, output string
 	var incDirs []string
 	var defines []string
+	var extras []string
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
 		case "-o":
@@ -201,7 +205,7 @@ func (e *Env) runAsm(args []string) error {
 		case "-l", "-m", "-lo", "-pagesize", "-font", "-print":
 			i++ // listing options with an argument: ignored
 		case "-t", "-h", "-w", "-wt", "-wi", "-unsafe", "-c":
-			// flags without arguments
+			extras = append(extras, a) // no argument; recorded for replay
 		default:
 			if strings.HasPrefix(a, "-") {
 				return fmt.Errorf("asmiigs: unsupported option %q", a)
@@ -220,7 +224,7 @@ func (e *Env) runAsm(args []string) error {
 	if d := e.Get("aiigsincludes"); d != "" {
 		incDirs = append(incDirs, e.HostPath(d))
 	}
-	e.logAsm(input, output, incDirs, defines)
+	e.logAsm(input, output, incDirs, defines, extras)
 	obj, err := asm.AssembleFileOpts(input, incDirs, defines)
 	if err != nil {
 		return fmt.Errorf("asmiigs %s: %w", filepath.Base(input), err)

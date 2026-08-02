@@ -22,6 +22,11 @@ type term struct {
 	// pub marks a reference to a published (ENTRY/EXPORT) symbol other than a
 	// segment's own label.
 	pub bool
+	// litDisp is a literal addend that stood directly after this term in the
+	// source ("lst_rslt_scode+2-lst_rslt_ec"). The one-pass original emits
+	// expression operands in source order, so the +2 belongs to scode's
+	// operand (label, 2, add), not after the subtraction.
+	litDisp int64
 }
 
 // blocksFold reports whether a term keeps a difference of labels from folding
@@ -152,6 +157,26 @@ outer:
 	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift}
 }
 
+// attachLit folds a constant that follows a single positive label term onto
+// that term, preserving the source order the one-pass original emits:
+// "scode+2-ec" reaches the object as scode, 2, add, ec, subtract, not as
+// (scode-ec)+2. Only that shape attaches -- a trailing constant after a
+// subtraction ("scode-ec+2") really is emitted last, and shifted or deferred
+// values keep their own ordering rules.
+func (v Val) attachLit(o Val, c int64) (Val, bool) {
+	if !o.isNum() || c == 0 || o.Shift != 0 || len(o.Post) > 0 {
+		return Val{}, false
+	}
+	if len(v.Pos) != 1 || len(v.Neg) != 0 || len(v.Post) > 0 || v.Shift != 0 {
+		return Val{}, false
+	}
+	r := v
+	r.Pos = append([]term(nil), v.Pos...)
+	r.Pos[0].litDisp += c
+	r.C += c
+	return r, true
+}
+
 // combine carries a pending shift or deferred operation through an addition:
 // "$4000+(draw_window>>16)" adds a constant to an already-shifted label, and
 // dropping the shift here silently produced the label's low word instead of
@@ -188,6 +213,9 @@ func (v Val) add(o Val) (Val, error) {
 		}
 		return v.addConst(0x01, o.C), nil
 	}
+	if r, ok := v.attachLit(o, o.C); ok {
+		return r, nil
+	}
 	shift, post, err := combine(v, o)
 	if err != nil {
 		return Val{}, err
@@ -211,6 +239,9 @@ func (v Val) sub(o Val) (Val, error) {
 			return v, nil
 		}
 		return v.addConst(0x02, o.C), nil
+	}
+	if r, ok := v.attachLit(o, -o.C); ok {
+		return r, nil
 	}
 	shift, post, err := combine(v, o)
 	if err != nil {

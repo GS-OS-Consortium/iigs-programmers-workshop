@@ -97,6 +97,9 @@ func (e *segEmitter) expr(rec byte, size int, segName string, disp int64, shift 
 type termRef struct {
 	name string
 	disp int64
+	// lit is a literal addend the source wrote directly after this operand
+	// (term.litDisp); it is emitted with the operand, in source order.
+	lit int64
 }
 
 // exprGeneral emits a general EXPR record for a value that does not reduce
@@ -172,6 +175,14 @@ func exprBody(pos, neg []termRef, c int64, post []postOp) []byte {
 		if t.disp != 0 {
 			pushConst(t.disp)
 			body = append(body, 0x01)
+		}
+		// a negative addend is pushed positive and subtracted
+		if t.lit > 0 {
+			pushConst(t.lit)
+			body = append(body, 0x01)
+		} else if t.lit < 0 {
+			pushConst(-t.lit)
+			body = append(body, 0x02)
 		}
 	}
 	first := true
@@ -251,8 +262,21 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 				}
 				r, ok := st.nextDef(t.fwd, t.scope, t.atSeq)
 				if !ok {
-					// unresolvable (e.g. branch to an external): hard error,
-					// never loop
+					if !forceAll {
+						// "Undefined ID -- IMPORT assumed" (AsmIIGS -unsafe,
+						// which the FST makefiles pass): the reference stays
+						// symbolic for the linker, exactly like a declared
+						// IMPORT. hfs.fst.main reaches save_gbuf_ptr1 in its
+						// data segment this way.
+						st.imports[t.fwd] = true
+						if neg {
+							next, _ = next.sub(Val{Pos: []term{t}})
+						} else {
+							next, _ = next.add(Val{Pos: []term{t}})
+						}
+						return
+					}
+					// unresolvable branch target: hard error, never loop
 					err = fmt.Errorf("undefined ID: %s", t.fwd)
 					return
 				}
@@ -269,6 +293,8 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					r.Pos[0].defSeq = r.defSeq
 					r.Pos[0].pub = st.publishedAt(r.Pos[0])
 					r.Pos[0].viaFwd = true
+					// the literal addend rides the term; v.C already has it
+					r.Pos[0].litDisp += t.litDisp
 				}
 				tv = r
 			} else {
@@ -303,8 +329,8 @@ func (st *asmState) termRefs(ts []term, curSeg int) ([]termRef, int64) {
 	var covered int64
 	for _, t := range ts {
 		n, d := st.exprRef(t, t.symOff, curSeg)
-		out = append(out, termRef{name: n, disp: d})
-		covered += t.symOff
+		out = append(out, termRef{name: n, disp: d, lit: t.litDisp})
+		covered += t.symOff + t.litDisp
 	}
 	return out, covered
 }
@@ -403,7 +429,11 @@ func (st *asmState) exprRef(t term, c int64, curSeg int) (string, int64) {
 	// one the GLOBAL declares. Within a segment only the published definition
 	// is named; an earlier private one of the same name is just a local label
 	// (ProDOS.FST's flush_file has its own clear_index).
-	published := t.name != "" && st.entries[t.name] && !st.segNames[t.name]
+	// An ENTRY name that also names a segment still resolves BY NAME across
+	// segments -- to the segment, not to whichever plain-label definition
+	// pass 1 bound (hs.fst's "jsr do_update" reaches the later do_update
+	// PROC, not READ+$12C, oracle-probed).
+	published := t.name != "" && st.entries[t.name]
 	if published && t.seg != curSeg {
 		return t.name, c - t.symOff
 	}
@@ -430,8 +460,11 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 		case aRec:
 			// A published name is declared once, at its last definition;
 			// earlier ones were provisional and are dropped now that the
-			// count is known.
-			if a.global != "" && a.gseq != st.pubGseq[a.global] {
+			// count is known. A name that also names a segment ANYWHERE in
+			// the file yields no GLOBAL at all, even when the plain-label
+			// definition came first -- hs.fst's do_update is a label in READ
+			// and, later, a PROC of its own (oracle-probed).
+			if a.global != "" && (a.gseq != st.pubGseq[a.global] || st.segNames[a.global]) {
 				continue
 			}
 			e.flush()

@@ -83,6 +83,12 @@ type asmState struct {
 	longI      bool
 	msb        bool
 	strMode    string // "ASIS" or "PASCAL"
+	// blanksOff is BLANKS OFF: the operand field ends at the first blank
+	// after a complete operand. The DEFAULT is BLANKS ON (oracle-probed),
+	// where the field runs to the ';' comment or end of line -- hfs.fst.btree
+	// pops its registers with "lda #(f_d0+...) << 2<tab>; comment" and the
+	// shift is part of the operand.
+	blanksOff bool
 
 	syms map[string]Val
 	// All definitions of each name in source order. A one-pass assembler
@@ -191,11 +197,12 @@ func (st *asmState) scopePrefix() string {
 	if st.scopeSeg >= 0 {
 		return fmt.Sprintf("%d\x00", st.scopeSeg)
 	}
-	// A data segment's fields are file-wide whether or not it is exported --
-	// the low five bits of KIND are the type, so $0001 counts as much as
-	// $4001 (HFS's "data" record is exported, and scoping its fields to their
-	// own segment made every cross-segment field reference undefined).
-	if st.cur == nil || st.inRecord || st.cur.kind&0x1F == 0x01 {
+	// A data segment's PLAIN field names are scoped to the segment like any
+	// PROC label (oracle-probed: "sta save1" from another segment is
+	// "Undefined ID", or "IMPORT assumed" under -unsafe). Only EXPORTed
+	// fields and the qualified RECORD.FIELD form reach across segments --
+	// hfs.fst.main relies on the IMPORT-assumed form for save_gbuf_ptr1.
+	if st.cur == nil || st.inRecord {
 		return ""
 	}
 	return fmt.Sprintf("%d\x00", st.curSegIndex())
@@ -211,10 +218,23 @@ func (st *asmState) lookup(name string) Val {
 		return fwdVal(name)
 	}
 	// A WITH'd record instance qualifies a bare field name; the most recent
-	// WITH wins.
+	// Tag with the symbol's own name/offset so cross-segment references
+	// can be emitted by name; same-segment backward refs still use
+	// segment+offset (see exprRef).
+	tag := func(v Val) Val {
+		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
+			t := term{seg: v.Pos[0].seg, name: name, symOff: v.C, defSeq: v.defSeq}
+			t.pub = st.publishedAt(t)
+			v.Pos = []term{t}
+		}
+		return v
+	}
+	// WITH wins. Its result is tagged like any other lookup: hfs.fst.main
+	// reaches its data segment's fields through "with data", and the
+	// EXPORTed ones must still emit by name, not as DATA+offset.
 	for i := len(st.withs) - 1; i >= 0; i-- {
 		if v, ok := st.syms[st.withs[i]+"."+name]; ok {
-			return v
+			return tag(v)
 		}
 	}
 	scope := st.scopePrefix()
@@ -223,15 +243,7 @@ func (st *asmState) lookup(name string) Val {
 		if !ok {
 			continue
 		}
-		// Tag with the symbol's own name/offset so cross-segment references
-		// can be emitted by name; same-segment backward refs still use
-		// segment+offset (see exprRef).
-		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
-			t := term{seg: v.Pos[0].seg, name: name, symOff: v.C, defSeq: v.defSeq}
-			t.pub = st.publishedAt(t)
-			v.Pos = []term{t}
-		}
-		return v
+		return tag(v)
 	}
 	f := fwdVal(name)
 	f.Pos[0].scope = scope
@@ -421,6 +433,31 @@ func operandOnly(s string) string {
 		}
 	}
 	return s
+}
+
+// operandField cuts the operand from the rest of a line under the current
+// BLANKS mode. BLANKS ON (the default): the field runs to the ';' comment or
+// end of line, so "#(mask) << 2" keeps its shift. BLANKS OFF: the field ends
+// at the first blank after a complete operand (operandOnly). DC operands
+// always end at the first blank outside quotes regardless of mode
+// (oracle-verified in hfs.fst.main, a BLANKS ON file), so the DC path calls
+// operandOnly directly.
+func (st *asmState) operandField(s string) string {
+	if st.blanksOff {
+		return operandOnly(s)
+	}
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			inStr = !inStr
+		case ';':
+			if !inStr {
+				return strings.TrimRight(s[:i], " \t")
+			}
+		}
+	}
+	return strings.TrimRight(s, " \t")
 }
 
 // continuesOperand reports whether an operand ending in c is incomplete, so
@@ -640,7 +677,7 @@ func (st *asmState) doLine(l line) {
 	case "equ", "set":
 		// SET is EQU for a symbol that may be redefined; the DSect/BYTE/WORD/
 		// LONG macros walk a dummy PC that way to lay out parameter records.
-		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
+		v, err := evalExpr(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("%s: %v", strings.ToUpper(op), err)
 			return
@@ -655,6 +692,17 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		st.define(l.label, v)
+		// An equate inside a RECORD data segment is reachable through WITH
+		// (and DATA.NAME), like the segment's DS fields -- hfs.fst.main's
+		// len_params. Its plain name stays scoped to the segment
+		// (oracle-probed: cross-segment "ldy #diff" is IMPORT assumed).
+		if st.cur != nil && st.cur.kind&0x1F == 0x01 {
+			if u := st.sym(l.label); u != "" && u != st.cur.name {
+				q := st.cur.name + "." + u
+				st.fileWide[q] = true
+				st.define(q, v)
+			}
+		}
 		if u := st.sym(l.label); st.entryEqu[u] && v.isNum() {
 			rec := gequRec(u, st.entryPriv[u], v.C)
 			if st.cur == nil && len(st.segs) == 0 {
@@ -749,7 +797,10 @@ func (st *asmState) doLine(l line) {
 	case "case":
 		st.caseSens = strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "on")
 		return
-	case "title", "eject", "print", "space", "page", "pagesize", "blanks",
+	case "blanks":
+		st.blanksOff = strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "off")
+		return
+	case "title", "eject", "print", "space", "page", "pagesize",
 		"list", "nolist", "trace", "err", "obj", "noobj", "ttl":
 		return // listing/diagnostic control: no object-file effect
 	case "datachk", "codechk":
@@ -852,7 +903,7 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		// A bare ORG restores the location counter to its high-water mark.
-		if operandOnly(l.rest) == "" {
+		if st.operandField(l.rest) == "" {
 			if st.pc > st.segHigh {
 				st.segHigh = st.pc
 			}
@@ -864,7 +915,7 @@ func (st *asmState) doLine(l line) {
 		}
 		// The operand may name a label in this segment: AD3.5.data does
 		// "ORG trk_ctr" to overlay a later field on earlier storage.
-		val, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
+		val, err := evalExpr(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("ORG: %v", err)
 			return
@@ -908,7 +959,7 @@ func (st *asmState) doLine(l line) {
 		}
 		// "POpen ds openParms" reserves one instance of a RECORD template and
 		// makes its fields reachable as POpen.field.
-		if rec := st.sym(operandOnly(l.rest)); st.recSize[rec] != 0 {
+		if rec := st.sym(st.operandField(l.rest)); st.recSize[rec] != 0 {
 			base := st.pc
 			if l.label != "" {
 				for f, off := range st.recFields[rec] {
@@ -920,7 +971,7 @@ func (st *asmState) doLine(l line) {
 			st.pc += st.recSize[rec]
 			return
 		}
-		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		n, err := evalNum(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("DS: %v", err)
 			return
@@ -956,7 +1007,7 @@ func (st *asmState) doLine(l line) {
 		if l.label != "" {
 			st.defineCodeLabel(l.label)
 		}
-		st.doInst(op, operandOnly(l.rest))
+		st.doInst(op, st.operandField(l.rest))
 		return
 	}
 	st.errf("unknown opcode/directive %q", l.op)
@@ -1031,9 +1082,13 @@ func (st *asmState) defineCodeLabel(name string) {
 	st.define(name, segVal(st.curSegIndex(), st.pc))
 	u := st.sym(name)
 	// Fields of a RECORD data segment are also reachable through the
-	// qualified "record.field" form, as a template's fields are.
+	// qualified "record.field" form, as a template's fields are; the
+	// qualified name stays file-wide even though the plain name is scoped
+	// to the data segment.
 	if st.cur.kind&0x1F == 0x01 && u != st.cur.name {
-		st.define(st.cur.name+"."+u, segVal(st.curSegIndex(), st.pc))
+		q := st.cur.name + "." + u
+		st.fileWide[q] = true
+		st.define(q, segVal(st.curSegIndex(), st.pc))
 	}
 	// A published name yields exactly ONE GLOBAL record, at its last
 	// definition -- ProDOS.FST defines clear_index twice and the original
@@ -1161,14 +1216,14 @@ func (st *asmState) doRecordLine(op string, l line) {
 	case "org":
 		// A bare ORG restores the location counter to its high-water mark,
 		// which is how overlapping ORG regions in a template are unioned.
-		if operandOnly(l.rest) == "" {
+		if st.operandField(l.rest) == "" {
 			if st.recPC > st.recHigh {
 				st.recHigh = st.recPC
 			}
 			st.recPC = st.recHigh
 			return
 		}
-		v, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		v, err := evalNum(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("RECORD ORG: %v", err)
 			return
@@ -1188,7 +1243,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 		case "ds.l":
 			size = 4
 		}
-		n, err := evalNum(operandOnly(l.rest), &exprCtx{st: st})
+		n, err := evalNum(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("RECORD DS: %v", err)
 			return
@@ -1196,7 +1251,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 		st.recField(l.label, n*size, defField)
 		return
 	case "equ", "set":
-		v, err := evalExpr(operandOnly(l.rest), &exprCtx{st: st})
+		v, err := evalExpr(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("%s: %v", strings.ToUpper(op), err)
 			return

@@ -1163,6 +1163,21 @@ func splitCompareIn(s string, brackets bool) (string, string, string) {
 			if inStr || depth != 0 {
 				continue
 			}
+			if i+1 < len(s) && s[i+1] == '<' { // shift, not comparison
+				i++
+				continue
+			}
+			// A bare "<" needs a left-hand side to be a comparison. With none
+			// it is the direct-page prefix of a substituted operand, as in
+			// "IF &addr1='' THEN" with &addr1 = "<s_temp1" -- reading that as
+			// a comparison took the wrong branch of gsos.macros' pulllong and
+			// dropped the stores entirely. This holds even when '=' follows:
+			// M16.Util's pushlong tests "&addr[1:1]='#'", and with &addr =
+			// "<last_dib" the condition is the string "<" against "#", not
+			// "<=" with an empty left side.
+			if strings.TrimSpace(s[:i]) == "" {
+				continue
+			}
 			if i+1 < len(s) {
 				if s[i+1] == '>' {
 					return strings.TrimSpace(s[:i]), "<>", strings.TrimSpace(s[i+2:])
@@ -1170,35 +1185,21 @@ func splitCompareIn(s string, brackets bool) (string, string, string) {
 				if s[i+1] == '=' {
 					return strings.TrimSpace(s[:i]), "<=", strings.TrimSpace(s[i+2:])
 				}
-				if s[i+1] == '<' { // shift, not comparison
-					i++
-					continue
-				}
-			}
-			// A bare "<" needs a left-hand side to be a comparison. With none
-			// it is the direct-page prefix of a substituted operand, as in
-			// "IF &addr1='' THEN" with &addr1 = "<s_temp1" -- reading that as
-			// a comparison took the wrong branch of gsos.macros' pulllong and
-			// dropped the stores entirely.
-			if strings.TrimSpace(s[:i]) == "" {
-				continue
 			}
 			return strings.TrimSpace(s[:i]), "<", strings.TrimSpace(s[i+1:])
 		case '>':
 			if inStr || depth != 0 {
 				continue
 			}
-			if i+1 < len(s) {
-				if s[i+1] == '=' {
-					return strings.TrimSpace(s[:i]), ">=", strings.TrimSpace(s[i+2:])
-				}
-				if s[i+1] == '>' { // shift
-					i++
-					continue
-				}
+			if i+1 < len(s) && s[i+1] == '>' { // shift
+				i++
+				continue
 			}
 			if strings.TrimSpace(s[:i]) == "" {
 				continue // long-addressing prefix, not a comparison
+			}
+			if i+1 < len(s) && s[i+1] == '=' {
+				return strings.TrimSpace(s[:i]), ">=", strings.TrimSpace(s[i+2:])
 			}
 			return strings.TrimSpace(s[:i]), ">", strings.TrimSpace(s[i+1:])
 		case '=':
