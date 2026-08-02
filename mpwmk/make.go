@@ -205,7 +205,19 @@ func NewBuilder(env *Env, mf *Makefile) *Builder {
 			continue
 		}
 		for _, t := range r.Targets {
-			b.MF.byTgt[strings.ToLower(env.HostPath(t))] = r
+			// A target that is nothing but a variable reference may name a
+			// whole list of files: make.as.fst hangs the equates.dump
+			// dependency on every object with "{objects} ƒ {obj}equates.dump".
+			// Same one-form-only rule as for dependencies (MPW file names
+			// contain spaces).
+			names := []string{t}
+			if tt := strings.TrimSpace(t); strings.HasPrefix(tt, "{") &&
+				strings.HasSuffix(tt, "}") && !strings.Contains(tt[:len(tt)-1], "}") {
+				names = splitFields(env.Expand(tt))
+			}
+			for _, n := range names {
+				b.MF.byTgt[strings.ToLower(env.HostPath(n))] = r
+			}
 		}
 	}
 	return b

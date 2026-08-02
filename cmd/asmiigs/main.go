@@ -50,7 +50,13 @@ func main() {
 	if len(inputs) != 1 || out == "" {
 		die("usage: asmiigs [options] file.aii -o file.obj")
 	}
-	obj, err := asm.AssembleFileOpts(inputs[0], incDirs, defines)
+	cwd, _ := os.Getwd()
+	obj, err := asm.AssembleFileWith(inputs[0], asm.FileOpts{
+		IncDirs: incDirs,
+		Defines: defines,
+		CurDir:  cwd,
+		Getenv:  os.Getenv,
+	})
 	if err != nil {
 		die("%s:\n%v", inputs[0], err)
 	}

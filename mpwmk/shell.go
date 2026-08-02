@@ -354,6 +354,7 @@ func (e *Env) RunCommand(line string) error {
 	}
 	// strip redirections we do not need to honor for object-producing builds
 	line, outFile, appendOut := splitRedirect(line)
+	line = e.substBackquotes(line)
 	words := Tokenize(e.Expand(line))
 	if len(words) == 0 {
 		return nil
@@ -386,6 +387,47 @@ func (e *Env) RunCommand(line string) error {
 		}
 	}
 	return err
+}
+
+// substBackquotes replaces `command` spans with the command's output, the
+// MPW shell's command substitution. It works inside double quotes (that is
+// how make.as.fst saves the working directory: Set YeOldeDirectory
+// "`Directory`") but not inside single ones, and the substituted output has
+// surrounding whitespace trimmed.
+func (e *Env) substBackquotes(line string) string {
+	if !strings.Contains(line, "`") {
+		return line
+	}
+	var b strings.Builder
+	inS := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if c == '\'' {
+			inS = !inS
+		}
+		if c != '`' || inS {
+			b.WriteByte(c)
+			continue
+		}
+		j := strings.IndexByte(line[i+1:], '`')
+		if j < 0 {
+			b.WriteByte(c)
+			continue
+		}
+		inner := line[i+1 : i+1+j]
+		i += j + 1
+		words := Tokenize(e.Expand(inner))
+		if len(words) == 0 {
+			continue
+		}
+		var out strings.Builder
+		if err := e.dispatch(strings.ToLower(words[0]), words[1:], &out); err != nil {
+			fmt.Fprintf(e.Out, "mpwmk: `%s`: %v\n", inner, err)
+			continue
+		}
+		b.WriteString(strings.TrimSpace(out.String()))
+	}
+	return b.String()
 }
 
 // splitRedirect removes a trailing "> file" / ">> file" and any stderr

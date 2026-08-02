@@ -22,6 +22,7 @@ type macroDef struct {
 	namePre  string   // literal name, lowercased; for "equds.&siz" this is "equds."
 	nameVar  string   // param bound to the name suffix ("" if exact-match name)
 	params   []string // positional parameter names (upper, no &)
+	defaults []string // per-param default value ("&creator=$FFFFFFFF"), "" if none
 	body     []string
 }
 
@@ -46,6 +47,15 @@ type ppState struct {
 	protoNext bool // next line is the macro prototype
 
 	incDirs []string
+	// DUMP/LOAD precompiled symbol tables (the AppleShare FST's
+	// equates.dump). Our .dump file is a stub naming the source that built
+	// it; LOAD replays that source into the current state, stopping at its
+	// DUMP directive (loadDepth > 0 while replaying, stopLoad unwinds it).
+	curDir    string              // MPW current directory, for DUMP's path
+	defines   []string            // this invocation's -d list, recorded in the stub
+	getenv    func(string) string // MPW shell variables (&GETENV)
+	loadDepth int
+	stopLoad  bool
 	// mexit is set by MEXIT to stop expanding the current macro body
 	mexit bool
 	// gotoTarget is the sequence symbol a GOTO is skipping forward to
@@ -145,13 +155,85 @@ func (pp *ppState) findInclude(spec string) string {
 	return direct
 }
 
+// ---------- DUMP/LOAD precompiled symbol tables ----------
+//
+// The original AsmIIGS writes a binary snapshot of its symbol table, macros
+// and records; other files LOAD it in place of re-including everything (the
+// AppleShare FST is the only GS/OS user). The dump file is a build
+// intermediate nothing shipped ever contains, so instead of matching its
+// format we write a stub naming the source (and -d defines) that produced
+// it; LOAD replays that source into the current state up to its DUMP
+// directive, which reproduces the snapshot semantics.
+
+const dumpStubMagic = ";asmiigs-dump v1"
+
+func (pp *ppState) writeDump(spec string) {
+	st := pp.st
+	dir := pp.curDir
+	if dir == "" {
+		dir = filepath.Dir(st.curFile)
+	}
+	path := mpwPath(dir, spec)
+	src := st.curFile
+	if abs, err := filepath.Abs(src); err == nil {
+		src = abs
+	}
+	var b strings.Builder
+	b.WriteString(dumpStubMagic + "\n")
+	b.WriteString(";source=" + src + "\n")
+	for _, d := range pp.defines {
+		b.WriteString(";define=" + d + "\n")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		st.errf("DUMP %s: %v", spec, err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0644); err != nil {
+		st.errf("DUMP %s: %v", spec, err)
+	}
+}
+
+func (pp *ppState) doLoad(spec string) {
+	st := pp.st
+	path := pp.findInclude(spec)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		st.errf("LOAD %s: %v", spec, err)
+		return
+	}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r", "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != dumpStubMagic {
+		st.errf("LOAD %s: not an asmiigs dump stub", spec)
+		return
+	}
+	src := ""
+	for _, ln := range lines[1:] {
+		if v, ok := strings.CutPrefix(ln, ";source="); ok {
+			src = v
+		} else if v, ok := strings.CutPrefix(ln, ";define="); ok {
+			st.applyDefine(v)
+		}
+	}
+	if src == "" {
+		st.errf("LOAD %s: stub names no source", spec)
+		return
+	}
+	pp.loadDepth++
+	err = pp.processFile(src)
+	pp.loadDepth--
+	pp.stopLoad = false
+	if err != nil {
+		st.errf("LOAD %s: %v", spec, err)
+	}
+}
+
 func (pp *ppState) processSource(src, path string) {
 	st := pp.st
 	prevFile, prevLine := st.curFile, st.curLine
 	st.curFile = path
 	lines := strings.Split(src, "\n")
 	for n := 0; n < len(lines); n++ {
-		if st.ended {
+		if st.ended || pp.stopLoad {
 			break
 		}
 		raw := lines[n]
@@ -433,6 +515,27 @@ func (pp *ppState) processLine(raw string) {
 			st.errf("INCLUDE %s: %v", spec, err)
 		}
 		return
+	case "dump":
+		// DUMP 'file' snapshots the symbol/macro state. While replaying a
+		// source under LOAD it instead marks where the snapshot was taken:
+		// everything past it was not in the dump.
+		if pp.loadDepth > 0 {
+			pp.stopLoad = true
+			return
+		}
+		spec := strings.TrimSpace(l.rest)
+		if s, err := unquote(operandOnly(spec)); err == nil {
+			spec = s
+		}
+		pp.writeDump(spec)
+		return
+	case "load":
+		spec := strings.TrimSpace(l.rest)
+		if s, err := unquote(operandOnly(spec)); err == nil {
+			spec = s
+		}
+		pp.doLoad(spec)
+		return
 	case "write", "writeln", "writehex":
 		// listing-directed output; substitution still happens for its side
 		// effects but nothing is printed or emitted
@@ -474,7 +577,12 @@ func (pp *ppState) parseProto(raw string) {
 	for _, p := range splitArgs(l.rest) {
 		p = strings.TrimSpace(p)
 		if strings.HasPrefix(p, "&") {
-			def.params = append(def.params, strings.ToUpper(p[1:]))
+			// "&param=value" gives the parameter a default, taken when the
+			// invocation omits the argument (AppleShare's ftype macro:
+			// "&creator=$FFFFFFFF").
+			name, dflt, _ := strings.Cut(p[1:], "=")
+			def.params = append(def.params, strings.ToUpper(strings.TrimSpace(name)))
+			def.defaults = append(def.defaults, strings.TrimSpace(dflt))
 		}
 	}
 }
@@ -502,8 +610,23 @@ func (pp *ppState) findMacro(op string) (*macroDef, string) {
 
 func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	frame := &ppFrame{vars: map[string]string{}}
+	redirect := labelRedirect{}
 	if def.labelVar != "" {
 		frame.vars[def.labelVar] = inv.label
+		// The invocation's label belongs to the CALLER: a plain label
+		// delimits the caller's @local scope exactly as writing it outside
+		// would (pascal.fst's "sys_entry PROCNAME" segments reuse @no_way;
+		// without this a stale @no_way from an earlier segment leaks in).
+		// An @-label instead defines INTO the caller's scope when the body's
+		// "&lab" line runs ("@hitReturn _RestoreTextState" in ETalk must
+		// satisfy the outer "beq @hitReturn").
+		if inv.label != "" && !strings.HasPrefix(inv.label, "@") {
+			pp.st.localScopeMax++
+			pp.st.scopeChain[len(pp.st.scopeChain)-1] = pp.st.localScopeMax
+		} else if strings.HasPrefix(inv.label, "@") {
+			redirect = labelRedirect{name: pp.st.sym(inv.label),
+				chainIdx: len(pp.st.scopeChain) - 1}
+		}
 	} else if inv.label != "" {
 		// a label on an invocation of a label-less macro defines a code label
 		pp.st.defineCodeLabel(inv.label)
@@ -520,9 +643,19 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 		if i < len(args) {
 			v = strings.TrimSpace(args[i])
 		}
+		if v == "" && i < len(def.defaults) {
+			v = def.defaults[i]
+		}
 		frame.vars[p] = v
 	}
 	pp.frames = append(pp.frames, frame)
+	// A macro expansion pushes its own @local scope: each expansion's
+	// @labels stay apart from the next one's, and the caller's scope (with
+	// its @labels) resumes after the call (see scopeChain in asm.go).
+	chainDepth := len(pp.st.scopeChain)
+	pp.st.localScopeMax++
+	pp.st.scopeChain = append(pp.st.scopeChain, pp.st.localScopeMax)
+	pp.st.labelRedirect = append(pp.st.labelRedirect, redirect)
 	condDepth := len(pp.conds)
 	for _, bl := range def.body {
 		if pp.st.ended || pp.mexit {
@@ -530,6 +663,8 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 		}
 		pp.processLine(bl)
 	}
+	pp.st.labelRedirect = pp.st.labelRedirect[:len(pp.st.labelRedirect)-1]
+	pp.st.scopeChain = pp.st.scopeChain[:chainDepth]
 	pp.mexit = false
 	// close any conditional left open by the body (defensive)
 	if len(pp.conds) > condDepth {
@@ -636,7 +771,7 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
-	"ORD": true, "SUBSTR": true, "TYPE": true, "S2I": true,
+	"ORD": true, "SUBSTR": true, "TYPE": true, "S2I": true, "GETENV": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -819,6 +954,14 @@ func (pp *ppState) callFunc(name string, args []string) string {
 		return substr(pp.rawArg(args[:1]), pp.argNum(args[1]), pp.argNum(args[2]))
 	case "TRIM":
 		return strings.TrimSpace(pp.rawArg(args))
+	case "GETENV":
+		// MPW shell variable lookup; the AppleShare equates default their
+		// DebugCode from &getenv('MSDDebugFlag'). Under mpwmk this reads
+		// the makefile's variable table, standalone the process env.
+		if pp.getenv == nil || len(args) == 0 {
+			return ""
+		}
+		return pp.getenv(strings.Trim(strings.TrimSpace(pp.rawArg(args)), "'"))
 	case "LEN":
 		return strconv.Itoa(len(pp.rawArg(args)))
 	case "UC":

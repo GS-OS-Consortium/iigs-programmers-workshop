@@ -19,6 +19,11 @@ type term struct {
 	atSeq  int64  // definition counter when the forward reference was made
 	defSeq int64  // definition counter of the definition this resolved to
 	scope  string // symbol-table scope prefix in effect at the reference
+	// chain is the @local scope chain at an @-label forward reference: the
+	// definition may land in ANY enclosing scope (a macro argument like
+	// "pushword |@deref_handle" is evaluated inside the expansion's scope,
+	// but the label is defined later in the caller's scope).
+	chain []int
 	// pub marks a reference to a published (ENTRY/EXPORT) symbol other than a
 	// segment's own label.
 	pub bool

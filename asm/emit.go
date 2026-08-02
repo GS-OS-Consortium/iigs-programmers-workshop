@@ -271,7 +271,13 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					}
 					return
 				}
-				r, ok := st.nextDef(t.fwd, t.scope, t.atSeq)
+				var r Val
+				var ok bool
+				if len(t.chain) > 0 {
+					r, ok = st.nextDefChain(t.fwd, t.chain, t.atSeq)
+				} else {
+					r, ok = st.nextDef(t.fwd, t.scope, t.atSeq)
+				}
 				if !ok {
 					stuck[t.fwd] = true
 					// "Undefined ID -- IMPORT assumed" (AsmIIGS -unsafe,
@@ -351,6 +357,21 @@ func (st *asmState) termRefs(ts []term, curSeg int) ([]termRef, int64) {
 // nextDef returns the first definition of name made after seq (a one-pass
 // forward reference binds to the next definition, not the last). The
 // reference's own segment scope is searched before the file-wide one.
+// A forward @local reference instead binds to the earliest subsequent
+// definition made in any scope of its recorded chain (see scopeChain).
+func (st *asmState) nextDefChain(name string, chain []int, seq int64) (Val, bool) {
+	var best Val
+	found := false
+	for _, s := range chain {
+		for _, d := range st.symSeq[fmt.Sprintf("%s#%d", name, s)] {
+			if d.defSeq > seq && (!found || d.defSeq < best.defSeq) {
+				best, found = d, true
+			}
+		}
+	}
+	return best, found
+}
+
 func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
 	for i, key := range [2]string{scope + name, name} {
 		defs := st.symSeq[key]

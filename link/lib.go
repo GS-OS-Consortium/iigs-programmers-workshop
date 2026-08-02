@@ -77,25 +77,60 @@ func SelectLib(objs []*omf.File, lib *omf.File) *omf.File {
 	var buckets [512][]string
 	seen := map[string]bool{}
 	defined := map[string]bool{}
+	// A reference lookup can move a symbol to its chain's head, but each
+	// symbol moves AT MOST ONCE: the first reference prepends it, the first
+	// RE-reference (from a later segment) hoists it back to the head, and
+	// every reference after that leaves it in place -- as if a 1-bit
+	// "multiply referenced" flag gates the relink. Oracle-probed (p5: a
+	// re-reference hoists an old entry over a newer one) and pinned by
+	// MSDos.FST's buckets 505/3/139/162, which need exactly one hoist:
+	// mount_volume rises over search_name at its second reference but does
+	// NOT rise over find_volume at its third.
+	hoisted := map[string]bool{}
 	insert := func(n string) {
-		if seen[n] {
+		b := libHash(n)
+		if !seen[n] {
+			seen[n] = true
+			buckets[b] = append([]string{n}, buckets[b]...)
 			return
 		}
-		seen[n] = true
-		b := libHash(n)
-		buckets[b] = append([]string{n}, buckets[b]...)
+		if hoisted[n] {
+			return
+		}
+		hoisted[n] = true
+		ch := buckets[b]
+		for i, x := range ch {
+			if x == n {
+				ch = append(ch[:i:i], ch[i+1:]...)
+				break
+			}
+		}
+		buckets[b] = append([]string{n}, ch...)
 	}
-	define := func(n string) { insert(n); defined[n] = true }
+	segBatch := func(s *omf.Segment) {
+		for _, d := range defs(s) {
+			if !seen[d] {
+				insert(d)
+			}
+			defined[d] = true
+		}
+		// Each distinct symbol is looked up ONCE per segment, at its first
+		// occurrence -- repeats within the segment do not re-hoist it
+		// (oracle-probed: READ references curr_mark, then save_curr_mark,
+		// then curr_mark again, and save_curr_mark is pulled first).
+		inSeg := map[string]bool{}
+		for _, r := range refs(s) {
+			if inSeg[r] {
+				continue
+			}
+			inSeg[r] = true
+			insert(r)
+		}
+	}
 
 	for _, f := range objs {
 		for i := range f.Segments {
-			s := &f.Segments[i]
-			for _, d := range defs(s) {
-				define(d)
-			}
-			for _, r := range refs(s) {
-				insert(r)
-			}
+			segBatch(&f.Segments[i])
 		}
 	}
 
@@ -115,12 +150,7 @@ func SelectLib(objs []*omf.File, lib *omf.File) *omf.File {
 				}
 				pulled[s] = true
 				out.Segments = append(out.Segments, *s)
-				for _, d := range defs(s) {
-					define(d)
-				}
-				for _, r := range refs(s) {
-					insert(r)
-				}
+				segBatch(s)
 				progress = true
 			}
 		}

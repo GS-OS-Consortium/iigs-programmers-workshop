@@ -320,7 +320,12 @@ func (e *Env) runAsm(args []string) error {
 		incDirs = append(incDirs, e.HostPath(d))
 	}
 	e.logAsm(input, output, incDirs, defines, extras)
-	obj, err := asm.AssembleFileOpts(input, incDirs, defines)
+	obj, err := asm.AssembleFileWith(input, asm.FileOpts{
+		IncDirs: incDirs,
+		Defines: defines,
+		CurDir:  e.Dir,
+		Getenv:  e.Get,
+	})
 	if err != nil {
 		return fmt.Errorf("asmiigs %s: %w", filepath.Base(input), err)
 	}

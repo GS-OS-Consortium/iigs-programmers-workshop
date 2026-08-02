@@ -81,7 +81,24 @@ type symEntry struct {
 }
 
 type asmState struct {
-	localScope int // bumped at each non-local code label; scopes @locals
+	// @local scoping is a CHAIN of scopes (oracle-probed, AppleShare's
+	// trysub and the SCSI drivers): a macro expansion pushes a fresh scope
+	// and pops it at ENDM, so consecutive expansions keep their @labels
+	// apart while the caller's scope -- with its @labels -- resumes after
+	// the call. Every non-local code label REPLACES the innermost scope.
+	// References resolve innermost-outward, and a forward reference binds
+	// to the next definition made in any scope that was on the chain when
+	// the reference was made (a macro argument like "pushword
+	// |@deref_handle" is evaluated inside the expansion but its label is
+	// defined later in the caller's scope). localScopeMax is a monotonic id
+	// generator; scope ids are never reused.
+	scopeChain    []int
+	localScopeMax int
+	// labelRedirect, one entry per open macro expansion: when the
+	// invocation's label is an @-local ("@hitReturn _RestoreTextState"),
+	// the body's "&lab" definition belongs to the CALLER's scope, not the
+	// expansion's -- the outer "beq @hitReturn" must reach it.
+	labelRedirect []labelRedirect
 	cpu        int
 	longA      bool
 	longI      bool
@@ -150,7 +167,16 @@ type asmState struct {
 	// stays the plain constant. MSDos' "ldy #bpb_size-1" folds to $12 even
 	// under "with bios_parm_block" (oracle-verified).
 	recEqus map[string]map[string]bool
-	recDown   bool // RECORD ...,decrement: fields grow downward
+	recDown bool // RECORD ...,decrement: fields grow downward
+	// recImport is "name RECORD IMPORT": the storage lives in another file
+	// (AppleShare's data.aii declares SPWrite with RECORD EXPORT, flush.aii
+	// re-declares the layout with RECORD IMPORT). No segment or bytes are
+	// emitted; the name becomes an external symbol and each ds-declared
+	// field resolves to import+offset, reachable only as RECORD.FIELD
+	// (bare field names outside are Undefined ID -- oracle-probed, and an
+	// addend folds into the offset constant: SPWrite.ComAddr+2 emits
+	// "SPWRITE, $0D, add").
+	recImport bool
 	// recBare records what the open template's unqualified field names hid,
 	// so ENDR can put it back (see doRecordLine).
 	recBare []bareField
@@ -220,12 +246,19 @@ func (st *asmState) scopePrefix() string {
 
 func (st *asmState) lookup(name string) Val {
 	if strings.HasPrefix(name, "@") {
-		name = st.scopedLocal(name)
-	}
-	// An IMPORT declared in the current segment makes the symbol external
-	// there, even when another segment in the same file defines it.
-	if st.cur != nil && st.cur.imports[name] {
-		return fwdVal(name)
+		// Backward: innermost chain scope first (an expansion's @label
+		// shadows the caller's). Forward: remember the whole chain -- the
+		// definition may land in any scope that encloses this reference.
+		for i := len(st.scopeChain) - 1; i >= 0; i-- {
+			key := fmt.Sprintf("%s#%d", name, st.scopeChain[i])
+			if v, ok := st.syms[key]; ok {
+				return v
+			}
+		}
+		f := fwdVal(name)
+		f.Pos[0].atSeq = st.defSeq
+		f.Pos[0].chain = append([]int(nil), st.scopeChain...)
+		return f
 	}
 	// A WITH'd record instance qualifies a bare field name; the most recent
 	// Tag with the symbol's own name/offset so cross-segment references
@@ -239,9 +272,13 @@ func (st *asmState) lookup(name string) Val {
 		}
 		return v
 	}
-	// WITH wins. Its result is tagged like any other lookup: hfs.fst.main
-	// reaches its data segment's fields through "with data", and the
-	// EXPORTed ones must still emit by name, not as DATA+offset.
+	// WITH wins -- even over an IMPORT of the same name in the same segment
+	// (oracle-probed: AppleShare's PreProcess does "with dp,mydata" AND
+	// "import my_fork_bitmap", and the reference emits MYDATA+offset; nothing
+	// ever publishes MY_FORK_BITMAP by name). Its result is tagged like any
+	// other lookup: hfs.fst.main reaches its data segment's fields through
+	// "with data", and the EXPORTed ones must still emit by name, not as
+	// DATA+offset.
 	for i := len(st.withs) - 1; i >= 0; i-- {
 		if v, ok := st.syms[st.withs[i]+"."+name]; ok {
 			v = tag(v)
@@ -251,6 +288,11 @@ func (st *asmState) lookup(name string) Val {
 			}
 			return v
 		}
+	}
+	// An IMPORT declared in the current segment makes the symbol external
+	// there, even when another segment in the same file defines it.
+	if st.cur != nil && st.cur.imports[name] {
+		return fwdVal(name)
 	}
 	scope := st.scopePrefix()
 	for _, key := range [2]string{scope + name, name} {
@@ -266,8 +308,19 @@ func (st *asmState) lookup(name string) Val {
 	return f
 }
 
+type labelRedirect struct {
+	name     string // canonicalized @-label from the invocation ("" = none)
+	chainIdx int    // the caller's slot in scopeChain
+}
+
 func (st *asmState) scopedLocal(name string) string {
-	return fmt.Sprintf("%s#%d", name, st.localScope)
+	if n := len(st.labelRedirect); n > 0 {
+		if r := st.labelRedirect[n-1]; r.name != "" && st.sym(name) == r.name &&
+			r.chainIdx < len(st.scopeChain) {
+			return fmt.Sprintf("%s#%d", name, st.scopeChain[r.chainIdx])
+		}
+	}
+	return fmt.Sprintf("%s#%d", name, st.scopeChain[len(st.scopeChain)-1])
 }
 
 func (st *asmState) define(name string, v Val) {
@@ -277,7 +330,8 @@ func (st *asmState) define(name string, v Val) {
 		key = st.scopedLocal(name)
 	} else {
 		// any non-local label delimits @local scopes (incl. X EQU *)
-		st.localScope++
+		st.localScopeMax++
+		st.scopeChain[len(st.scopeChain)-1] = st.localScopeMax
 		// ENTRY/EXPORT symbols stay file-wide; everything else is scoped to
 		// the segment being assembled.
 		if !st.entries[name] && !st.fileWide[name] {
@@ -558,14 +612,43 @@ func AssembleFile(path string, incDirs ...string) (*Object, error) {
 // AssembleFileOpts assembles with include directories and command-line
 // symbol definitions ("-D NAME=VALUE", as the makefiles pass them).
 func AssembleFileOpts(path string, incDirs, defines []string) (*Object, error) {
+	return AssembleFileWith(path, FileOpts{IncDirs: incDirs, Defines: defines})
+}
+
+// FileOpts carries the invocation context beyond the source itself. CurDir
+// is the MPW current directory (a DUMP operand like ':obj:equates.dump' is
+// relative to it); Getenv answers &GETENV from the MPW shell's variables.
+type FileOpts struct {
+	IncDirs []string
+	Defines []string
+	CurDir  string
+	Getenv  func(string) string
+}
+
+func AssembleFileWith(path string, o FileOpts) (*Object, error) {
 	st := newState()
-	st.pp.incDirs = incDirs
-	// A single -d flag may carry a comma-separated list, e.g. "-d &type,type=0"
-	var flat []string
-	for _, d := range defines {
-		flat = append(flat, strings.Split(d, ",")...)
+	st.pp.incDirs = o.IncDirs
+	st.pp.curDir = o.CurDir
+	st.pp.getenv = o.Getenv
+	st.pp.defines = o.Defines
+	for _, d := range o.Defines {
+		st.applyDefine(d)
 	}
-	for _, d := range flat {
+	// absolutize so MPW '::' (parent-dir) include paths resolve correctly
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if err := st.pp.processFile(path); err != nil {
+		return nil, err
+	}
+	return st.finish()
+}
+
+// applyDefine handles one -d flag, which may carry a comma-separated list,
+// e.g. "-d &type,type=0". Also used when a LOADed dump stub replays the
+// defines its source was originally assembled under.
+func (st *asmState) applyDefine(define string) {
+	for _, d := range strings.Split(define, ",") {
 		name, val, ok := strings.Cut(d, "=")
 		if !ok {
 			val = "1"
@@ -580,14 +663,6 @@ func AssembleFileOpts(path string, incDirs, defines []string) (*Object, error) {
 		st.define(name, num(v))
 		st.pp.globals[strings.ToUpper(name)] = strings.TrimSpace(val)
 	}
-	// absolutize so MPW '::' (parent-dir) include paths resolve correctly
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	if err := st.pp.processFile(path); err != nil {
-		return nil, err
-	}
-	return st.finish()
 }
 
 // AssembleSource assembles in-memory source; dir is used for INCLUDE resolution.
@@ -617,6 +692,7 @@ func newState() *asmState {
 		fileWide:   map[string]bool{},
 		segNames:   map[string]bool{},
 		scopeSeg:   -1,
+		scopeChain: []int{0},
 		recSize:    map[string]int64{},
 		recFields:  map[string]map[string]int64{},
 		recEqus:    map[string]map[string]bool{},
@@ -806,6 +882,7 @@ func (st *asmState) doLine(l line) {
 		v := int64(0)
 		hasStart := false
 		export := false
+		imported := false
 		if r := operandOnly(l.rest); r != "" {
 			// "RECORD start[,increment|decrement]": decrement grows fields
 			// downward from the start offset
@@ -817,6 +894,9 @@ func (st *asmState) doLine(l line) {
 					continue
 				case "export":
 					export = true
+					continue
+				case "import":
+					imported = true
 					continue
 				case "increment", "private", "entry", "":
 					continue // attributes: no effect on field offsets
@@ -833,6 +913,22 @@ func (st *asmState) doLine(l line) {
 			}
 		}
 		if !hasStart {
+			// "RECORD IMPORT" is the reference side of a RECORD EXPORT in
+			// another file: a template whose base is an external symbol.
+			if imported {
+				name := st.sym(l.label)
+				if name == "" {
+					st.errf("RECORD IMPORT requires a label")
+					return
+				}
+				st.imports[name] = true
+				st.inRecord = true
+				st.recImport = true
+				st.recHigh = 0
+				st.recPC = 0
+				st.recName = name
+				return
+			}
 			// A RECORD with no start offset is not a template at all: it
 			// opens a data segment (oracle-verified KIND $4001), which is how
 			// these sources define tables like Character.FST's cmd_tbl that
@@ -1286,6 +1382,14 @@ func (st *asmState) doRecordLine(op string, l line) {
 	// defined globally let a template field shadow a PROC of the same name:
 	// the loader's call table folded "DC.L LoadName-1" to a constant.
 	defField := func(name string, v Val) {
+		// In a RECORD IMPORT the storage is external: a ds-declared field is
+		// the imported base symbol plus its offset, not a bare constant (an
+		// EQU inside stays a constant, same as recEqus for instances).
+		if st.recImport && v.isNum() && op != "equ" && op != "set" {
+			iv := fwdVal(st.recName)
+			iv.C = v.C
+			v = iv
+		}
 		if key := st.sym(name); key != "" {
 			prev, had := st.syms[key]
 			st.recBare = append(st.recBare,
@@ -1325,6 +1429,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 		}
 		st.recBare = nil
 		st.inRecord = false
+		st.recImport = false
 		st.recName = ""
 		if op == "end" {
 			st.ended = true
