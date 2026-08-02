@@ -235,9 +235,17 @@ func (e *segEmitter) end() []byte {
 func (st *asmState) resolve(v Val) (Val, error)    { return st.resolveMode(v, false) }
 func (st *asmState) resolveAll(v Val) (Val, error) { return st.resolveMode(v, true) }
 func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
+	// stuck holds names forceAll resolution could not find a definition
+	// for: they stay symbolic (RELEXPR by name) instead of looping.
+	stuck := map[string]bool{}
 	pending := func() bool {
 		if forceAll {
-			return v.hasFwd()
+			for _, t := range append(append([]term(nil), v.Pos...), v.Neg...) {
+				if t.fwd != "" && !stuck[t.fwd] {
+					return true
+				}
+			}
+			return false
 		}
 		return v.hasUnresolvedFwd(st)
 	}
@@ -265,22 +273,20 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 				}
 				r, ok := st.nextDef(t.fwd, t.scope, t.atSeq)
 				if !ok {
-					if !forceAll {
-						// "Undefined ID -- IMPORT assumed" (AsmIIGS -unsafe,
-						// which the FST makefiles pass): the reference stays
-						// symbolic for the linker, exactly like a declared
-						// IMPORT. hfs.fst.main reaches save_gbuf_ptr1 in its
-						// data segment this way.
-						st.imports[t.fwd] = true
-						if neg {
-							next, _ = next.sub(Val{Pos: []term{t}})
-						} else {
-							next, _ = next.add(Val{Pos: []term{t}})
-						}
-						return
+					stuck[t.fwd] = true
+					// "Undefined ID -- IMPORT assumed" (AsmIIGS -unsafe,
+					// which the FST makefiles pass): the reference stays
+					// symbolic for the linker, exactly like a declared
+					// IMPORT. hfs.fst.main reaches save_gbuf_ptr1 in its
+					// data segment this way, and a BRANCH to an import
+					// ("brl main_exit" in MSDos.Calls) becomes a RELEXPR
+					// naming the target (oracle-probed).
+					st.imports[t.fwd] = true
+					if neg {
+						next, _ = next.sub(Val{Pos: []term{t}})
+					} else {
+						next, _ = next.add(Val{Pos: []term{t}})
 					}
-					// unresolvable branch target: hard error, never loop
-					err = fmt.Errorf("undefined ID: %s", t.fwd)
 					return
 				}
 				if r.hasFwd() {

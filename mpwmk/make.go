@@ -306,24 +306,41 @@ func (b *Builder) Build(target string) error {
 }
 
 // matchSuffix finds a suffix rule producing host, returning it and the host
-// path of the implied dependency.
+// path of the implied dependency. The dependency is looked for next to the
+// target first, then in the directories a DIRECTORY rule names: make.MSDos
+// says `"{Object}" ƒ "{MSDos}"`, so an .obj targeted into Object/ finds its
+// .aii in the MSDos source directory.
 func (b *Builder) matchSuffix(host string) (*Rule, string) {
+	base := strings.TrimSuffix(filepath.Base(host), filepath.Ext(host))
+	dirs := []string{filepath.Dir(host)}
+	dirKey := strings.ToLower(filepath.Dir(host))
+	dr := b.MF.byTgt[dirKey]
+	if dr == nil {
+		dr = b.MF.byTgt[dirKey+"/"]
+	}
+	if dr != nil && len(dr.Cmds) == 0 {
+		for _, d := range dr.Deps {
+			dirs = append(dirs, strings.TrimRight(b.Env.HostPath(d), "/"))
+		}
+	}
 	for _, r := range b.MF.suffix {
 		tgtSfx, depSfx, _ := suffixPair(r)
 		if !strings.EqualFold(filepath.Ext(host), tgtSfx) {
 			continue
 		}
-		dep := strings.TrimSuffix(host, filepath.Ext(host)) + depSfx
-		if _, err := os.Stat(dep); err != nil {
-			// MPW file names are case-insensitive; the makefiles are not
-			// consistent about it.
-			if alt, ok := findCaseInsensitive(dep); ok {
-				dep = alt
-			} else {
-				continue
+		for _, dir := range dirs {
+			dep := filepath.Join(dir, base+depSfx)
+			if _, err := os.Stat(dep); err != nil {
+				// MPW file names are case-insensitive; the makefiles are
+				// not consistent about it.
+				if alt, ok := findCaseInsensitive(dep); ok {
+					dep = alt
+				} else {
+					continue
+				}
 			}
+			return r, dep
 		}
-		return r, dep
 	}
 	return nil, ""
 }

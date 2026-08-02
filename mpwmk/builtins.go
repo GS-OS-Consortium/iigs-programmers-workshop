@@ -80,11 +80,106 @@ func (e *Env) dispatch(name string, args []string, out io.Writer) error {
 		return e.runLink(args)
 	case "makebiniigs":
 		return e.runMakeBin(args)
-	case "reziigs", "dereziigs", "expressiigs", "makelibiigs", "overlayiigs",
+	case "overlayiigs":
+		// "OverlayIIGS src dst -a $off" copies src over dst at file offset
+		// off, extending dst as needed -- make.p8 assembles the P8 image
+		// this way (the $0C80 loader boundary matches mlisrc's own assert).
+		// The tool is not in the recovered MPW IIGS set; the shipped P8
+		// byte-validates these semantics.
+		var ps []string
+		off := int64(-1)
+		for i := 0; i < len(args); i++ {
+			if strings.ToLower(args[i]) == "-a" && i+1 < len(args) {
+				v, err := parseMPWNum(args[i+1])
+				if err != nil {
+					return err
+				}
+				off = v
+				i++
+				continue
+			}
+			if !strings.HasPrefix(args[i], "-") {
+				ps = append(ps, e.HostPath(args[i]))
+			}
+		}
+		if len(ps) != 2 || off < 0 {
+			return fmt.Errorf("overlayiigs: need src dst -a offset")
+		}
+		src, err := os.ReadFile(ps[0])
+		if err != nil {
+			return err
+		}
+		dst, err := os.ReadFile(ps[1])
+		if err != nil {
+			return err
+		}
+		if need := off + int64(len(src)); need > int64(len(dst)) {
+			dst = append(dst, make([]byte, need-int64(len(dst)))...)
+		}
+		copy(dst[off:], src)
+		return os.WriteFile(ps[1], dst, 0644)
+	case "makelibiigs":
+		return e.runMakeLib(args)
+	case "reziigs", "dereziigs", "expressiigs",
 		"pascaliigs", "ciigs", "tmlpascal", "asmmatiigs":
 		return fmt.Errorf("%s: not implemented yet", name)
+
+	// ---- the Aristotle display.0 patch (make.aristotle) ----
+	// PatchTool is a MAC-side MPW C tool whose whole job is three writes
+	// (NetBoot/AristotlePatch/main.c); its build chain (the 68K "C" and
+	// "Link") only exists to produce it, so stub those and do the patch
+	// natively when the tool is invoked.
+	case "c":
+		for _, a := range args {
+			if !strings.HasPrefix(a, "-") {
+				return os.WriteFile(e.HostPath(a)+".o", nil, 0644)
+			}
+		}
+		return nil
+	case "link":
+		for i := 0; i < len(args); i++ {
+			if strings.ToLower(args[i]) == "-o" && i+1 < len(args) {
+				return os.WriteFile(e.HostPath(args[i+1]), nil, 0644)
+			}
+		}
+		return nil
+	}
+	if strings.EqualFold(filepath.Base(strings.ReplaceAll(name, ":", "/")), "patchtool") {
+		return e.patchTool(args)
 	}
 	return fmt.Errorf("unknown command %q", name)
+}
+
+// patchTool reimplements NetBoot/AristotlePatch/main.c: patch the jump at
+// offset 1 to CodeAddr $6B92, stamp version "1.0.1 " at $5DB0, and copy the
+// patch code over the file starting at $6392.
+func (e *Env) patchTool(args []string) error {
+	var ps []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			ps = append(ps, e.HostPath(a))
+		}
+	}
+	if len(ps) != 2 {
+		return fmt.Errorf("patchtool: need oldfile and patchfile")
+	}
+	old, err := os.ReadFile(ps[0])
+	if err != nil {
+		return err
+	}
+	patch, err := os.ReadFile(ps[1])
+	if err != nil {
+		return err
+	}
+	const codeAddr, versionLoc, codeOffset = 0x6B92, 0x5DB0, 0x6392
+	if need := codeOffset + len(patch); need > len(old) {
+		old = append(old, make([]byte, need-len(old))...)
+	}
+	old[1] = byte(codeAddr & 0xFF)
+	old[2] = byte(codeAddr >> 8)
+	copy(old[versionLoc:], "1.0.1 ")
+	copy(old[codeOffset:], patch)
+	return os.WriteFile(ps[0], old, 0644)
 }
 
 // logAsm appends one assembly to the file named by MPWMK_TOOLLOG, with every
@@ -256,6 +351,7 @@ func (e *Env) linkSel(a string) (link.Sel, error) {
 
 func (e *Env) runLink(args []string) error {
 	var inputs []string
+	var libs []string
 	var output string
 	var groups []link.Group
 	var log []string
@@ -275,7 +371,11 @@ func (e *Env) runLink(args []string) error {
 		case "-apw":
 			apw = true
 			log = append(log, "-apw")
-		case "-t", "-at", "-org", "-lib", "-s":
+		case "-lib":
+			i++
+			libs = append(libs, e.HostPath(args[i]))
+			log = append(log, "-lib", e.HostPath(args[i]))
+		case "-t", "-at", "-org", "-s":
 			i++ // consume the option's argument (type/aux stamping is metadata)
 		case "-x":
 			express = false // no ~ExpressLoad segment
@@ -328,6 +428,20 @@ func (e *Env) runLink(args []string) error {
 		}
 		objs = append(objs, f)
 	}
+	// "-lib X.lib": pull the library segments the objects need
+	for _, p := range libs {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		f, err := omf.Parse(data)
+		if err != nil {
+			return fmt.Errorf("linkiigs %s: %w", filepath.Base(p), err)
+		}
+		if sel := link.SelectLib(objs, f); sel != nil {
+			objs = append(objs, sel)
+		}
+	}
 	res, err := link.LinkOpts(objs, express)
 	if err != nil {
 		return fmt.Errorf("linkiigs: %w", err)
@@ -361,6 +475,11 @@ func (e *Env) runMakeBin(args []string) error {
 			}
 			input = e.HostPath(a)
 		}
+	}
+	if output == "" {
+		// "MakeBinIIGS file" with no -o converts the load file IN PLACE
+		// (make.atinit does this to ATINIT).
+		output = input
 	}
 	data, err := os.ReadFile(input)
 	if err != nil {

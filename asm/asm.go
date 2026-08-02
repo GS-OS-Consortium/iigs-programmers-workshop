@@ -144,6 +144,12 @@ type asmState struct {
 	// "label DS <record>" can reserve the right size and alias the fields.
 	recSize   map[string]int64
 	recFields map[string]map[string]int64
+	// recEqus marks which recFields entries are EQUates rather than
+	// ds-declared fields: an instance ("label ds <rec>", "import
+	// name:<rec>", WITH) aliases a FIELD to instance+offset but an EQU
+	// stays the plain constant. MSDos' "ldy #bpb_size-1" folds to $12 even
+	// under "with bios_parm_block" (oracle-verified).
+	recEqus map[string]map[string]bool
 	recDown   bool // RECORD ...,decrement: fields grow downward
 	// recBare records what the open template's unqualified field names hid,
 	// so ENDR can put it back (see doRecordLine).
@@ -613,6 +619,7 @@ func newState() *asmState {
 		scopeSeg:   -1,
 		recSize:    map[string]int64{},
 		recFields:  map[string]map[string]int64{},
+		recEqus:    map[string]map[string]bool{},
 		entryEqu:   map[string]bool{},
 		loadName:   "main",
 	}
@@ -750,7 +757,11 @@ func (st *asmState) doLine(l line) {
 			st.errf("%s: %v", strings.ToUpper(op), err)
 			return
 		}
-		if v.hasFwd() {
+		// An EQU of an IMPORTed symbol is an alias -- MSDos.Calls does
+		// "check_cluster equ entries_checked" against an Import, and every
+		// reference to the alias reaches the external by name. Only a
+		// forward LOCAL symbol is an error (oracle-probed).
+		if v.hasUnresolvedFwd(st) {
 			st.errf("%s: undefined forward symbol in %q", strings.ToUpper(op), l.rest)
 			return
 		}
@@ -926,6 +937,10 @@ func (st *asmState) doLine(l line) {
 			for f, off := range st.recFields[rec] {
 				v := fwdVal(nm)
 				v.C = off
+				if st.recEqus[rec][f] {
+					// a template EQU is a constant, not an instance field
+					v = num(off)
+				}
 				// file-wide BEFORE defining: define() consults fileWide to
 				// decide whether to scope the key to the current segment
 				st.fileWide[nm+"."+f] = true
@@ -1043,6 +1058,10 @@ func (st *asmState) doLine(l line) {
 					q := st.sym(l.label) + "." + f
 					if st.cur.kind&0x1F == 0x01 {
 						st.fileWide[q] = true
+					}
+					if st.recEqus[rec][f] {
+						st.define(q, num(off))
+						continue
 					}
 					st.define(q, segVal(st.curSegIndex(), base+off))
 				}
@@ -1341,6 +1360,23 @@ func (st *asmState) doRecordLine(op string, l line) {
 		case "ds.l":
 			size = 4
 		}
+		// "MSDos_stuff ds msdos_vcr" nests one template inside another:
+		// it reserves the inner template's size and aliases its fields as
+		// label.field at the current offset.
+		if rec := st.sym(st.operandField(l.rest)); st.recSize[rec] != 0 {
+			base := st.recPC
+			if l.label != "" {
+				for f, off := range st.recFields[rec] {
+					if st.recEqus[rec][f] {
+						defField(st.sym(l.label)+"."+f, num(off))
+						continue
+					}
+					defField(st.sym(l.label)+"."+f, num(base+off))
+				}
+			}
+			st.recField(l.label, st.recSize[rec], defField)
+			return
+		}
 		n, err := evalNum(st.operandField(l.rest), &exprCtx{st: st})
 		if err != nil {
 			st.errf("RECORD DS: %v", err)
@@ -1358,6 +1394,12 @@ func (st *asmState) doRecordLine(op string, l line) {
 		// DP.a ends with "dir_page_size equ *" and Data.a reserves
 		// "DirectPage.dir_page_size+2" bytes from it.
 		defField(l.label, v)
+		if st.recName != "" && l.label != "" {
+			if st.recEqus[st.recName] == nil {
+				st.recEqus[st.recName] = map[string]bool{}
+			}
+			st.recEqus[st.recName][st.sym(l.label)] = true
+		}
 		return
 	case "", "anop":
 		if l.label != "" {
