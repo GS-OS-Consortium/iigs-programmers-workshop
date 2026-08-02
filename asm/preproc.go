@@ -353,6 +353,13 @@ func (pp *ppState) processLine(raw string) {
 	switch op {
 	case "if":
 		if !pp.active() {
+			// "IF cond GOTO .sym" opens no block even when skipped: mlisrc's
+			// "if 0 then" region contains one, and pushing a frame for it
+			// made the region's ENDIF pop the wrong conditional and swallow
+			// the rest of the file.
+			if _, _, ok := splitIfGoto(l.rest); ok {
+				return
+			}
 			pp.conds = append(pp.conds, condFrame{parentActive: false})
 			return
 		}

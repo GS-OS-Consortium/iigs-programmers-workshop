@@ -70,16 +70,22 @@ func evalNumLenient(s string, ctx *exprCtx) (int64, error) {
 	return 0, fmt.Errorf("expression must be constant: %q", s)
 }
 
-// evalNum evaluates and requires a plain numeric result.
+// evalNum evaluates and requires a plain numeric result. A pair of
+// published labels in the CURRENT segment folds here like any other
+// same-segment difference (mlisrc's "if exit-procstart = $A0" -- exit is
+// ENTRY'd, and cancel() defers published pairs for pass 2's benefit).
 func evalNum(s string, ctx *exprCtx) (int64, error) {
 	v, err := evalExpr(s, ctx)
 	if err != nil {
 		return 0, err
 	}
+	if !v.isNum() && ctx.st != nil && ctx.st.cur != nil {
+		v = v.cancelForSeg(ctx.st.curSegIndex())
+	}
 	if !v.isNum() {
 		return 0, fmt.Errorf("expression must be constant: %q", s)
 	}
-	return v.C, nil
+	return applyPost(v.C, v.Post), nil
 }
 
 func (p *exprParser) skipWS() {
@@ -222,6 +228,17 @@ func (p *exprParser) parseBitwise() (Val, error) {
 			if v, err = numOrDefer("++", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
 				return Val{}, err
 			}
+		case p.peek() == '|' && p.peek2() != "||":
+			// '|' mid-expression is bitwise OR at this same loosest level:
+			// atp_includes' "and #atpxobit|7" and "#8|7+1" = 8 (oracle-probed)
+			p.pos++
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("|", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+				return Val{}, err
+			}
 		case p.peek2() == "**": // bitwise AND (MPW asm)
 			p.pos += 2
 			r, err := p.parseShift()
@@ -281,6 +298,17 @@ func (p *exprParser) parseMul() (Val, error) {
 	for {
 		p.skipWS()
 		switch {
+		case p.peek() == '|' && p.peek2() != "||":
+			// '|' mid-expression is bitwise OR at this same loosest level:
+			// atp_includes' "and #atpxobit|7" and "#8|7+1" = 8 (oracle-probed)
+			p.pos++
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("|", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+				return Val{}, err
+			}
 		case p.peek2() == "**": // bitwise AND (MPW asm)
 			p.pos += 2
 			r, err := p.parseUnary()

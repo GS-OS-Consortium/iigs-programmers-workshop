@@ -755,6 +755,12 @@ func (st *asmState) doLine(l line) {
 			return
 		}
 		v = v.foldPub()
+		// An EQU yields an absolute: apply deferred trailing constants now
+		// (Cache's "c_data_len equ end_of_data-start_of_data-1", where the
+		// published pair folds and the -1 rode along as a Post op).
+		if v.isNum() && len(v.Post) > 0 {
+			v = num(applyPost(v.C, v.Post))
+		}
 		if op == "set" {
 			st.redefine(l.label, v)
 			return
@@ -772,7 +778,8 @@ func (st *asmState) doLine(l line) {
 			}
 		}
 		if u := st.sym(l.label); st.entryEqu[u] && v.isNum() {
-			rec := gequRec(u, st.entryPriv[u], v.C)
+			// deferred trailing constants (Cache's "end-start-1") apply here
+			rec := gequRec(u, st.entryPriv[u], applyPost(v.C, v.Post))
 			if st.cur == nil && len(st.segs) == 0 {
 				st.pendingRecs = append(st.pendingRecs, rec)
 			} else {
