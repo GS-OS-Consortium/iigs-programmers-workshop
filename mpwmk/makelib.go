@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dagenbrock/iigs-tools/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/omf"
 )
 
 // runMakeLib reimplements MakeLibIIGS ("-l lib -r member.obj ..."), verified

@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dagenbrock/iigs-tools/link"
-	"github.com/dagenbrock/iigs-tools/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/link"
+	"github.com/dagenbrock/iigs-programmers-workshop/omf"
 )
 
 func main() {

@@ -1,7 +1,7 @@
 package link
 
 import (
-	"github.com/dagenbrock/iigs-tools/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/omf"
 )
 
 // libHash is LinkIIGS's symbol-table hash: h = (h*2 + c) mod 512 over the

@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dagenbrock/iigs-tools/asm"
-	"github.com/dagenbrock/iigs-tools/link"
-	"github.com/dagenbrock/iigs-tools/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/asm"
+	"github.com/dagenbrock/iigs-programmers-workshop/link"
+	"github.com/dagenbrock/iigs-programmers-workshop/omf"
 )
 
 // dispatch runs one command: MPW built-ins and the IIgs cross tools.

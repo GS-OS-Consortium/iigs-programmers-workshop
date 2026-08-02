@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dagenbrock/iigs-tools/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/omf"
 )
 
 func main() {

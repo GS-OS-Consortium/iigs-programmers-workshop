@@ -1,4 +1,4 @@
-module github.com/dagenbrock/iigs-tools
+module github.com/dagenbrock/iigs-programmers-workshop
 
 go 1.25.5
 

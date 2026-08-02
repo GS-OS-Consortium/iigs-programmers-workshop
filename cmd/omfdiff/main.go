@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/dagenbrock/iigs-tools/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/omf"
 )
 
 var diffs int

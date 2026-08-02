@@ -19,7 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dagenbrock/iigs-tools/mpwmk"
+	"github.com/dagenbrock/iigs-programmers-workshop/mpwmk"
 )
 
 type multi []string

@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/dagenbrock/iigs-tools/asm"
+	"github.com/dagenbrock/iigs-programmers-workshop/asm"
 )
 
 func main() {
