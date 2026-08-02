@@ -894,10 +894,12 @@ func (st *asmState) doLine(l line) {
 		}
 		return
 	case "ds", "ds.b", "ds.w", "ds.l":
-		size := int64(1)
+		// A bare DS counts WORDS, not bytes: the device dispatcher reserves
+		// its 32-character replacement name with "ds 32" and gets 64 bytes.
+		size := int64(2)
 		switch op {
-		case "ds.w":
-			size = 2
+		case "ds.b":
+			size = 1
 		case "ds.l":
 			size = 4
 		}
@@ -1177,10 +1179,12 @@ func (st *asmState) doRecordLine(op string, l line) {
 		st.recPC = v
 		return
 	case "ds", "ds.b", "ds.w", "ds.l":
-		size := int64(1)
+		// A bare DS counts WORDS, not bytes: the device dispatcher reserves
+		// its 32-character replacement name with "ds 32" and gets 64 bytes.
+		size := int64(2)
 		switch op {
-		case "ds.w":
-			size = 2
+		case "ds.b":
+			size = 1
 		case "ds.l":
 			size = 4
 		}

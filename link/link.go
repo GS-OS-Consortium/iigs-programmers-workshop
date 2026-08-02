@@ -15,12 +15,12 @@ import (
 type objSeg struct {
 	name string
 	base int64 // offset within the merged load segment image
-	// abs is the load segment's ORG when it is absolute. A symbol in an
-	// absolute load segment resolves to a fixed address, which is the only
-	// way a reference from ANOTHER load segment can be right: the loader is
-	// two of them, 'Loader' at $01A5D0 and 'Loader_LC' at $01CFD0, and
-	// resolving across them against the referrer's own org put every such
-	// call $2A00 out.
+	// abs is this object segment's absolute run address, or 0 if it floats
+	// with the load address. Two things fix an address: an absolute load
+	// segment (the loader is two of them, 'Loader' at $01A5D0 and
+	// 'Loader_LC' at $01CFD0 -- resolving across them against the referrer's
+	// own org put every such call $2A00 out), and a TEMPORG segment, which is
+	// assembled for the address it will be copied to and run at.
 	abs int64
 	seg *omf.Segment
 }
@@ -58,7 +58,13 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	for _, f := range objs {
 		for i := range f.Segments {
 			s := &f.Segments[i]
-			os := &objSeg{name: s.SegName, base: int64(len(image)), seg: s}
+			// A TEMPORG segment is assembled for the address it will be
+			// copied to and run at, so references into it are absolute and
+			// need no relocation record. AD3.5's read1to1 is built for
+			// $01BC00 and moved there before use; relocating its nibble
+			// reader at load time left it spinning on the data register.
+			os := &objSeg{name: s.SegName, base: int64(len(image)),
+				abs: int64(s.TempOrg), seg: s}
 			segs = append(segs, os)
 			byName[s.SegName] = os
 			if len(segs) == 1 {
@@ -71,7 +77,12 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 			}
 			// Record GLOBAL (ENTRY/EXPORT) definitions at their offsets in
 			// the merged image so expressions can reference them by name.
+			// A TEMPORG segment's symbols are fixed addresses instead.
 			off := os.base
+			into := globals
+			if os.abs != 0 {
+				off, into = os.abs, absolutes
+			}
 			for _, r := range s.Records {
 				switch {
 				case r.Op >= 0x01 && r.Op <= 0xDF:
@@ -85,7 +96,7 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 					off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 				case r.Op == omf.RecGlobal:
 					n := int(r.Raw[1])
-					globals[string(r.Raw[2:2+n])] = off
+					into[string(r.Raw[2:2+n])] = off
 				case r.Op == omf.RecGequ:
 					// "EXPORT name:EQU" publishes a constant rather than a
 					// location, so its value is absolute, not image-relative.
@@ -273,7 +284,7 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes ma
 			pos += 1 + n
 			if os, ok := byName[name]; ok {
 				if os.abs != 0 {
-					push(os.base+os.abs, 0)
+					push(os.abs, 0)
 				} else {
 					push(os.base, 1)
 				}
@@ -572,7 +583,11 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 					pos = int64(s.Org) - b.org
 					at = pos
 				}
-				os := &objSeg{name: s.SegName, base: at, abs: b.org, seg: s}
+				absAt := int64(0)
+				if b.org != 0 {
+					absAt = b.org + at
+				}
+				os := &objSeg{name: s.SegName, base: at, abs: absAt, seg: s}
 				segs = append(segs, os)
 				byName[s.SegName] = os
 				img, err := segImage(s)
@@ -582,8 +597,8 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 				// In an absolute load segment a published symbol has a fixed
 				// address, so record it as one.
 				symBase, into := os.base, globals
-				if b.org != 0 {
-					symBase, into = os.base+b.org, absolutes
+				if os.abs != 0 {
+					symBase, into = os.abs, absolutes
 				}
 				if err := collectSymbols(s, symBase, into, absolutes); err != nil {
 					return nil, err
