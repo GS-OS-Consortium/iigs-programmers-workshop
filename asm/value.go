@@ -22,11 +22,24 @@ type term struct {
 	// pub marks a reference to a published (ENTRY/EXPORT) symbol other than a
 	// segment's own label.
 	pub bool
-	// litDisp is a literal addend that stood directly after this term in the
-	// source ("lst_rslt_scode+2-lst_rslt_ec"). The one-pass original emits
-	// expression operands in source order, so the +2 belongs to scode's
-	// operand (label, 2, add), not after the subtraction.
-	litDisp int64
+	// viaWith marks a binding made through a WITH instance; it is final --
+	// pass 2 must not rebind it to a same-name local label (pascal.fst's
+	// p_create_date stores to the GLOBALS field temp under "WITH globals"
+	// even though the PROC defines its own temp further down).
+	viaWith bool
+	// byName marks a reference the one-pass original emitted BY NAME because
+	// its binding at reference time was cross-segment, even though the final
+	// (published) definition is in the referencing segment. ProDOS.FST's
+	// get_write_blk does "jsr clear_index" before its own published
+	// clear_index label, while an earlier segment already defined one.
+	byName bool
+	// lits are literal addends that stood directly after this term in the
+	// source ("lst_rslt_scode+2-lst_rslt_ec"), in order, negative meaning
+	// subtracted. The one-pass original emits expression operands in source
+	// order and never merges two source constants once the value is
+	// symbolic, so the +2 belongs to scode's operand (label, 2, add), not
+	// after the subtraction, and "+zeropg_code+2" is two separate adds.
+	lits []int64
 }
 
 // blocksFold reports whether a term keeps a difference of labels from folding
@@ -115,15 +128,21 @@ func (v Val) hasFwd() bool {
 	return false
 }
 
-// cancel removes resolved same-segment pos/neg pairs.
+// cancel removes resolved same-segment pos/neg pairs. A pair naming a
+// PUBLISHED symbol is left alone here: whether it folds depends on where the
+// REFERENCE stands (same segment as the labels: folds, like ud3.5's
+// dib_1-driver_data; another segment: stays a symbolic EXPR, like
+// DOS3.3.FST's "dc.w access - g" table built in fill_param from
+// global_params' fields, oracle-probed) -- and only pass 2 knows the
+// segment. cancelForSeg finishes the job there.
 func (v Val) cancel() Val {
 	pos := append([]term(nil), v.Pos...)
 	var neg []term
 outer:
 	for _, n := range v.Neg {
-		if n.fwd == "" && !n.blocksFold() {
+		if n.fwd == "" && !n.pub && !n.blocksFold() {
 			for i, p := range pos {
-				if p.fwd == "" && p.seg == n.seg && !p.blocksFold() {
+				if p.fwd == "" && p.seg == n.seg && !p.pub && !p.blocksFold() {
 					pos = append(pos[:i], pos[i+1:]...)
 					continue outer
 				}
@@ -133,6 +152,29 @@ outer:
 	}
 	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift,
 		AfterShift: v.AfterShift, ConstFirst: v.ConstFirst}
+}
+
+// cancelForSeg folds the same-segment pairs cancel() deferred, now that the
+// referencing segment is known: a pair of labels in the reference's OWN
+// segment cancels even when published (a forward reference to a published
+// symbol still blocks, per blocksFold).
+func (v Val) cancelForSeg(curSeg int) Val {
+	pos := append([]term(nil), v.Pos...)
+	var neg []term
+outer:
+	for _, n := range v.Neg {
+		if n.fwd == "" && n.seg == curSeg && !n.blocksFold() {
+			for i, p := range pos {
+				if p.fwd == "" && p.seg == curSeg && !p.blocksFold() {
+					pos = append(pos[:i], pos[i+1:]...)
+					continue outer
+				}
+			}
+		}
+		neg = append(neg, n)
+	}
+	return Val{C: v.C, Pos: pos, Neg: neg, Post: v.Post, Shift: v.Shift,
+		AfterShift: v.AfterShift, ConstFirst: v.ConstFirst, defSeq: v.defSeq}
 }
 
 // foldPub cancels pairs that cancel() left alone because they name published
@@ -172,7 +214,7 @@ func (v Val) attachLit(o Val, c int64) (Val, bool) {
 	}
 	r := v
 	r.Pos = append([]term(nil), v.Pos...)
-	r.Pos[0].litDisp += c
+	r.Pos[0].lits = append(append([]int64(nil), r.Pos[0].lits...), c)
 	r.C += c
 	return r, true
 }
@@ -207,14 +249,26 @@ func (v Val) addConst(op byte, c int64) Val {
 }
 
 func (v Val) add(o Val) (Val, error) {
+	// A constant joining a symbolic value keeps its own place in the token
+	// stream: attached to the single positive term when nothing follows it
+	// yet, or as an ordered trailing add otherwise. Two source constants
+	// never merge once the value is symbolic ("+zeropg_code+2" in
+	// SCSIM.Mgmnt is two separate adds, oracle-verified). A shifted value
+	// keeps the AfterShift/ConstFirst path below.
+	if o.isNum() && v.isLabel() && v.Shift == 0 && o.Shift == 0 {
+		if o.C == 0 {
+			return v, nil
+		}
+		if r, ok := v.attachLit(o, o.C); ok {
+			return r, nil
+		}
+		return v.addConst(0x01, o.C), nil
+	}
 	if len(v.Post) > 0 && o.isNum() {
 		if o.C == 0 {
 			return v, nil
 		}
 		return v.addConst(0x01, o.C), nil
-	}
-	if r, ok := v.attachLit(o, o.C); ok {
-		return r, nil
 	}
 	shift, post, err := combine(v, o)
 	if err != nil {
@@ -234,14 +288,20 @@ func (v Val) add(o Val) (Val, error) {
 }
 
 func (v Val) sub(o Val) (Val, error) {
+	if o.isNum() && v.isLabel() && v.Shift == 0 && o.Shift == 0 {
+		if o.C == 0 {
+			return v, nil
+		}
+		if r, ok := v.attachLit(o, -o.C); ok {
+			return r, nil
+		}
+		return v.addConst(0x02, o.C), nil
+	}
 	if len(v.Post) > 0 && o.isNum() {
 		if o.C == 0 {
 			return v, nil
 		}
 		return v.addConst(0x02, o.C), nil
-	}
-	if r, ok := v.attachLit(o, -o.C); ok {
-		return r, nil
 	}
 	shift, post, err := combine(v, o)
 	if err != nil {

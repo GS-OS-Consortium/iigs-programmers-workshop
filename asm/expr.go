@@ -37,7 +37,7 @@ type exprParser struct {
 
 func evalExpr(s string, ctx *exprCtx) (Val, error) {
 	p := &exprParser{s: strings.TrimSpace(s), ctx: ctx}
-	v, err := p.parseShift()
+	v, err := p.parseBitwise()
 	if err != nil {
 		return Val{}, err
 	}
@@ -122,51 +122,9 @@ func (p *exprParser) parseAdd() (Val, error) {
 	for {
 		p.skipWS()
 		switch {
-		case p.peekWord("AND"): // word forms of the bitwise operators
-			p.pos += 3
-			r, err := p.parseMul()
-			if err != nil {
-				return Val{}, err
-			}
-			if v, err = numOrDefer("AND", 0x08, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
-				return Val{}, err
-			}
-		case p.peekWord("OR"):
-			p.pos += 2
-			r, err := p.parseMul()
-			if err != nil {
-				return Val{}, err
-			}
-			if v, err = numOrDefer("OR", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
-				return Val{}, err
-			}
-		case p.peekWord("EOR"), p.peekWord("XOR"):
-			p.pos += 3
-			r, err := p.parseMul()
-			if err != nil {
-				return Val{}, err
-			}
-			if v, err = numOrDefer("EOR", 0x0A, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
-				return Val{}, err
-			}
-		case p.peek2() == "--": // bitwise XOR (MPW asm)
-			p.pos += 2
-			r, err := p.parseMul()
-			if err != nil {
-				return Val{}, err
-			}
-			if v, err = numOrDefer("--", 0x0A, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
-				return Val{}, err
-			}
-		case p.peek2() == "++": // bitwise OR (MPW asm)
-			p.pos += 2
-			r, err := p.parseMul()
-			if err != nil {
-				return Val{}, err
-			}
-			if v, err = numOrDefer("++", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
-				return Val{}, err
-			}
+		case p.peek2() == "++" || p.peek2() == "--":
+			// bitwise OR/XOR belong to parseBitwise, the outermost level
+			return v, nil
 		case p.peek() == '+':
 			p.pos++
 			r, err := p.parseMul()
@@ -206,8 +164,81 @@ func (p *exprParser) absify(v Val) Val {
 	return v
 }
 
-// parseShift is the OUTERMOST binary level: ">>" and "<<" bind more loosely
-// than anything else, taking the whole expression on either side. So
+// parseBitwise is the OUTERMOST binary level: the word-form AND/OR/EOR and
+// their "**"/"++"/"--" spellings bind more loosely than even the shifts.
+// DOS3.3.FST's copy_tbl is "0 ++ copy << 3 ++ copy << 15 ..." and assembles
+// to the OR of the shifted bits, $8008 (oracle-probed) -- with ++ inside the
+// additive level the right shift operand swallowed the rest of the table.
+func (p *exprParser) parseBitwise() (Val, error) {
+	v, err := p.parseShift()
+	if err != nil {
+		return Val{}, err
+	}
+	for {
+		p.skipWS()
+		switch {
+		case p.peekWord("AND"):
+			p.pos += 3
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("AND", 0x08, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peekWord("OR"):
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("OR", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peekWord("EOR"), p.peekWord("XOR"):
+			p.pos += 3
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("EOR", 0x0A, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peek2() == "--": // bitwise XOR (MPW asm)
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("--", 0x0A, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x ^ y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peek2() == "++": // bitwise OR (MPW asm)
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("++", 0x09, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x | y, nil }); err != nil {
+				return Val{}, err
+			}
+		case p.peek2() == "**": // bitwise AND (MPW asm)
+			p.pos += 2
+			r, err := p.parseShift()
+			if err != nil {
+				return Val{}, err
+			}
+			if v, err = numOrDefer("**", 0x08, p.absify(v), p.absify(r), func(x, y int64) (int64, error) { return x & y, nil }); err != nil {
+				return Val{}, err
+			}
+		default:
+			return v, nil
+		}
+	}
+}
+
+// parseShift: ">>" and "<<" bind more loosely than the arithmetic operators,
+// taking the whole additive expression on either side. So
 // "device_name+1>>16" is "(device_name+1)>>16" and "lab>>16+$4000" shifts by
 // 16400 (both oracle-probed).
 func (p *exprParser) parseShift() (Val, error) {
@@ -350,7 +381,7 @@ func (p *exprParser) parseUnary() (Val, error) {
 		return v.negate(), nil
 	case '(':
 		p.pos++
-		v, err := p.parseShift()
+		v, err := p.parseBitwise()
 		if err != nil {
 			return Val{}, err
 		}

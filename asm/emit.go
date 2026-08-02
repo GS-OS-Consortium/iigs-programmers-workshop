@@ -97,9 +97,10 @@ func (e *segEmitter) expr(rec byte, size int, segName string, disp int64, shift 
 type termRef struct {
 	name string
 	disp int64
-	// lit is a literal addend the source wrote directly after this operand
-	// (term.litDisp); it is emitted with the operand, in source order.
-	lit int64
+	// lits are literal addends the source wrote directly after this operand
+	// (term.lits); each is emitted with the operand, in source order,
+	// negative meaning subtracted.
+	lits []int64
 }
 
 // exprGeneral emits a general EXPR record for a value that does not reduce
@@ -177,12 +178,14 @@ func exprBody(pos, neg []termRef, c int64, post []postOp) []byte {
 			body = append(body, 0x01)
 		}
 		// a negative addend is pushed positive and subtracted
-		if t.lit > 0 {
-			pushConst(t.lit)
-			body = append(body, 0x01)
-		} else if t.lit < 0 {
-			pushConst(-t.lit)
-			body = append(body, 0x02)
+		for _, l := range t.lits {
+			if l > 0 {
+				pushConst(l)
+				body = append(body, 0x01)
+			} else if l < 0 {
+				pushConst(-l)
+				body = append(body, 0x02)
+			}
 		}
 	}
 	first := true
@@ -293,8 +296,8 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					r.Pos[0].defSeq = r.defSeq
 					r.Pos[0].pub = st.publishedAt(r.Pos[0])
 					r.Pos[0].viaFwd = true
-					// the literal addend rides the term; v.C already has it
-					r.Pos[0].litDisp += t.litDisp
+					// the literal addends ride the term; v.C already has them
+					r.Pos[0].lits = append(append([]int64(nil), r.Pos[0].lits...), t.lits...)
 				}
 				tv = r
 			} else {
@@ -329,8 +332,12 @@ func (st *asmState) termRefs(ts []term, curSeg int) ([]termRef, int64) {
 	var covered int64
 	for _, t := range ts {
 		n, d := st.exprRef(t, t.symOff, curSeg)
-		out = append(out, termRef{name: n, disp: d, lit: t.litDisp})
-		covered += t.symOff + t.litDisp
+		lit := int64(0)
+		for _, l := range t.lits {
+			lit += l
+		}
+		out = append(out, termRef{name: n, disp: d, lits: t.lits})
+		covered += t.symOff + lit
 	}
 	return out, covered
 }
@@ -381,13 +388,16 @@ func (st *asmState) preferLocal(v Val, curSeg int) Val {
 		return v
 	}
 	t := v.Pos[0]
-	if t.name == "" || t.fwd != "" || t.seg == curSeg {
+	if t.name == "" || t.fwd != "" || t.seg == curSeg || t.viaWith {
 		return v
 	}
 	defs := st.symSeq[fmt.Sprintf("%d\x00", curSeg)+t.name]
 	for _, d := range defs {
 		if len(d.Pos) == 1 && len(d.Neg) == 0 && d.Pos[0].seg == curSeg {
-			nt := term{seg: curSeg, name: t.name, symOff: d.C, defSeq: d.defSeq}
+			// The pass-1 binding was cross-segment, so the one-pass original
+			// had already emitted the reference by name (see term.byName).
+			nt := term{seg: curSeg, name: t.name, symOff: d.C, defSeq: d.defSeq,
+				byName: true}
 			nt.pub = st.publishedAt(nt)
 			return Val{C: d.C, Pos: []term{nt}, Post: v.Post, Shift: v.Shift}
 		}
@@ -437,7 +447,7 @@ func (st *asmState) exprRef(t term, c int64, curSeg int) (string, int64) {
 	if published && t.seg != curSeg {
 		return t.name, c - t.symOff
 	}
-	if st.publishedAt(t) && t.viaFwd {
+	if st.publishedAt(t) && (t.viaFwd || t.byName) {
 		return t.name, c - t.symOff
 	}
 	return st.segs[t.seg].name, c
@@ -491,6 +501,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			t = st.preferLocal(t, segIdx)
+			t = t.cancelForSeg(segIdx)
 			if !t.isNum() && st.branchDeferred(t, segIdx) {
 				pos, gained := st.termRefs(t.Pos, segIdx)
 				neg, lost := st.termRefs(t.Neg, segIdx)
@@ -500,9 +511,9 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			var disp int64
 			if t.isNum() {
 				// branch to an absolute constant: relative to org-based pc
-				disp = t.C - (seg.org + a.pcNext)
+				disp = applyPost(t.C, t.Post) - (seg.org + a.pcNext)
 			} else {
-				disp = t.C - a.pcNext
+				disp = applyPost(t.C, t.Post) - a.pcNext
 			}
 			if a.size == 1 {
 				if (disp < -128 || disp > 127) && os.Getenv("ASMIIGS_SLOPPY_BRANCH") == "" {
@@ -525,6 +536,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			t = st.preferLocal(t, segIdx)
+			t = t.cancelForSeg(segIdx)
 			if t.isNum() {
 				c := applyShift(applyPost(t.C, t.Post), a.shift)
 				var b []byte
@@ -555,6 +567,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			t = st.preferLocal(t, segIdx)
+			t = t.cancelForSeg(segIdx)
 			if t.isNum() {
 				// resolved to a constant after all (e.g. forward EQU)
 				c := applyShift(applyPost(t.C, t.Post), a.shift)
@@ -583,6 +596,6 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 		}
 	}
 	return &Segment{Name: seg.name, LoadName: seg.loadName, Org: seg.org, Kind: seg.kind, KindSet: seg.kindSet,
-		Skip: seg.skip, TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
+		Skip: seg.skip, Align: seg.align, TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
 		Length: seg.endPC, Records: e.end()}, nil
 }

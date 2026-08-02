@@ -60,6 +60,10 @@ type segState struct {
 	skip       bool   // OMF KIND SKIP bit ($0200), from the sticky PROC SKIP mode
 	actions    []action
 	endPC      int64
+	// storage marks the one-line data segment a file-scope storage
+	// declaration opens; the NEXT storage line must open its own, not
+	// resume this one.
+	storage bool
 }
 
 // bareField remembers a symbol a RECORD template's field name shadowed.
@@ -234,7 +238,12 @@ func (st *asmState) lookup(name string) Val {
 	// EXPORTed ones must still emit by name, not as DATA+offset.
 	for i := len(st.withs) - 1; i >= 0; i-- {
 		if v, ok := st.syms[st.withs[i]+"."+name]; ok {
-			return tag(v)
+			v = tag(v)
+			if len(v.Pos) == 1 {
+				v.Pos = append([]term(nil), v.Pos...)
+				v.Pos[0].viaWith = true
+			}
+			return v
 		}
 	}
 	scope := st.scopePrefix()
@@ -458,6 +467,65 @@ func (st *asmState) operandField(s string) string {
 		}
 	}
 	return strings.TrimRight(s, " \t")
+}
+
+// dcOperand cuts a DC item list from the rest of a line. DC operands end at
+// the first blank outside quotes even under BLANKS ON ("DC.L ctree_idx_rec
+// 'ptr to..." carries a bare comment opening with an apostrophe,
+// oracle-verified in hfs.fst.main) -- EXCEPT that the expression continues
+// when an operator adjoins the blank on either side: DOS3.3.FST builds its
+// fill_param tables with "dc.w access<tab>- g". Under BLANKS OFF the plain
+// first-blank rule applies.
+func (st *asmState) dcOperand(s string) string {
+	if st.blanksOff {
+		return operandOnly(s)
+	}
+	inStr := false
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			inStr = !inStr
+		case '(', '[':
+			if !inStr {
+				depth++
+			}
+		case ')', ']':
+			if !inStr {
+				depth--
+			}
+		case ' ', '\t':
+			if inStr || depth != 0 {
+				continue
+			}
+			// last real character before the blanks
+			j := i
+			for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t') {
+				j--
+			}
+			if j > 0 && continuesOperand(s[j-1]) {
+				continue
+			}
+			// first real character after the blanks
+			k := i
+			for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
+				k++
+			}
+			// "++"/"--"/"**"/"<<" are the word-form OR/XOR/AND and shift
+			// operators, so a doubled character continues too (DOS3.3's
+			// copy_tbl is "dc.w 0 ++ \" continued over 16 "copy << n ++"
+			// lines).
+			if k < len(s) && strings.IndexByte("+-*/&|^<>=", s[k]) >= 0 {
+				continue
+			}
+			return s[:i]
+		case ';':
+			if !inStr {
+				return strings.TrimRight(s[:i], " \t")
+			}
+		}
+	}
+	return s
 }
 
 // continuesOperand reports whether an operand ending in c is incomplete, so
@@ -954,17 +1022,22 @@ func (st *asmState) doLine(l line) {
 		case "ds.l":
 			size = 4
 		}
-		if l.label != "" {
+		if !st.storageLine(l.label) && l.label != "" {
 			st.defineCodeLabel(l.label)
 		}
 		// "POpen ds openParms" reserves one instance of a RECORD template and
-		// makes its fields reachable as POpen.field.
+		// makes its fields reachable as POpen.field. In a data segment the
+		// qualified names stay file-wide (the Loader reads Header.DispName
+		// from its Globals record across segments), like RECORD.FIELD.
 		if rec := st.sym(st.operandField(l.rest)); st.recSize[rec] != 0 {
 			base := st.pc
 			if l.label != "" {
 				for f, off := range st.recFields[rec] {
-					st.define(st.sym(l.label)+"."+f,
-						segVal(st.curSegIndex(), base+off))
+					q := st.sym(l.label) + "." + f
+					if st.cur.kind&0x1F == 0x01 {
+						st.fileWide[q] = true
+					}
+					st.define(q, segVal(st.curSegIndex(), base+off))
 				}
 			}
 			st.addAction(action{kind: aDS, count: st.recSize[rec]})
@@ -1062,9 +1135,27 @@ func (st *asmState) openSegment(seg *segState) {
 	st.pendingRecs = nil
 	// The segment's own label names it, so the label stays visible to the
 	// whole file even though the labels inside it do not.
-	st.fileWide[seg.name] = true
-	st.segNames[seg.name] = true
-	st.define(seg.name, segVal(st.curSegIndex(), 0))
+	if seg.name != "" {
+		st.fileWide[seg.name] = true
+		st.segNames[seg.name] = true
+		st.define(seg.name, segVal(st.curSegIndex(), 0))
+	}
+}
+
+// storageLine opens the one-line data segment a file-scope storage
+// declaration gets. Every "label ds n" (or dc/dcb) between PROCs is its OWN
+// KIND $4001 segment named by its label -- "" when unlabeled -- and the next
+// storage line opens another; nothing is appended to the previous segment
+// (oracle-probed; DOS3.3.FST includes DOS.FST.storage between two PROCs and
+// its references resolve segment by segment). Returns true when it opened
+// one, in which case the label is already defined as the segment name.
+func (st *asmState) storageLine(label string) bool {
+	if st.ended || (st.cur != nil && !st.cur.storage) {
+		return false
+	}
+	st.openSegment(&segState{name: st.sym(label), loadName: st.loadName,
+		imports: map[string]bool{}, kind: 0x4001, kindSet: true, storage: true})
+	return true
 }
 
 func (st *asmState) defineCodeLabel(name string) {
@@ -1329,7 +1420,7 @@ func (st *asmState) emitBytes(b ...byte) {
 // ---------- DC / DCB ----------
 
 func (st *asmState) doDC(op string, l line) {
-	if l.label != "" {
+	if !st.storageLine(l.label) && l.label != "" {
 		st.defineCodeLabel(l.label)
 	}
 	size := 1
@@ -1344,8 +1435,9 @@ func (st *asmState) doDC(op string, l line) {
 	// The operand field ends at the first blank outside a quoted string, so a
 	// bare trailing comment is not part of it -- these sources contain typos
 	// like "DC.L ctree_idx_rec  'ptr to ..." where the comment opens with a
-	// quote instead of a semicolon.
-	for _, item := range splitArgs(operandOnly(l.rest)) {
+	// quote instead of a semicolon. An adjoining operator continues the
+	// expression past the blank (see dcOperand).
+	for _, item := range splitArgs(st.dcOperand(l.rest)) {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
@@ -1364,6 +1456,9 @@ func (st *asmState) doDC(op string, l line) {
 			}
 			if st.strMode == "PASCAL" {
 				b = append([]byte{byte(len(b))}, b...)
+			} else if st.strMode == "C" {
+				// STRING C: NUL-terminated (DOS3.3.FST's volume name table)
+				b = append(b, 0)
 			}
 			st.emitBytes(b...)
 			continue
@@ -1415,7 +1510,7 @@ func (st *asmState) exprRecFor(mn string, chosen Mode, n int) byte {
 }
 
 func (st *asmState) doDCB(op string, l line) {
-	if l.label != "" {
+	if !st.storageLine(l.label) && l.label != "" {
 		st.defineCodeLabel(l.label)
 	}
 	args := splitArgs(l.rest)
@@ -1645,19 +1740,29 @@ func (st *asmState) doInst(mn, operand string) {
 
 	if chosen == Move {
 		// MVN/MVP src,dst: operands are addresses; bank bytes emitted as
-		// opcode, dstbank, srcbank (oracle-verified).
+		// opcode, dstbank, srcbank (oracle-verified). A relocatable operand
+		// (AppleDisk5.25's "mvn xtra_dstat1,dstat1") emits a 1-byte LEXPR of
+		// label >> 16 -- the linker extracts the bank.
 		parts := splitArgs(exprStr)
 		if len(parts) != 2 {
 			st.errf("%s: need two operands", mn)
 			return
 		}
-		src, err1 := evalNumLenient(parts[0], &exprCtx{st: st})
-		dst, err2 := evalNumLenient(parts[1], &exprCtx{st: st})
-		if err1 != nil || err2 != nil {
-			st.errf("%s: bad operands", mn)
-			return
+		st.emitBytes(info.code)
+		for _, p := range [2]string{parts[1], parts[0]} { // dst first
+			v, err := evalExpr(p, &exprCtx{st: st})
+			if err != nil {
+				st.errf("%s: bad operands", mn)
+				return
+			}
+			if v.isNum() {
+				st.emitBytes(byte(v.C >> 16))
+				continue
+			}
+			st.addAction(action{kind: aExpr, target: v, size: 1,
+				rec: recLexpr, shift: -16 + v.Shift})
+			st.pc++
 		}
-		st.emitBytes(info.code, byte(dst>>16), byte(src>>16))
 		return
 	}
 

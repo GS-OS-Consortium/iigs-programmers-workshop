@@ -13,6 +13,7 @@ type Segment struct {
 	Kind       uint16 // OMF KIND: $4000 private code, $4001 private data
 	KindSet    bool   // Kind is explicit, so a zero value means KIND $0000
 	Skip       bool   // KIND SKIP bit ($0200), set by the sticky PROC SKIP mode
+	Align      int64  // PROC ALIGN n (segment alignment), 0 = none
 	Length     int64
 	Records    []byte
 }
@@ -68,7 +69,7 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	}
 	le.PutUint16(hdr[0x14:], kind)          // KIND
 	le.PutUint32(hdr[0x18:], uint32(s.Org)) // ORG
-	le.PutUint32(hdr[0x1C:], 0)             // ALIGN
+	le.PutUint32(hdr[0x1C:], uint32(s.Align)) // ALIGN
 	hdr[0x20] = 0                           // NUMSEX
 	if s.HasTempOrg {
 		hdr[0x21] = 1 // v2.1 marker (oracle-verified)

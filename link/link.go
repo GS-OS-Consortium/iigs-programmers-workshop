@@ -23,6 +23,16 @@ type objSeg struct {
 	// assembled for the address it will be copied to and run at.
 	abs int64
 	seg *omf.Segment
+	// fileSegs maps segment names to segments of the SAME object file. A
+	// label reference resolves there first: the four ATALK objects each
+	// carry a DISP_TABLE whose LEXPRs name their OWN startup/open/read
+	// segments, and a flat last-wins map pointed rpm's table at others'.
+	// fileGlobals/fileAbs are the same-file GLOBAL and GEQU symbols: three
+	// of the ATALK objects publish a SUP_NUM, and each one's code reads its
+	// own.
+	fileSegs    map[string]*objSeg
+	fileGlobals map[string]int64
+	fileAbs     map[string]int64
 }
 
 type relocPatch struct {
@@ -55,7 +65,11 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	var image []byte
 	var org int64
 	var kind uint16 = 0x4000
+	var align int64 // load segment ALIGN = max member alignment
 	for _, f := range objs {
+		fileSegs := map[string]*objSeg{}
+		fileGlobals := map[string]int64{}
+		fileAbs := map[string]int64{}
 		for i := range f.Segments {
 			s := &f.Segments[i]
 			// A TEMPORG segment is assembled for the address it will be
@@ -63,10 +77,22 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 			// need no relocation record. AD3.5's read1to1 is built for
 			// $01BC00 and moved there before use; relocating its nibble
 			// reader at load time left it spinning on the data register.
+			// an ALIGNed object segment is padded out to its boundary
+			// (AppleDisk5.25 page-aligns its IWM code with "PROC ALIGN 256")
+			if a := int64(s.Align); a > 0 {
+				if int64(len(image))%a != 0 {
+					image = append(image, make([]byte, a-int64(len(image))%a)...)
+				}
+				if a > align {
+					align = a
+				}
+			}
 			os := &objSeg{name: s.SegName, base: int64(len(image)),
-				abs: int64(s.TempOrg), seg: s}
+				abs: int64(s.TempOrg), seg: s, fileSegs: fileSegs,
+				fileGlobals: fileGlobals, fileAbs: fileAbs}
 			segs = append(segs, os)
 			byName[s.SegName] = os
+			fileSegs[s.SegName] = os
 			if len(segs) == 1 {
 				org = int64(s.Org)
 				kind = s.Kind
@@ -97,6 +123,11 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 				case r.Op == omf.RecGlobal:
 					n := int(r.Raw[1])
 					into[string(r.Raw[2:2+n])] = off
+					if os.abs == 0 {
+						fileGlobals[string(r.Raw[2:2+n])] = off
+					} else {
+						fileAbs[string(r.Raw[2:2+n])] = off
+					}
 				case r.Op == omf.RecGequ:
 					// "EXPORT name:EQU" publishes a constant rather than a
 					// location, so its value is absolute, not image-relative.
@@ -106,6 +137,7 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 						return nil, fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
 					}
 					absolutes[string(r.Raw[2:2+n])] = v
+					fileAbs[string(r.Raw[2:2+n])] = v
 				}
 			}
 			image = append(image, img...)
@@ -166,9 +198,9 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	}
 
 	if !express {
-		return loadSegment(mainName, 1, image, org, kind, patches), nil
+		return loadSegment(mainName, 1, image, org, kind, align, patches), nil
 	}
-	return buildLoadFile(image, org, kind, patches)
+	return buildLoadFile(image, org, kind, align, patches)
 }
 
 // segImage extracts the raw code image of an object segment (expression
@@ -282,6 +314,26 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes ma
 			n := int(b[pos])
 			name := string(b[pos+1 : pos+1+n])
 			pos += 1 + n
+			// the referencing object file's own segments and published
+			// symbols win over same-named ones from other files
+			if cur != nil && cur.fileSegs != nil {
+				if os, ok := cur.fileSegs[name]; ok {
+					if os.abs != 0 {
+						push(os.abs, 0)
+					} else {
+						push(os.base, 1)
+					}
+					continue
+				}
+				if off, ok := cur.fileGlobals[name]; ok {
+					push(off, 1)
+					continue
+				}
+				if v, ok := cur.fileAbs[name]; ok {
+					push(v, 0)
+					continue
+				}
+			}
 			if os, ok := byName[name]; ok {
 				if os.abs != 0 {
 					push(os.abs, 0)
@@ -361,7 +413,7 @@ const (
 
 // buildLoadFile emits ~ExpressLoad + the "main" load segment, matching
 // LinkIIGS 1.2 byte-for-byte.
-func buildLoadFile(image []byte, org int64, kind uint16, patches []relocPatch) ([]byte, error) {
+func buildLoadFile(image []byte, org int64, kind uint16, align int64, patches []relocPatch) ([]byte, error) {
 	le := binary.LittleEndian
 
 	// --- main segment header (needed for the ExpressLoad header copy) ---
@@ -378,7 +430,8 @@ func buildLoadFile(image []byte, org int64, kind uint16, patches []relocPatch) (
 	le.PutUint32(mainHdr[0x10:], 0x10000)
 	le.PutUint16(mainHdr[0x14:], kind)
 	le.PutUint32(mainHdr[0x18:], uint32(org))
-	le.PutUint16(mainHdr[0x22:], 2) // SEGNUM
+	le.PutUint32(mainHdr[0x1C:], uint32(align)) // ALIGN
+	le.PutUint16(mainHdr[0x22:], 2)             // SEGNUM
 	le.PutUint16(mainHdr[0x28:], uint16(mainDispName))
 	le.PutUint16(mainHdr[0x2A:], uint16(dispData))
 	// LOADNAME = 10 zero bytes
@@ -538,6 +591,7 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 		image   []byte
 		org     int64
 		kind    uint16
+		align   int64
 		patches []relocPatch
 	}
 
@@ -547,6 +601,16 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 	globals := map[string]int64{}
 	absolutes := map[string]int64{}
 	byName := map[string]*objSeg{}
+	// per-object-file scopes: a label reference resolves to a segment or
+	// published symbol of its own file before any same-named one elsewhere
+	// (see objSeg.fileSegs). The same file may appear in several groups
+	// (scm.obj is split across 17 load segments), so key by the parsed file.
+	type fileScope struct {
+		segs    map[string]*objSeg
+		globals map[string]int64
+		abs     map[string]int64
+	}
+	fileMaps := map[*omf.File]*fileScope{}
 	var all [][]*objSeg
 	var out []built
 	for _, g := range groups {
@@ -554,6 +618,12 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 		var segs []*objSeg
 		pos := int64(0)
 		for _, sel := range g.Sels {
+			fs := fileMaps[sel.File]
+			if fs == nil {
+				fs = &fileScope{segs: map[string]*objSeg{},
+					globals: map[string]int64{}, abs: map[string]int64{}}
+				fileMaps[sel.File] = fs
+			}
 			for i := range sel.File.Segments {
 				s := &sel.File.Segments[i]
 				if sel.Seg != "" &&
@@ -568,6 +638,14 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 				// pads out to it -- but it still publishes its symbols, which
 				// the loader's header segment refers to.
 				skip := s.Kind&0x0200 != 0
+				if a := int64(s.Align); a > 0 {
+					if pos%a != 0 {
+						pos += a - pos%a
+					}
+					if a > b.align {
+						b.align = a
+					}
+				}
 				at := pos
 				if len(segs) == 0 {
 					b.org, b.kind = int64(s.Org), s.Kind
@@ -587,9 +665,11 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 				if b.org != 0 {
 					absAt = b.org + at
 				}
-				os := &objSeg{name: s.SegName, base: at, abs: absAt, seg: s}
+				os := &objSeg{name: s.SegName, base: at, abs: absAt, seg: s,
+					fileSegs: fs.segs, fileGlobals: fs.globals, fileAbs: fs.abs}
 				segs = append(segs, os)
 				byName[s.SegName] = os
+				fs.segs[s.SegName] = os
 				img, err := segImage(s)
 				if err != nil {
 					return nil, err
@@ -601,6 +681,13 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 					symBase, into = os.abs, absolutes
 				}
 				if err := collectSymbols(s, symBase, into, absolutes); err != nil {
+					return nil, err
+				}
+				fInto := fs.globals
+				if os.abs != 0 {
+					fInto = fs.abs
+				}
+				if err := collectSymbols(s, symBase, fInto, fs.abs); err != nil {
 					return nil, err
 				}
 				if skip {
@@ -680,7 +767,7 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 	var file []byte
 	for i := range out {
 		b := &out[i]
-		file = append(file, loadSegment(b.name, i+1, b.image, b.org, b.kind, b.patches)...)
+		file = append(file, loadSegment(b.name, i+1, b.image, b.org, b.kind, b.align, b.patches)...)
 	}
 	return file, nil
 }
@@ -715,7 +802,7 @@ func collectSymbols(s *omf.Segment, base int64, globals, absolutes map[string]in
 }
 
 // loadSegment emits one load-file segment carrying image plus its relocations.
-func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, patches []relocPatch) []byte {
+func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, align int64, patches []relocPatch) []byte {
 	le := binary.LittleEndian
 	dispData := mainDispName + 10 + 1 + len(name)
 	relocBytes := relocRecords(patches)
@@ -729,6 +816,7 @@ func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, 
 	le.PutUint32(hdr[0x10:], 0x10000)
 	le.PutUint16(hdr[0x14:], kind)
 	le.PutUint32(hdr[0x18:], uint32(org))
+	le.PutUint32(hdr[0x1C:], uint32(align))
 	le.PutUint16(hdr[0x22:], uint16(segNum))
 	le.PutUint16(hdr[0x28:], uint16(mainDispName))
 	le.PutUint16(hdr[0x2A:], uint16(dispData))
