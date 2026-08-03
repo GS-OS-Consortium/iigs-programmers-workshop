@@ -586,7 +586,8 @@ func isSymStart(c byte) bool {
 }
 
 // '$' may appear inside an identifier (e.g. cmd_$802A); it only introduces a
-// hex constant at the start of a term.
+// hex constant at the start of a term. atMark tags an @local that entered a
+// macro expansion as argument text (caller-scope provenance, see markAtLocals).
 func isSymChar(c byte) bool {
-	return isSymStart(c) || c >= '0' && c <= '9' || c == '.' || c == '$'
+	return isSymStart(c) || c >= '0' && c <= '9' || c == '.' || c == '$' || c == atMark
 }

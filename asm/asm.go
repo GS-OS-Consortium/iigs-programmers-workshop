@@ -127,7 +127,10 @@ type asmState struct {
 	// fileWide names escape segment scope: ENTRY/EXPORT symbols and the PROC
 	// labels that name the segments themselves.
 	fileWide map[string]bool
-	segNames map[string]bool // segment labels, which do fold in differences
+	segNames map[string]bool
+	// definingSegName is set while beginSegment defines a segment's own name,
+	// which is the one definition of that name that stays file-wide
+	definingSegName bool
 	// A published name emits exactly one GLOBAL record. globalNth numbers the
 	// definitions as they are seen, entrySeg says which segment the ENTRY or
 	// EXPORT directive pinned it to (-1 = file scope, unpinned), pubGseq is
@@ -246,18 +249,41 @@ func (st *asmState) scopePrefix() string {
 
 func (st *asmState) lookup(name string) Val {
 	if strings.HasPrefix(name, "@") {
-		// Backward: innermost chain scope first (an expansion's @label
-		// shadows the caller's). Forward: remember the whole chain -- the
-		// definition may land in any scope that encloses this reference.
-		for i := len(st.scopeChain) - 1; i >= 0; i-- {
-			key := fmt.Sprintf("%s#%d", name, st.scopeChain[i])
+		// A macro expansion is a closed scope for @locals: a reference
+		// written in the body never sees the caller's labels, backward or
+		// forward (oracle-probed: both directions are "Undefined ID";
+		// sf.asm's bnel macro branches to its own forward @1 past a caller
+		// @1 139 bytes back). A reference that entered as ARGUMENT text
+		// carries atMarks and resolves in the scope that wrote it (rule 3
+		// of testcases/asm/at-scope-macro.aii). An @-labeled "&lab"
+		// invocation's label lives in the caller's scope, so unmarked
+		// references to that name redirect there like definitions do.
+		clean, k := stripAtMarks(name)
+		if k == 0 {
+			if n := len(st.labelRedirect); n > 0 {
+				r := st.labelRedirect[n-1]
+				if r.name != "" && st.sym(clean) == r.name && r.chainIdx < len(st.scopeChain) {
+					slot := st.scopeChain[r.chainIdx]
+					if v, ok := st.syms[fmt.Sprintf("%s#%d", clean, slot)]; ok {
+						return v
+					}
+					f := fwdVal(clean)
+					f.Pos[0].atSeq = st.defSeq
+					f.Pos[0].chain = []int{slot}
+					return f
+				}
+			}
+		}
+		lo, hi := st.atLevelRange(k)
+		for i := hi; i >= lo; i-- {
+			key := fmt.Sprintf("%s#%d", clean, st.scopeChain[i])
 			if v, ok := st.syms[key]; ok {
 				return v
 			}
 		}
-		f := fwdVal(name)
+		f := fwdVal(clean)
 		f.Pos[0].atSeq = st.defSeq
-		f.Pos[0].chain = append([]int(nil), st.scopeChain...)
+		f.Pos[0].chain = append([]int(nil), st.scopeChain[lo:hi+1]...)
 		return f
 	}
 	// A WITH'd record instance qualifies a bare field name; the most recent
@@ -313,14 +339,86 @@ type labelRedirect struct {
 	chainIdx int    // the caller's slot in scopeChain
 }
 
-func (st *asmState) scopedLocal(name string) string {
-	if n := len(st.labelRedirect); n > 0 {
-		if r := st.labelRedirect[n-1]; r.name != "" && st.sym(name) == r.name &&
-			r.chainIdx < len(st.scopeChain) {
-			return fmt.Sprintf("%s#%d", name, st.scopeChain[r.chainIdx])
+// atMark tags an @local that entered a macro expansion as argument text: the
+// name belongs to the CALLER's scope, one level out per mark (a parameter
+// passed down through nested macros accumulates one mark per hop). Literal
+// @locals in a macro body carry no mark and stay private to the expansion.
+const atMark = '\x01'
+
+// markAtLocals inserts one atMark after each '@' that starts an identifier,
+// skipping quoted text (an '@' inside a string literal is data).
+func markAtLocals(s string) string {
+	if !strings.ContainsRune(s, '@') {
+		return s
+	}
+	var b strings.Builder
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		b.WriteByte(c)
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '@' && (i == 0 || !isSymChar(s[i-1])):
+			b.WriteByte(atMark)
 		}
 	}
-	return fmt.Sprintf("%s#%d", name, st.scopeChain[len(st.scopeChain)-1])
+	return b.String()
+}
+
+// stripAtMarks splits "@\x01\x01name" into "@name" and the mark count.
+func stripAtMarks(name string) (string, int) {
+	k := 0
+	for len(name) > 1+k && name[1+k] == atMark {
+		k++
+	}
+	if k == 0 {
+		return name, 0
+	}
+	return name[:1] + name[1+k:], k
+}
+
+// atLevelRange is the scopeChain index range [lo, hi] visible to an @local
+// carrying k marks: k = 0 is the innermost expansion (or open code), each
+// mark steps one expansion out toward the caller.
+func (st *asmState) atLevelRange(k int) (int, int) {
+	n := len(st.labelRedirect)
+	depth := n - k
+	if depth < 0 {
+		depth = 0
+	}
+	hi := len(st.scopeChain) - 1
+	if depth < n && st.labelRedirect[depth].chainIdx < hi {
+		hi = st.labelRedirect[depth].chainIdx
+	}
+	lo := 0
+	if depth > 0 && depth-1 < n {
+		lo = st.labelRedirect[depth-1].chainIdx + 1
+	}
+	if lo > hi {
+		lo = hi
+	}
+	return lo, hi
+}
+
+func (st *asmState) scopedLocal(name string) string {
+	clean, k := stripAtMarks(name)
+	if k > 0 {
+		// argument-text label: defined into the scope that wrote it
+		_, hi := st.atLevelRange(k)
+		return fmt.Sprintf("%s#%d", clean, st.scopeChain[hi])
+	}
+	if n := len(st.labelRedirect); n > 0 {
+		if r := st.labelRedirect[n-1]; r.name != "" && st.sym(clean) == r.name &&
+			r.chainIdx < len(st.scopeChain) {
+			return fmt.Sprintf("%s#%d", clean, st.scopeChain[r.chainIdx])
+		}
+	}
+	return fmt.Sprintf("%s#%d", clean, st.scopeChain[len(st.scopeChain)-1])
 }
 
 func (st *asmState) define(name string, v Val) {
@@ -333,8 +431,13 @@ func (st *asmState) define(name string, v Val) {
 		st.localScopeMax++
 		st.scopeChain[len(st.scopeChain)-1] = st.localScopeMax
 		// ENTRY/EXPORT symbols stay file-wide; everything else is scoped to
-		// the segment being assembled.
-		if !st.entries[name] && !st.fileWide[name] {
+		// the segment being assembled. A segment's own name is file-wide, but
+		// that does not extend to an ordinary label somewhere else that
+		// happens to share it: NetBoot's Start.aii has a START segment and a
+		// local "Start" label in each of its path PROCs, and "dc.w End-Start"
+		// there measures the local pair (oracle-verified).
+		if !st.entries[name] && (!st.fileWide[name] ||
+			(st.segNames[name] && !st.definingSegName)) {
 			key = st.scopePrefix() + name
 		}
 	}
@@ -486,18 +589,11 @@ func operandOnly(s string) string {
 			if j > 0 && continuesOperand(s[j-1]) {
 				continue
 			}
-			// The expression may also resume after the blanks:
-			// Device.Dispatcher has "lda |temp_load_addr<tab>+2", and the
-			// original reads it as one operand. Only a sign directly against
-			// a value counts, so a "-" or "*" opening a trailing comment
-			// still ends the field.
-			k := i
-			for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
-				k++
-			}
-			if k+1 < len(s) && (s[k] == '+' || s[k] == '-') && resumesOperand(s[k+1]) {
-				continue
-			}
+			// Nothing resumes after the blanks: under BLANKS OFF even
+			// "lda |lbl<tab>+2" ends at the blank and "+2" is a comment
+			// (oracle-probed; WDefProc's "bne exit140<tab>-yes." relies on
+			// it). An operand only continues PAST blanks when it is still
+			// incomplete -- the continuesOperand check above.
 			return s[:i]
 		}
 	}
@@ -1260,7 +1356,9 @@ func (st *asmState) openSegment(seg *segState) {
 	if seg.name != "" {
 		st.fileWide[seg.name] = true
 		st.segNames[seg.name] = true
+		st.definingSegName = true
 		st.define(seg.name, segVal(st.curSegIndex(), 0))
+		st.definingSegName = false
 	}
 }
 
@@ -1294,6 +1392,8 @@ func (st *asmState) defineCodeLabel(name string) {
 	}
 	st.define(name, segVal(st.curSegIndex(), st.pc))
 	u := st.sym(name)
+	// the label's own defSeq, before any further define() bumps the counter
+	labelSeq := st.defSeq
 	// Fields of a RECORD data segment are also reachable through the
 	// qualified "record.field" form, as a template's fields are; the
 	// qualified name stays file-wide even though the plain name is scoped
@@ -1315,7 +1415,7 @@ func (st *asmState) defineCodeLabel(name string) {
 		// The pinned segment's definition wins; failing that, the first.
 		if (ok && pinned == st.curSegIndex()) || (!chosen && (!ok || pinned < 0)) {
 			st.pubGseq[u] = st.globalNth[u]
-			st.lastPubSeq[u] = st.defSeq
+			st.lastPubSeq[u] = labelSeq
 		}
 		st.addAction(action{kind: aRec, bytes: globalRec(u, st.entryPriv[u]),
 			global: u, gseq: st.globalNth[u]})
@@ -1807,6 +1907,14 @@ func splitArgs(s string) []string {
 // ---------- instructions ----------
 
 func (st *asmState) doInst(mn, operand string) {
+	// Under BLANKS OFF an instruction that never takes an address operand
+	// treats everything after the mnemonic as a field comment -- the
+	// toolbox sources' "phd Save caller's zero page." style. Oracle-probed:
+	// BLANKS ON rejects the same line, and a mnemonic with memory modes
+	// (ASL) still parses its first field as an operand.
+	if st.blanksOff && operand != "" && impliedOnly(mn) {
+		operand = ""
+	}
 	mode, exprStr, err := parseOperand(mn, operand)
 	if err != nil {
 		st.errf("%s: %v", mn, err)
@@ -2002,6 +2110,12 @@ func modeChain(m Mode) []Mode {
 func parseOperand(mn, s string) (Mode, string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
+		// BRK and COP carry a signature byte, so a bare one still assembles
+		// to two bytes with a zero signature (oracle-verified: NetBoot's
+		// "Brk brk" is 00 00, and "brk $12" is 00 12).
+		if sig := strings.ToLower(mn); sig == "brk" || sig == "cop" {
+			return Imm8, "0", nil
+		}
 		return Implied, "", nil
 	}
 	if strings.EqualFold(s, "a") {

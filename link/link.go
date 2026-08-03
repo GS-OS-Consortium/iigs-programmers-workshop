@@ -5,6 +5,7 @@
 package link
 
 import (
+	"os"
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -13,8 +14,9 @@ import (
 )
 
 type objSeg struct {
-	name string
-	base int64 // offset within the merged load segment image
+	name  string
+	group int   // index of the load segment (Group) this object segment landed in
+	base  int64 // offset within the merged load segment image
 	// abs is this object segment's absolute run address, or 0 if it floats
 	// with the load address. Two things fix an address: an absolute load
 	// segment (the loader is two of them, 'Loader' at $01A5D0 and
@@ -31,8 +33,15 @@ type objSeg struct {
 	// of the ATALK objects publish a SUP_NUM, and each one's code reads its
 	// own.
 	fileSegs    map[string]*objSeg
-	fileGlobals map[string]int64
+	fileGlobals map[string]gsym
 	fileAbs     map[string]int64
+}
+
+// gsym is a relocatable published symbol: an offset within the image of one
+// load segment (group).
+type gsym struct {
+	val   int64
+	group int
 }
 
 type relocPatch struct {
@@ -40,6 +49,35 @@ type relocPatch struct {
 	shift  int64
 	offset int64
 	value  int64
+	// interseg patches reference another load segment of the same file: the
+	// reference from Tool015's MainTool through the ~JumpTable to its dynamic
+	// PopUpProc segment is "segment 3, offset $12" rather than a value.
+	interseg bool
+	seg      int
+	segoff   int64
+}
+
+// flatSym is one entry of the linker's cross-file symbol table. Only PUBLIC
+// symbols enter it -- EXPORTed globals and GEQUs (private byte 0) and
+// non-private segments (KIND bit $4000 clear) -- and a later registration
+// replaces an earlier one whatever its kind (oracle-probed with colliding
+// exported PROCs and EXPORT labels; Tool014's "shutdown" has a private PROC,
+// an ENTRY, and an EXPORT, and every cross-file reference takes the EXPORT).
+// Private segments and ENTRY symbols are visible only through the
+// referencing file's own fileSegs/fileGlobals tier -- the oracle resolves a
+// cross-file reference with only private definitions to ZERO with a
+// "Missing symbol" warning.
+type flatSym struct {
+	val    int64
+	isBase bool // image offset (load-address dependent) vs absolute value
+	group  int  // owning load segment when isBase
+}
+
+// globalPrivate reads the private byte of a GLOBAL/GEQU record
+// ([op][len][name][length:2][type:1][private:1]...).
+func globalPrivate(raw []byte) byte {
+	n := int(raw[1])
+	return raw[2+n+3]
 }
 
 // Link links object segments (currently: one load segment named "main",
@@ -54,21 +92,22 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	// directive). The loader is built from two -- 'Loader' and 'Loader_LC' --
 	// and becomes Loader.bin and Loader.bin.2.
 	if gs := groupByLoadName(objs); len(gs) > 1 {
-		return LinkGroups(gs, true)
+		return LinkGroups(gs, express)
 	}
 	// place object segments sequentially
 	var segs []*objSeg
 	byName := map[string]*objSeg{}
-	globals := map[string]int64{} // ENTRY symbols -> offset in the image
+	globals := map[string]gsym{} // ENTRY symbols -> offset in the image
 	// "EXPORT name:EQU" symbols: absolute values, not image offsets
 	absolutes := map[string]int64{}
+	flat := map[string]flatSym{}
 	var image []byte
 	var org int64
 	var kind uint16 = 0x4000
 	var align int64 // load segment ALIGN = max member alignment
 	for _, f := range objs {
 		fileSegs := map[string]*objSeg{}
-		fileGlobals := map[string]int64{}
+		fileGlobals := map[string]gsym{}
 		fileAbs := map[string]int64{}
 		for i := range f.Segments {
 			s := &f.Segments[i]
@@ -93,6 +132,13 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 			segs = append(segs, os)
 			byName[s.SegName] = os
 			fileSegs[s.SegName] = os
+			if s.Kind&0x4000 == 0 {
+				if os.abs != 0 {
+					flat[s.SegName] = flatSym{os.abs, false, 0}
+				} else {
+					flat[s.SegName] = flatSym{os.base, true, 0}
+				}
+			}
 			if len(segs) == 1 {
 				org = int64(s.Org)
 				kind = s.Kind
@@ -105,9 +151,9 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 			// the merged image so expressions can reference them by name.
 			// A TEMPORG segment's symbols are fixed addresses instead.
 			off := os.base
-			into := globals
-			if os.abs != 0 {
-				off, into = os.abs, absolutes
+			isAbs := os.abs != 0
+			if isAbs {
+				off = os.abs
 			}
 			for _, r := range s.Records {
 				switch {
@@ -122,22 +168,33 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 					off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 				case r.Op == omf.RecGlobal:
 					n := int(r.Raw[1])
-					into[string(r.Raw[2:2+n])] = off
-					if os.abs == 0 {
-						fileGlobals[string(r.Raw[2:2+n])] = off
+					name := string(r.Raw[2 : 2+n])
+					if isAbs {
+						absolutes[name] = off
 					} else {
-						fileAbs[string(r.Raw[2:2+n])] = off
+						globals[name] = gsym{off, 0}
+					}
+					if globalPrivate(r.Raw) == 0 {
+						flat[name] = flatSym{off, !isAbs, 0}
+					}
+					if !isAbs {
+						fileGlobals[name] = gsym{off, 0}
+					} else {
+						fileAbs[name] = off
 					}
 				case r.Op == omf.RecGequ:
 					// "EXPORT name:EQU" publishes a constant rather than a
 					// location, so its value is absolute, not image-relative.
 					n := int(r.Raw[1])
-					v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil)
+					v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil, nil)
 					if err != nil {
 						return nil, fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
 					}
 					absolutes[string(r.Raw[2:2+n])] = v
 					fileAbs[string(r.Raw[2:2+n])] = v
+					if globalPrivate(r.Raw) == 0 {
+						flat[string(r.Raw[2:2+n])] = flatSym{v, false, 0}
+					}
 				}
 			}
 			image = append(image, img...)
@@ -158,7 +215,7 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 				pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 			case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 				size := int(r.Raw[1])
-				val, shift, reloc, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, os)
+				val, shift, reloc, _, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, flat, os)
 				if err != nil {
 					return nil, fmt.Errorf("segment %s: %w", os.name, err)
 				}
@@ -182,7 +239,7 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 				pc += int64(size)
 			case r.Op == omf.RecRelexpr:
 				size := int(r.Raw[1])
-				v, err := relBranch(r.Raw, pc, org, byName, globals, absolutes, os)
+				v, err := relBranch(r.Raw, pc, org, byName, globals, absolutes, flat, os)
 				if err != nil {
 					return nil, fmt.Errorf("segment %s: %w", os.name, err)
 				}
@@ -252,9 +309,9 @@ func segImage(s *omf.Segment) ([]byte, error) {
 // image-relative, so a load-address-dependent target cancels against the
 // branch's own address and the site never needs a relocation record; an
 // absolute target has to give the load address back before subtracting.
-func relBranch(raw []byte, pc, org int64, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, error) {
+func relBranch(raw []byte, pc, org int64, byName map[string]*objSeg, globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym, cur *objSeg) (int64, error) {
 	origin := int64(int32(binary.LittleEndian.Uint32(raw[2:])))
-	val, shift, reloc, err := evalOMFExprReloc(raw[6:], byName, globals, absolutes, cur)
+	val, shift, reloc, _, err := evalOMFExprReloc(raw[6:], byName, globals, absolutes, flat, cur)
 	if err != nil {
 		return 0, err
 	}
@@ -277,26 +334,42 @@ func relBranch(raw []byte, pc, org int64, byName map[string]*objSeg, globals, ab
 // a difference of two labels in the same segment cancels the base and needs
 // no relocation, which is how "end_of_perm_msgs-error_data" is a plain
 // constant in the load file.
-func evalOMFExpr(b []byte, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, int64, error) {
-	v, sh, _, err := evalOMFExprReloc(b, byName, globals, absolutes, cur)
+func evalOMFExpr(b []byte, byName map[string]*objSeg, globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym, cur *objSeg) (int64, int64, error) {
+	v, sh, _, _, err := evalOMFExprReloc(b, byName, globals, absolutes, flat, cur)
 	return v, sh, err
 }
 
-func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes map[string]int64, cur *objSeg) (int64, int64, bool, error) {
+// evalOMFExprReloc also reports the load segment (group index) the
+// relocatable result is an offset into, so a multi-segment link can turn a
+// cross-segment reference into an interseg relocation.
+func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym, cur *objSeg) (int64, int64, bool, int, error) {
 	var stack []int64
 	var base []int64 // per-entry coefficient of the load address
+	var grp []int    // per-entry owning group of the relocatable part
 	var shift int64
-	push := func(v, c int64) { stack = append(stack, v); base = append(base, c) }
-	pop2 := func() (int64, int64, int64, int64, bool) {
+	push := func(v, c int64, g int) { stack = append(stack, v); base = append(base, c); grp = append(grp, g) }
+	pop2 := func() (int64, int64, int64, int64, int, int, bool) {
 		if len(stack) < 2 {
-			return 0, 0, 0, 0, false
+			return 0, 0, 0, 0, 0, 0, false
 		}
 		x, y := stack[len(stack)-2], stack[len(stack)-1]
 		cx, cy := base[len(base)-2], base[len(base)-1]
-		stack, base = stack[:len(stack)-1], base[:len(base)-1]
-		return x, y, cx, cy, true
+		gx, gy := grp[len(grp)-2], grp[len(grp)-1]
+		stack, base, grp = stack[:len(stack)-1], base[:len(base)-1], grp[:len(grp)-1]
+		return x, y, cx, cy, gx, gy, true
 	}
-	set := func(v, c int64) { stack[len(stack)-1], base[len(base)-1] = v, c }
+	set := func(v, c int64, g int) { stack[len(stack)-1], base[len(base)-1], grp[len(grp)-1] = v, c, g }
+	// the group of a combined term: whichever side still depends on a load
+	// address wins; a cancelled result carries no group
+	combine := func(cx, cy int64, gx, gy int) int {
+		if cx != 0 {
+			return gx
+		}
+		if cy != 0 {
+			return gy
+		}
+		return -1
+	}
 	pos := 0
 	for pos < len(b) {
 		tok := b[pos]
@@ -304,64 +377,87 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes ma
 		switch {
 		case tok == 0x00:
 			if len(stack) != 1 {
-				return 0, 0, false, fmt.Errorf("bad expression stack depth %d", len(stack))
+				return 0, 0, false, -1, fmt.Errorf("bad expression stack depth %d", len(stack))
 			}
-			return stack[0], shift, base[0] != 0, nil
+			return stack[0], shift, base[0] != 0, grp[0], nil
 		case tok == 0x81 || tok == 0x80 || tok == 0x87: // numeric operand
-			push(int64(int32(binary.LittleEndian.Uint32(b[pos:]))), 0)
+			push(int64(int32(binary.LittleEndian.Uint32(b[pos:]))), 0, -1)
 			pos += 4
 		case tok == 0x82 || tok == 0x83: // label reference
 			n := int(b[pos])
 			name := string(b[pos+1 : pos+1+n])
 			pos += 1 + n
+			if os.Getenv("LINKDEBUG") == name {
+				src := "?"
+				if cur != nil { src = cur.name }
+				_, inFileSegs := cur.fileSegs[name]
+				_, inFileGlob := cur.fileGlobals[name]
+				bn, inByName := byName[name]
+				gv, inGlob := globals[name]
+				bnb := int64(-1)
+				if inByName { bnb = bn.base }
+				fmt.Fprintf(os.Stderr, "LDBG ref %s from %s fileSegs=%v fileGlob=%v byName=%v(base=%x) globals=%v(%x)\n",
+					name, src, inFileSegs, inFileGlob, inByName, bnb, inGlob, gv.val)
+			}
 			// the referencing object file's own segments and published
 			// symbols win over same-named ones from other files
 			if cur != nil && cur.fileSegs != nil {
 				if os, ok := cur.fileSegs[name]; ok {
 					if os.abs != 0 {
-						push(os.abs, 0)
+						push(os.abs, 0, -1)
 					} else {
-						push(os.base, 1)
+						push(os.base, 1, os.group)
 					}
 					continue
 				}
-				if off, ok := cur.fileGlobals[name]; ok {
-					push(off, 1)
+				if g, ok := cur.fileGlobals[name]; ok {
+					push(g.val, 1, g.group)
 					continue
 				}
 				if v, ok := cur.fileAbs[name]; ok {
-					push(v, 0)
+					push(v, 0, -1)
 					continue
 				}
 			}
-			if os, ok := byName[name]; ok {
-				if os.abs != 0 {
-					push(os.abs, 0)
+			// Cross-file: the flat table of PUBLIC symbols, last
+			// registration winning across kinds (see flatSym). The old
+			// byName/globals/absolutes chain stays as a fallback for names
+			// with no public definition; the gated corpus never exercises
+			// it (the original zeroes such references with a warning).
+			if fs, ok := flat[name]; ok {
+				if fs.isBase {
+					push(fs.val, 1, fs.group)
 				} else {
-					push(os.base, 1)
+					push(fs.val, 0, -1)
 				}
-			} else if off, ok := globals[name]; ok {
-				push(off, 1)
+			} else if os, ok := byName[name]; ok {
+				if os.abs != 0 {
+					push(os.abs, 0, -1)
+				} else {
+					push(os.base, 1, os.group)
+				}
+			} else if g, ok := globals[name]; ok {
+				push(g.val, 1, g.group)
 			} else if v, ok := absolutes[name]; ok {
-				push(v, 0) // an EQU symbol is absolute, not a location
+				push(v, 0, -1) // an EQU symbol is absolute, not a location
 			} else {
-				return 0, 0, false, fmt.Errorf("undefined label %q", name)
+				return 0, 0, false, -1, fmt.Errorf("undefined label %q", name)
 			}
 		case tok == 0x01, tok == 0x02: // + -
-			x, y, cx, cy, ok := pop2()
+			x, y, cx, cy, gx, gy, ok := pop2()
 			if !ok {
-				return 0, 0, false, fmt.Errorf("stack underflow")
+				return 0, 0, false, -1, fmt.Errorf("stack underflow")
 			}
 			if tok == 0x01 {
-				set(x+y, cx+cy)
+				set(x+y, cx+cy, combine(cx, cy, gx, gy))
 			} else {
-				set(x-y, cx-cy)
+				set(x-y, cx-cy, combine(cx, cy, gx, gy))
 			}
 		case tok >= 0x03 && tok <= 0x05, tok == 0x08, tok == 0x09, tok == 0x0A:
 			// multiply, divide, mod, AND, OR, EOR
-			x, y, cx, cy, ok := pop2()
+			x, y, cx, cy, gx, gy, ok := pop2()
 			if !ok {
-				return 0, 0, false, fmt.Errorf("stack underflow")
+				return 0, 0, false, -1, fmt.Errorf("stack underflow")
 			}
 			c := cx | cy // still address-dependent if either side was
 			switch tok {
@@ -369,12 +465,12 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes ma
 				x *= y
 			case 0x04:
 				if y == 0 {
-					return 0, 0, false, fmt.Errorf("division by zero")
+					return 0, 0, false, -1, fmt.Errorf("division by zero")
 				}
 				x /= y
 			case 0x05:
 				if y == 0 {
-					return 0, 0, false, fmt.Errorf("division by zero")
+					return 0, 0, false, -1, fmt.Errorf("division by zero")
 				}
 				x %= y
 			case 0x08:
@@ -384,18 +480,34 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals, absolutes ma
 			case 0x0A:
 				x ^= y
 			}
-			set(x, c)
-		case tok == 0x07: // shift (negative = right); operand is the count
+			set(x, c, combine(cx, cy, gx, gy))
+		case tok == 0x07: // shift (negative = right); top of stack is the count
 			if len(stack) < 2 {
-				return 0, 0, false, fmt.Errorf("stack underflow")
+				return 0, 0, false, -1, fmt.Errorf("stack underflow")
 			}
-			shift = stack[len(stack)-1]
-			stack, base = stack[:len(stack)-1], base[:len(base)-1]
+			cnt := stack[len(stack)-1]
+			stack, base, grp = stack[:len(stack)-1], base[:len(base)-1], grp[:len(grp)-1]
+			if pos < len(b) && b[pos] != 0x00 {
+				// mid-expression: a real binary shift, applied now. scm's
+				// "(COMMON_INT_ENT<<8)+$5C" patches $255C -- deferring the
+				// shift to the end computed ($9F25+$5C)<<8 instead
+				// (oracle-verified).
+				v := stack[len(stack)-1]
+				if cnt < 0 {
+					v >>= uint(-cnt)
+				} else {
+					v <<= uint(cnt)
+				}
+				stack[len(stack)-1] = v
+			} else {
+				// trailing shift: carried on the relocation record
+				shift = cnt
+			}
 		default:
-			return 0, 0, false, fmt.Errorf("unsupported expression token $%02X", tok)
+			return 0, 0, false, -1, fmt.Errorf("unsupported expression token $%02X", tok)
 		}
 	}
-	return 0, 0, false, fmt.Errorf("unterminated expression")
+	return 0, 0, false, -1, fmt.Errorf("unterminated expression")
 }
 
 func putLE(b []byte, v int64, size int) {
@@ -414,82 +526,122 @@ const (
 // buildLoadFile emits ~ExpressLoad + the "main" load segment, matching
 // LinkIIGS 1.2 byte-for-byte.
 func buildLoadFile(image []byte, org int64, kind uint16, align int64, patches []relocPatch) ([]byte, error) {
+	return buildExpressFile([]exMember{{name: mainName, image: image, org: org,
+		kind: kind, align: align, segNum: 2, relocs: relocRecords(patches)}}), nil
+}
+
+// exMember is one real load segment of an ExpressLoad file.
+type exMember struct {
+	name   string
+	image  []byte
+	org    int64
+	kind   uint16
+	align  int64
+	segNum int
+	relocs []byte
+}
+
+// segHeader builds a load-segment header (the DISPDATA prefix). banksize
+// selects the $10000 BANKSIZE real segments carry; ~ExpressLoad leaves it 0.
+func segHeader(name string, segNum, byteCnt, imageLen int, org int64, kind uint16, align int64, banksize bool) []byte {
 	le := binary.LittleEndian
-
-	// --- main segment header (needed for the ExpressLoad header copy) ---
-	dispData := mainDispName + 10 + 1 + len(mainName) // 0x3B
-	relocBytes := relocRecords(patches)
-	mainRecs := len(image) + 5 + len(relocBytes) + 1 // LCONST hdr + image + relocs + END
-	mainByteCnt := dispData + mainRecs
-
-	mainHdr := make([]byte, dispData)
-	le.PutUint32(mainHdr[0x00:], uint32(mainByteCnt))
-	le.PutUint32(mainHdr[0x08:], uint32(len(image)))
-	mainHdr[0x0E] = 4
-	mainHdr[0x0F] = 2
-	le.PutUint32(mainHdr[0x10:], 0x10000)
-	le.PutUint16(mainHdr[0x14:], kind)
-	le.PutUint32(mainHdr[0x18:], uint32(org))
-	le.PutUint32(mainHdr[0x1C:], uint32(align)) // ALIGN
-	le.PutUint16(mainHdr[0x22:], 2)             // SEGNUM
-	le.PutUint16(mainHdr[0x28:], uint16(mainDispName))
-	le.PutUint16(mainHdr[0x2A:], uint16(dispData))
-	// LOADNAME = 10 zero bytes
-	mainHdr[mainDispName+10] = byte(len(mainName))
-	copy(mainHdr[mainDispName+11:], mainName)
-
-	// --- ~ExpressLoad segment ---
-	exName := "~ExpressLoad"
-	exDispData := mainDispName + 10 + 1 + len(exName) // 0x43
-	// directory(32) + header image 0x0C..0x2B (32) + loadname(10) + segname pstring
-	exData := make([]byte, 32+32+10+1+len(mainName))
-	le.PutUint16(exData[0x06:], 0x000A)
-	le.PutUint16(exData[0x0E:], 2) // file segment number of "main"
-	exByteCnt := exDispData + 5 + len(exData) + 1
-	dataFileOffset := exByteCnt + dispData + 5 // start of main LCONST payload
-	le.PutUint32(exData[0x10:], uint32(dataFileOffset))
-	le.PutUint32(exData[0x14:], uint32(len(image)))
-	if len(relocBytes) > 0 {
-		le.PutUint32(exData[0x18:], uint32(dataFileOffset+len(image)))
-		le.PutUint32(exData[0x1C:], uint32(len(relocBytes)))
+	dispData := mainDispName + 10 + 1 + len(name)
+	hdr := make([]byte, dispData)
+	le.PutUint32(hdr[0x00:], uint32(byteCnt))
+	le.PutUint32(hdr[0x08:], uint32(imageLen))
+	hdr[0x0E] = 4
+	hdr[0x0F] = 2
+	if banksize {
+		le.PutUint32(hdr[0x10:], 0x10000)
 	}
-	copy(exData[0x20:], mainHdr[0x0C:0x2C]) // header copy (DISPNAME/DISPDATA zeroed below)
-	// zero the DISPNAME/DISPDATA fields inside the copy except DISPNAME
-	le.PutUint16(exData[0x20+(0x28-0x0C):], uint16(mainDispName))
-	le.PutUint16(exData[0x20+(0x2A-0x0C):], 0)
-	// LOADNAME zeros at 0x40..0x49, then segname pstring
-	exData[0x4A] = byte(len(mainName))
-	copy(exData[0x4B:], mainName)
+	le.PutUint16(hdr[0x14:], kind)
+	le.PutUint32(hdr[0x18:], uint32(org))
+	le.PutUint32(hdr[0x1C:], uint32(align))
+	le.PutUint16(hdr[0x22:], uint16(segNum))
+	le.PutUint16(hdr[0x28:], uint16(mainDispName))
+	le.PutUint16(hdr[0x2A:], uint16(dispData))
+	// LOADNAME = 10 zero bytes, then the segment name
+	hdr[mainDispName+10] = byte(len(name))
+	copy(hdr[mainDispName+11:], name)
+	return hdr
+}
 
-	exHdr := make([]byte, exDispData)
-	le.PutUint32(exHdr[0x00:], uint32(exByteCnt))
-	le.PutUint32(exHdr[0x08:], uint32(len(exData)))
-	exHdr[0x0E] = 4
-	exHdr[0x0F] = 2
-	le.PutUint16(exHdr[0x14:], 0x8001)
-	le.PutUint16(exHdr[0x22:], 1)
-	le.PutUint16(exHdr[0x28:], uint16(mainDispName))
-	le.PutUint16(exHdr[0x2A:], uint16(exDispData))
-	exHdr[mainDispName+10] = byte(len(exName))
-	copy(exHdr[mainDispName+11:], exName)
+// buildExpressFile emits a ~ExpressLoad directory segment followed by the
+// member load segments. The directory layout (reverse-engineered from
+// LinkIIGS 1.2 output, single- and multi-segment):
+//
+//	+0  long  0
+//	+4  word  member count - 1
+//	+6  per member, 8 bytes: [word: offset of its block, relative to THIS
+//	    entry's position][3 zero words]
+//	then one word per member: its file segment number
+//	then per-member blocks:
+//	  +0  long  file offset of the segment's LCONST payload
+//	  +4  long  payload (image) length
+//	  +8  long  file offset of its reloc records (0 if none)
+//	  +12 long  reloc record byte length (0 if none)
+//	  +16 the segment header bytes $0C..$2B, with DISPDATA zeroed
+//	  +48 LOADNAME (10 zero bytes)
+//	  +58 segment name p-string
+func buildExpressFile(members []exMember) []byte {
+	le := binary.LittleEndian
+	exName := "~ExpressLoad"
+	exDispData := mainDispName + 10 + 1 + len(exName)
+	n := len(members)
+	dispData := make([]int, n)
+	byteCnt := make([]int, n)
+	for i, m := range members {
+		dispData[i] = mainDispName + 10 + 1 + len(m.name)
+		byteCnt[i] = dispData[i] + 5 + len(m.image) + len(m.relocs) + 1
+	}
+	exDataLen := 6 + 8*n + 2*n
+	blockPos := make([]int, n)
+	for i, m := range members {
+		blockPos[i] = exDataLen
+		exDataLen += 58 + 1 + len(m.name)
+	}
+	exData := make([]byte, exDataLen)
+	le.PutUint16(exData[4:], uint16(n-1))
+	exByteCnt := exDispData + 5 + exDataLen + 1
+	running := exByteCnt
+	for i, m := range members {
+		entryPos := 6 + 8*i
+		le.PutUint16(exData[entryPos:], uint16(blockPos[i]-entryPos))
+		le.PutUint16(exData[6+8*n+2*i:], uint16(m.segNum))
+		blk := exData[blockPos[i]:]
+		dataOff := running + dispData[i] + 5
+		le.PutUint32(blk[0:], uint32(dataOff))
+		le.PutUint32(blk[4:], uint32(len(m.image)))
+		if len(m.relocs) > 0 {
+			le.PutUint32(blk[8:], uint32(dataOff+len(m.image)))
+			le.PutUint32(blk[12:], uint32(len(m.relocs)))
+		}
+		hdr := segHeader(m.name, m.segNum, byteCnt[i], len(m.image), m.org, m.kind, m.align, true)
+		copy(blk[16:48], hdr[0x0C:0x2C])
+		blk[16+(0x2A-0x0C)] = 0 // DISPDATA zeroed inside the copy
+		blk[16+(0x2A-0x0C)+1] = 0
+		blk[58] = byte(len(m.name))
+		copy(blk[59:], m.name)
+		running += byteCnt[i]
+	}
 
-	var out []byte
-	out = append(out, exHdr...)
+	out := segHeader(exName, 1, exByteCnt, exDataLen, 0, 0x8001, 0, false)
 	out = append(out, 0xF2)
 	var cnt [4]byte
-	le.PutUint32(cnt[:], uint32(len(exData)))
+	le.PutUint32(cnt[:], uint32(exDataLen))
 	out = append(out, cnt[:]...)
 	out = append(out, exData...)
 	out = append(out, 0x00)
-
-	out = append(out, mainHdr...)
-	out = append(out, 0xF2)
-	le.PutUint32(cnt[:], uint32(len(image)))
-	out = append(out, cnt[:]...)
-	out = append(out, image...)
-	out = append(out, relocBytes...)
-	out = append(out, 0x00)
-	return out, nil
+	for i, m := range members {
+		out = append(out, segHeader(m.name, m.segNum, byteCnt[i], len(m.image), m.org, m.kind, m.align, true)...)
+		out = append(out, 0xF2)
+		le.PutUint32(cnt[:], uint32(len(m.image)))
+		out = append(out, cnt[:]...)
+		out = append(out, m.image...)
+		out = append(out, m.relocs...)
+		out = append(out, 0x00)
+	}
+	return out
 }
 
 // relocRecords emits the patch list the way LinkIIGS 1.2 does: unshifted 2-
@@ -500,13 +652,48 @@ func buildLoadFile(image []byte, org int64, kind uint16, align int64, patches []
 func relocRecords(patches []relocPatch) []byte {
 	var out []byte
 	var super2, super3 []relocPatch
+	superIS := map[int][]relocPatch{} // SUPER INTERSEG lists by type byte
 	for _, p := range patches {
+		if p.interseg {
+			switch {
+			case p.shift == 0 && p.size == 3 && p.seg < 256 && p.segoff < 0x10000:
+				// SUPER INTERSEG1 (type 2): file 1, 3-byte patches whose
+				// image bytes carry [target offset word][target segment]
+				superIS[2] = append(superIS[2], p)
+			case p.shift == 0 && p.size == 2 && p.seg >= 1 && p.seg <= 12 && p.segoff < 0x10000:
+				// SUPER INTERSEG13..24 (types 14..25): file 1, segment =
+				// type-13, 2-byte patches carrying the target offset word
+				superIS[13+p.seg] = append(superIS[13+p.seg], p)
+			case p.offset < 0x10000 && p.seg < 256 && p.segoff < 0x10000:
+				out = append(out, 0xF6, byte(p.size), byte(int8(p.shift)))
+				out = append(out, byte(p.offset), byte(p.offset>>8))
+				out = append(out, byte(p.seg))
+				out = append(out, byte(p.segoff), byte(p.segoff>>8))
+			default:
+				out = append(out, 0xE3, byte(p.size), byte(int8(p.shift)))
+				var b [4]byte
+				binary.LittleEndian.PutUint32(b[:], uint32(p.offset))
+				out = append(out, b[:]...)
+				out = append(out, 1, 0) // file number
+				out = append(out, byte(p.seg), byte(p.seg>>8))
+				binary.LittleEndian.PutUint32(b[:], uint32(p.segoff))
+				out = append(out, b[:]...)
+			}
+			continue
+		}
+		// The value participates as a full unsigned 32-bit quantity: a
+		// source constant can tag an address with a high flag bit
+		// (NewCalls' "DInfoParms+$80000000"), and $80005225 neither packs
+		// into a SUPER page (the value lives in 2 image bytes there) nor
+		// fits a cRELOC -- the original emits a wide RELOC for BOTH halves
+		// of the pea pair (oracle-verified in Tool014).
+		v := p.value & 0xFFFFFFFF
 		switch {
-		case p.shift == 0 && p.size == 2:
+		case p.shift == 0 && p.size == 2 && v < 0x10000:
 			super2 = append(super2, p)
-		case p.shift == 0 && p.size == 3:
+		case p.shift == 0 && p.size == 3 && v < 0x1000000:
 			super3 = append(super3, p)
-		case p.offset < 0x10000 && p.value < 0x10000:
+		case p.offset < 0x10000 && v < 0x10000:
 			out = append(out, 0xF5, byte(p.size), byte(int8(p.shift)))
 			out = append(out, byte(p.offset), byte(p.offset>>8))
 			out = append(out, byte(p.value), byte(p.value>>8))
@@ -520,7 +707,11 @@ func relocRecords(patches []relocPatch) []byte {
 		}
 	}
 	out = append(out, superReloc(super2, 0)...)
-	return append(out, superReloc(super3, 1)...)
+	out = append(out, superReloc(super3, 1)...)
+	for typ := 2; typ <= 25; typ++ {
+		out = append(out, superReloc(superIS[typ], byte(typ))...)
+	}
+	return out
 }
 
 // superReloc packs unshifted patches of one width into a SUPER record. The
@@ -566,8 +757,9 @@ func superReloc(super []relocPatch, typ byte) []byte {
 // Group is one "-lseg NAME obj... obj(@seg)..." load segment: a name and the
 // object segments that make it up, in order.
 type Group struct {
-	Name string
-	Sels []Sel
+	Name    string
+	Sels    []Sel
+	Dynamic bool // "-lseg:dynamic": mark the load segment dynamic
 }
 
 // Sel selects a whole object file, or the segments carrying one load name
@@ -580,48 +772,53 @@ type Sel struct {
 }
 
 // LinkGroups links each group into its own load segment of one load file.
-// Symbols are resolved across all groups, so a reference from one load
-// segment to a label in another still finds it.
+// Symbols are resolved across all groups; a reference from one load segment
+// to a label in another becomes an interseg relocation, and a reference into
+// a DYNAMIC load segment is routed through a generated ~JumpTable segment
+// whose entries the system loader patches at run time (oracle: Tool015's
+// MainTool reaches its PopUpProc defproc via "JML ~JumpTable entry").
 //
-// apw selects the plain (APW) load-file form with no ~ExpressLoad segment.
-func LinkGroups(groups []Group, apw bool) ([]byte, error) {
-	_ = apw // a multi-segment file is always emitted in the plain form
+// express selects the ~ExpressLoad form (the default); LinkIIGS -x emits the
+// plain form without it.
+func LinkGroups(groups []Group, express bool) ([]byte, error) {
 	type built struct {
 		name    string
 		image   []byte
 		org     int64
 		kind    uint16
 		align   int64
+		dynamic bool
 		patches []relocPatch
 	}
 
 	// First pass over every group: place segments and collect symbols. The
 	// images cannot be patched yet because a later group may define a symbol
 	// an earlier one references.
-	globals := map[string]int64{}
+	globals := map[string]gsym{}
 	absolutes := map[string]int64{}
 	byName := map[string]*objSeg{}
+	flat := map[string]flatSym{}
 	// per-object-file scopes: a label reference resolves to a segment or
 	// published symbol of its own file before any same-named one elsewhere
 	// (see objSeg.fileSegs). The same file may appear in several groups
 	// (scm.obj is split across 17 load segments), so key by the parsed file.
 	type fileScope struct {
 		segs    map[string]*objSeg
-		globals map[string]int64
+		globals map[string]gsym
 		abs     map[string]int64
 	}
 	fileMaps := map[*omf.File]*fileScope{}
 	var all [][]*objSeg
 	var out []built
-	for _, g := range groups {
-		b := built{name: g.Name}
+	for gi, g := range groups {
+		b := built{name: g.Name, dynamic: g.Dynamic}
 		var segs []*objSeg
 		pos := int64(0)
 		for _, sel := range g.Sels {
 			fs := fileMaps[sel.File]
 			if fs == nil {
 				fs = &fileScope{segs: map[string]*objSeg{},
-					globals: map[string]int64{}, abs: map[string]int64{}}
+					globals: map[string]gsym{}, abs: map[string]int64{}}
 				fileMaps[sel.File] = fs
 			}
 			for i := range sel.File.Segments {
@@ -662,32 +859,41 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 					at = pos
 				}
 				absAt := int64(0)
-				if b.org != 0 {
+				if s.TempOrg != 0 {
+					// a TEMPORG segment is assembled for the address it is
+					// copied to at run time: gquit's LOAD_APP sits at
+					// $E0D7C0 in the image but every symbol resolves to its
+					// $1010 run address (oracle-verified in scm.lnk)
+					absAt = int64(s.TempOrg)
+				} else if b.org != 0 {
 					absAt = b.org + at
 				}
-				os := &objSeg{name: s.SegName, base: at, abs: absAt, seg: s,
+				os := &objSeg{name: s.SegName, group: gi, base: at, abs: absAt, seg: s,
 					fileSegs: fs.segs, fileGlobals: fs.globals, fileAbs: fs.abs}
 				segs = append(segs, os)
 				byName[s.SegName] = os
 				fs.segs[s.SegName] = os
+				if s.Kind&0x4000 == 0 {
+					if os.abs != 0 {
+						flat[s.SegName] = flatSym{os.abs, false, gi}
+					} else {
+						flat[s.SegName] = flatSym{os.base, true, gi}
+					}
+				}
 				img, err := segImage(s)
 				if err != nil {
 					return nil, err
 				}
 				// In an absolute load segment a published symbol has a fixed
 				// address, so record it as one.
-				symBase, into := os.base, globals
+				symBase := os.base
 				if os.abs != 0 {
-					symBase, into = os.abs, absolutes
+					symBase = os.abs
 				}
-				if err := collectSymbols(s, symBase, into, absolutes); err != nil {
+				if err := collectSymbols(s, symBase, gi, os.abs != 0, globals, absolutes, flat); err != nil {
 					return nil, err
 				}
-				fInto := fs.globals
-				if os.abs != 0 {
-					fInto = fs.abs
-				}
-				if err := collectSymbols(s, symBase, fInto, fs.abs); err != nil {
+				if err := collectSymbols(s, symBase, gi, os.abs != 0, fs.globals, fs.abs, nil); err != nil {
 					return nil, err
 				}
 				if skip {
@@ -712,7 +918,99 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 		out = append(out, b)
 	}
 
-	// Second pass: patch, now that every symbol is known.
+	// A group is dynamic if the -lseg:dynamic flag or its object KIND says so.
+	isDynamic := func(gi int) bool {
+		return out[gi].dynamic || out[gi].kind&0x8000 != 0
+	}
+
+	// Prescan: find references from one group into a DYNAMIC group. Each
+	// distinct (group, offset) target gets a ~JumpTable entry, in first-
+	// reference order. The jump table's existence decides the final segment
+	// numbering, so this must happen before any image bytes are patched.
+	type jtKey struct {
+		group  int
+		offset int64
+	}
+	jtIndex := map[jtKey]int{}
+	var jtOrder []jtKey
+	for gi := range out {
+		if out[gi].org != 0 {
+			continue
+		}
+		for _, os := range all[gi] {
+			for _, r := range os.seg.Records {
+				if r.Op != omf.RecLexpr && r.Op != omf.RecBexpr && r.Op != omf.RecExpr {
+					continue
+				}
+				val, _, reloc, tgt, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, flat, os)
+				if err != nil {
+					return nil, fmt.Errorf("segment %s: %w", os.name, err)
+				}
+				if reloc && tgt >= 0 && tgt != gi && isDynamic(tgt) {
+					k := jtKey{tgt, val}
+					if _, ok := jtIndex[k]; !ok {
+						jtIndex[k] = len(jtOrder)
+						jtOrder = append(jtOrder, k)
+					}
+				}
+			}
+		}
+	}
+
+	// The load file is emitted [~ExpressLoad,] every STATIC group in
+	// declaration order, ~JumpTable, then every DYNAMIC group in declaration
+	// order -- the partition, not the declaration order, decides placement
+	// (oracle QDAux: "-lseg MAINPart / -lseg:Dynamic Pictures / -lseg
+	// CopyBits / ..." emits MAINPart, CopyBits, ~JumpTable, Pictures, ...).
+	first := 1
+	if express {
+		first = 2
+	}
+	var statics, dynamics []int
+	for gi := range out {
+		if isDynamic(gi) {
+			dynamics = append(dynamics, gi)
+		} else {
+			statics = append(statics, gi)
+		}
+	}
+	order := append(append([]int(nil), statics...), dynamics...)
+	segNum := make([]int, len(out))
+	jtSegNum := 0
+	{
+		n := first
+		for _, gi := range statics {
+			segNum[gi] = n
+			n++
+		}
+		if len(jtOrder) > 0 {
+			jtSegNum = n
+			n++
+		}
+		for _, gi := range dynamics {
+			segNum[gi] = n
+			n++
+		}
+	}
+
+	// ~JumpTable image: 8 zero bytes, then a 14-byte entry per target --
+	// userID(2) fileNum(2) segNum(2) offset(4) and an unpatched "JSL loader"
+	// ($22 00 00 00) the loader fixes up -- then a 4-byte zero terminator.
+	// A reference to the target becomes an interseg reloc to its entry's JSL.
+	jtEntryOff := func(idx int) int64 { return 8 + 14*int64(idx) + 10 }
+	var jtImage []byte
+	if len(jtOrder) > 0 {
+		jtImage = make([]byte, 8+14*len(jtOrder)+4)
+		for i, k := range jtOrder {
+			e := jtImage[8+14*i:]
+			binary.LittleEndian.PutUint16(e[2:], 1) // file number
+			binary.LittleEndian.PutUint16(e[4:], uint16(segNum[k.group]))
+			binary.LittleEndian.PutUint32(e[6:], uint32(k.offset))
+			e[10] = 0x22 // JSL
+		}
+	}
+
+	// Second pass: patch, now that every symbol and segment number is known.
 	for gi := range out {
 		b := &out[gi]
 		for _, os := range all[gi] {
@@ -725,11 +1023,12 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 					pc += int64(binary.LittleEndian.Uint32(r.Raw[1:]))
 				case r.Op == omf.RecLexpr || r.Op == omf.RecBexpr || r.Op == omf.RecExpr:
 					size := int(r.Raw[1])
-					val, shift, reloc, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, os)
+					val, shift, reloc, tgt, err := evalOMFExprReloc(r.Raw[2:], byName, globals, absolutes, flat, os)
 					if err != nil {
 						return nil, fmt.Errorf("segment %s: %w", os.name, err)
 					}
-					if b.org != 0 || !reloc {
+					switch {
+					case b.org != 0 || !reloc:
 						v := val
 						if reloc {
 							v += b.org
@@ -740,14 +1039,38 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 							v <<= uint(shift)
 						}
 						putLE(b.image[pc:], v, size)
-					} else {
+					case tgt >= 0 && tgt != gi:
+						// cross-segment: an interseg relocation. A target in
+						// a dynamic segment is reached through its ~JumpTable
+						// entry instead of directly.
+						seg, segoff := segNum[tgt], val
+						if isDynamic(tgt) {
+							seg, segoff = jtSegNum, jtEntryOff(jtIndex[jtKey{tgt, val}])
+						}
+						if size == 3 && shift == 0 && segoff < 0x10000 {
+							// SUPER INTERSEG payload: the image word is the
+							// target offset and the third byte its segment.
+							putLE(b.image[pc:], segoff, 2)
+							b.image[pc+2] = byte(seg)
+						} else if size == 2 && shift == 0 && seg >= 1 && seg <= 12 && segoff < 0x10000 {
+							// SUPER INTERSEG13..24 payload: the target offset
+							putLE(b.image[pc:], segoff, size)
+						} else {
+							// an explicit cINTERSEG/INTERSEG record carries
+							// the target itself; the image bytes stay zero
+							// (oracle: Tool016's shifted reference into Pics)
+							putLE(b.image[pc:], 0, size)
+						}
+						b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc,
+							interseg: true, seg: seg, segoff: segoff})
+					default:
 						putLE(b.image[pc:], val, size)
 						b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
 					}
 					pc += int64(size)
 				case r.Op == omf.RecRelexpr:
 					size := int(r.Raw[1])
-					v, err := relBranch(r.Raw, pc, b.org, byName, globals, absolutes, os)
+					v, err := relBranch(r.Raw, pc, b.org, byName, globals, absolutes, flat, os)
 					if err != nil {
 						return nil, fmt.Errorf("segment %s: %w", os.name, err)
 					}
@@ -764,16 +1087,54 @@ func LinkGroups(groups []Group, apw bool) ([]byte, error) {
 		}
 	}
 
-	var file []byte
-	for i := range out {
-		b := &out[i]
-		file = append(file, loadSegment(b.name, i+1, b.image, b.org, b.kind, b.align, b.patches)...)
+	// Assemble the members in final order, splicing in the ~JumpTable.
+	type member struct {
+		name    string
+		image   []byte
+		org     int64
+		kind    uint16
+		align   int64
+		patches []relocPatch
+		segNum  int
 	}
-	return file, nil
+	var members []member
+	jtDone := false
+	for _, gi := range order {
+		b := &out[gi]
+		if len(jtOrder) > 0 && !jtDone && isDynamic(gi) {
+			members = append(members, member{name: "~JumpTable", image: jtImage, kind: 0x0002, segNum: jtSegNum})
+			jtDone = true
+		}
+		kind := b.kind
+		if b.dynamic {
+			kind |= 0x8000
+		}
+		members = append(members, member{name: b.name, image: b.image, org: b.org,
+			kind: kind, align: b.align, patches: b.patches, segNum: segNum[gi]})
+	}
+	if len(jtOrder) > 0 && !jtDone {
+		members = append(members, member{name: "~JumpTable", image: jtImage, kind: 0x0002, segNum: jtSegNum})
+	}
+
+	if !express {
+		var file []byte
+		for _, m := range members {
+			file = append(file, loadSegment(m.name, m.segNum, m.image, m.org, m.kind, m.align, m.patches)...)
+		}
+		return file, nil
+	}
+	exMembers := make([]exMember, len(members))
+	for i, m := range members {
+		exMembers[i] = exMember{name: m.name, image: m.image, org: m.org,
+			kind: m.kind, align: m.align, segNum: m.segNum, relocs: relocRecords(m.patches)}
+	}
+	return buildExpressFile(exMembers), nil
 }
 
-// collectSymbols records a segment's GLOBAL and GEQU definitions.
-func collectSymbols(s *omf.Segment, base int64, globals, absolutes map[string]int64) error {
+// collectSymbols records a segment's GLOBAL and GEQU definitions. GLOBALs of
+// a relocatable segment are offsets within load segment `group`; those of an
+// absolute (org'd/TEMPORG) segment are fixed addresses and go to absolutes.
+func collectSymbols(s *omf.Segment, base int64, group int, isAbs bool, globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym) error {
 	off := base
 	for _, r := range s.Records {
 		switch {
@@ -788,12 +1149,23 @@ func collectSymbols(s *omf.Segment, base int64, globals, absolutes map[string]in
 			off += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
 		case r.Op == omf.RecGlobal:
 			n := int(r.Raw[1])
-			globals[string(r.Raw[2:2+n])] = off
+			name := string(r.Raw[2 : 2+n])
+			if isAbs {
+				absolutes[name] = off
+			} else {
+				globals[name] = gsym{off, group}
+			}
+			if flat != nil && globalPrivate(r.Raw) == 0 {
+				flat[name] = flatSym{off, !isAbs, group}
+			}
 		case r.Op == omf.RecGequ:
 			n := int(r.Raw[1])
-			v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil)
+			v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil, nil)
 			if err != nil {
 				return fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
+			}
+			if flat != nil && globalPrivate(r.Raw) == 0 {
+				flat[string(r.Raw[2:2+n])] = flatSym{v, false, -1}
 			}
 			absolutes[string(r.Raw[2:2+n])] = v
 		}

@@ -126,6 +126,9 @@ func (e *Env) HostPath(p string) string {
 	}
 	// A single trailing ':' just marks the name as a directory.
 	p = strings.TrimSuffix(p, ":")
+	if p == "" { // a lone ":" is the current directory
+		return e.Dir
+	}
 	base := e.Dir
 	for strings.HasPrefix(p, ":") {
 		if strings.HasPrefix(p, "::") {
@@ -278,6 +281,18 @@ func (e *Env) RunBlock(cmds []string) error {
 	return nil
 }
 
+// runCapture executes a command sequence with the same control flow as
+// RunBlock but collects its output instead of writing it through. It backs
+// command substitution, whose body may itself be a full if/else statement.
+func (e *Env) runCapture(cmds []string) (string, error) {
+	var buf strings.Builder
+	saved := e.Out
+	e.Out = &buf
+	defer func() { e.Out = saved }()
+	err := e.RunBlock(cmds)
+	return buf.String(), err
+}
+
 // condition evaluates an MPW Shell test, including || and && between terms.
 func (e *Env) condition(w []string) bool {
 	for i, t := range w {
@@ -319,24 +334,34 @@ func (e *Env) conditionTerm(w []string) bool {
 	return strings.TrimSpace(w[0]) != ""
 }
 
-// splitStatements splits a line on ';' outside quotes.
+// splitStatements splits a line on ';' outside quotes. A backquoted command
+// substitution is one unit however many ';' it contains -- TextEdit sizes its
+// -d define with "`if {DebugSymbols};echo '1';else;echo '0';end`".
 func splitStatements(line string) []string {
 	var out []string
 	depth := 0
-	inS, inD := false, false
+	inS, inD, inB := false, false, false
 	start := 0
 	for i := 0; i < len(line); i++ {
 		switch line[i] {
 		case '\'':
-			inS = !inS
+			if !inB {
+				inS = !inS
+			}
 		case '"':
-			inD = !inD
+			if !inB {
+				inD = !inD
+			}
+		case '`':
+			if !inS && !inD {
+				inB = !inB
+			}
 		case '(':
 			depth++
 		case ')':
 			depth--
 		case ';':
-			if !inS && !inD && depth == 0 {
+			if !inS && !inD && !inB && depth == 0 {
 				out = append(out, line[start:i])
 				start = i + 1
 			}
@@ -416,16 +441,15 @@ func (e *Env) substBackquotes(line string) string {
 		}
 		inner := line[i+1 : i+1+j]
 		i += j + 1
-		words := Tokenize(e.Expand(inner))
-		if len(words) == 0 {
+		if strings.TrimSpace(inner) == "" {
 			continue
 		}
-		var out strings.Builder
-		if err := e.dispatch(strings.ToLower(words[0]), words[1:], &out); err != nil {
+		out, err := e.runCapture([]string{inner})
+		if err != nil {
 			fmt.Fprintf(e.Out, "mpwmk: `%s`: %v\n", inner, err)
 			continue
 		}
-		b.WriteString(strings.TrimSpace(out.String()))
+		b.WriteString(strings.TrimSpace(out))
 	}
 	return b.String()
 }
@@ -453,13 +477,19 @@ func splitRedirect(line string) (rest, outFile string, appendOut bool) {
 			rest = strings.TrimSpace(rest[:i]) + " " + after
 		}
 	}
+	// stdout redirect may appear mid-line ("Linkiigs -l >map -lseg ...");
+	// take the first word after it as the target and keep the rest as args
 	if i := strings.Index(rest, ">>"); i >= 0 {
-		outFile = strings.TrimSpace(rest[i+2:])
-		return strings.TrimSpace(rest[:i]), firstWord(outFile), true
+		after := strings.TrimSpace(rest[i+2:])
+		outFile = firstWord(after)
+		rest = strings.TrimSpace(strings.TrimSpace(rest[:i]) + " " + strings.TrimSpace(strings.TrimPrefix(after, outFile)))
+		return rest, outFile, true
 	}
 	if i := strings.Index(rest, ">"); i >= 0 {
-		outFile = strings.TrimSpace(rest[i+1:])
-		return strings.TrimSpace(rest[:i]), firstWord(outFile), false
+		after := strings.TrimSpace(rest[i+1:])
+		outFile = firstWord(after)
+		rest = strings.TrimSpace(strings.TrimSpace(rest[:i]) + " " + strings.TrimSpace(strings.TrimPrefix(after, outFile)))
+		return rest, outFile, false
 	}
 	return rest, "", false
 }

@@ -110,9 +110,17 @@ type termRef struct {
 // pushed with its own displacement, and only a literal addend left over from
 // the source expression is applied at the end (oracle-verified: "elab-*" at
 // offset 2 of P2 emits ELAB, P2, 2, add, subtract).
-func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64, post []postOp) {
+func (e *segEmitter) exprGeneral(size int, pos, neg []termRef, c int64, post []postOp, shift int64) {
 	e.flush()
 	body := exprBody(pos, neg, c, post)
+	if shift != 0 {
+		// a trailing shift applies to the whole expression: FontMgr's
+		// "pea EndOfFMParams-FMParams>>16" ends "... $02 <shift> $07"
+		// (oracle-verified)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(shift))
+		body = append(body[:len(body)-1], 0x81, b[0], b[1], b[2], b[3], 0x07, recEnd)
+	}
 	e.recs = append(e.recs, recExpr, byte(size))
 	e.recs = append(e.recs, body...)
 }
@@ -411,25 +419,60 @@ func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
 // declares at the end of itself rather than the published one. Pass 1 binds
 // to whatever it has seen; only here is the segment being assembled known.
 func (st *asmState) preferLocal(v Val, curSeg int) Val {
-	if len(v.Pos) != 1 || len(v.Neg) != 0 {
+	if len(v.Pos) == 1 && len(v.Neg) == 0 {
+		t := v.Pos[0]
+		if nt, off, ok := st.localRebind(t, curSeg); ok {
+			return Val{C: off, Pos: []term{nt}, Post: v.Post, Shift: v.Shift}
+		}
 		return v
 	}
-	t := v.Pos[0]
+	// A multi-term value gets the same treatment term by term, so that a
+	// difference of two labels still cancels: NetBoot's path PROCs each
+	// measure "dc.w End-Start" over their own Start, which shares its name
+	// with the file's START segment (oracle-verified).
+	out := v
+	changed := false
+	rebindAll := func(ts []term, sign int64) []term {
+		res := append([]term(nil), ts...)
+		for i, t := range res {
+			nt, off, ok := st.localRebind(t, curSeg)
+			if !ok {
+				continue
+			}
+			// the term's value moves from the segment base to the label's
+			// own offset, so carry the difference in the constant -- with the
+			// term's own sign, since a subtracted term moves it the other way
+			out.C += sign * (off - t.symOff)
+			res[i] = nt
+			changed = true
+		}
+		return res
+	}
+	pos, neg := rebindAll(v.Pos, 1), rebindAll(v.Neg, -1)
+	if !changed {
+		return v
+	}
+	out.Pos, out.Neg = pos, neg
+	return out
+}
+
+// localRebind rebinds one term to a same-named definition in the referencing
+// segment, returning the new term and that definition's offset.
+func (st *asmState) localRebind(t term, curSeg int) (term, int64, bool) {
 	if t.name == "" || t.fwd != "" || t.seg == curSeg || t.viaWith {
-		return v
+		return t, 0, false
 	}
-	defs := st.symSeq[fmt.Sprintf("%d\x00", curSeg)+t.name]
-	for _, d := range defs {
+	for _, d := range st.symSeq[fmt.Sprintf("%d\x00", curSeg)+t.name] {
 		if len(d.Pos) == 1 && len(d.Neg) == 0 && d.Pos[0].seg == curSeg {
 			// The pass-1 binding was cross-segment, so the one-pass original
 			// had already emitted the reference by name (see term.byName).
 			nt := term{seg: curSeg, name: t.name, symOff: d.C, defSeq: d.defSeq,
 				byName: true}
 			nt.pub = st.publishedAt(nt)
-			return Val{C: d.C, Pos: []term{nt}, Post: v.Post, Shift: v.Shift}
+			return nt, d.C, true
 		}
 	}
-	return v
+	return t, 0, false
 }
 
 // branchDeferred reports whether a relative branch has to reach its target
@@ -472,6 +515,13 @@ func (st *asmState) exprRef(t term, c int64, curSeg int) (string, int64) {
 	// PROC, not READ+$12C, oracle-probed).
 	published := t.name != "" && st.entries[t.name]
 	if published && t.seg != curSeg {
+		return t.name, c - t.symOff
+	}
+	// In a DATA segment (bare RECORD, KIND bit 0) a published symbol is named
+	// in BOTH directions -- only a plain label there folds to segment+offset
+	// (oracle-probed; StdFile's DataSegment names its exported dialog records
+	// from a table that both precedes and follows them).
+	if st.publishedAt(t) && t.seg >= 0 && st.segs[t.seg].kind&0x0001 != 0 {
 		return t.name, c - t.symOff
 	}
 	if st.publishedAt(t) && (t.viaFwd || t.byName) {
@@ -576,7 +626,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			if len(t.Pos)+len(t.Neg) > 1 || len(t.Post) > 0 {
 				pos, gained := st.termRefs(t.Pos, segIdx)
 				neg, lost := st.termRefs(t.Neg, segIdx)
-				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post)
+				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post, a.shift)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)
@@ -608,7 +658,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			if len(t.Pos)+len(t.Neg) > 1 || len(t.Post) > 0 {
 				pos, gained := st.termRefs(t.Pos, segIdx)
 				neg, lost := st.termRefs(t.Neg, segIdx)
-				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post)
+				e.exprGeneral(a.size, pos, neg, t.C-gained+lost, t.Post, a.shift)
 				continue
 			}
 			nm, disp := st.exprRef(t.Pos[0], t.C, segIdx)

@@ -72,6 +72,22 @@ type modeEnt struct {
 	cpu  int
 }
 
+// impliedOnly reports whether a mnemonic never takes an address operand
+// (only Implied/Accum forms), which is what lets a BLANKS OFF line carry a
+// field comment directly after it.
+func impliedOnly(mn string) bool {
+	ents, ok := opTable[mn]
+	if !ok {
+		return false
+	}
+	for _, e := range ents {
+		if e.m != Implied && e.m != Accum {
+			return false
+		}
+	}
+	return true
+}
+
 var opTable = map[string][]modeEnt{
 	"adc": {{ImmM, 0x69, cpu6502}, {DP, 0x65, cpu6502}, {DPX, 0x75, cpu6502}, {Abs, 0x6D, cpu6502}, {AbsX, 0x7D, cpu6502}, {AbsY, 0x79, cpu6502}, {DPIndX, 0x61, cpu6502}, {DPIndY, 0x71, cpu6502}, {DPInd, 0x72, cpu65C02}, {AbsL, 0x6F, cpu65816}, {AbsLX, 0x7F, cpu65816}, {DPIndL, 0x67, cpu65816}, {DPIndLY, 0x77, cpu65816}, {SR, 0x63, cpu65816}, {SRIndY, 0x73, cpu65816}},
 	"and": {{ImmM, 0x29, cpu6502}, {DP, 0x25, cpu6502}, {DPX, 0x35, cpu6502}, {Abs, 0x2D, cpu6502}, {AbsX, 0x3D, cpu6502}, {AbsY, 0x39, cpu6502}, {DPIndX, 0x21, cpu6502}, {DPIndY, 0x31, cpu6502}, {DPInd, 0x32, cpu65C02}, {AbsL, 0x2F, cpu65816}, {AbsLX, 0x3F, cpu65816}, {DPIndL, 0x27, cpu65816}, {DPIndLY, 0x37, cpu65816}, {SR, 0x23, cpu65816}, {SRIndY, 0x33, cpu65816}},
@@ -95,6 +111,8 @@ var opTable = map[string][]modeEnt{
 	"cli": {{Implied, 0x58, cpu6502}},
 	"clv": {{Implied, 0xB8, cpu6502}},
 	"cmp": {{ImmM, 0xC9, cpu6502}, {DP, 0xC5, cpu6502}, {DPX, 0xD5, cpu6502}, {Abs, 0xCD, cpu6502}, {AbsX, 0xDD, cpu6502}, {AbsY, 0xD9, cpu6502}, {DPIndX, 0xC1, cpu6502}, {DPIndY, 0xD1, cpu6502}, {DPInd, 0xD2, cpu65C02}, {AbsL, 0xCF, cpu65816}, {AbsLX, 0xDF, cpu65816}, {DPIndL, 0xC7, cpu65816}, {DPIndLY, 0xD7, cpu65816}, {SR, 0xC3, cpu65816}, {SRIndY, 0xD3, cpu65816}},
+	// alias of cmp (the toolbox sources' "cpa theWind,s")
+	"cpa": {{ImmM, 0xC9, cpu6502}, {DP, 0xC5, cpu6502}, {DPX, 0xD5, cpu6502}, {Abs, 0xCD, cpu6502}, {AbsX, 0xDD, cpu6502}, {AbsY, 0xD9, cpu6502}, {DPIndX, 0xC1, cpu6502}, {DPIndY, 0xD1, cpu6502}, {DPInd, 0xD2, cpu65C02}, {AbsL, 0xCF, cpu65816}, {AbsLX, 0xDF, cpu65816}, {DPIndL, 0xC7, cpu65816}, {DPIndLY, 0xD7, cpu65816}, {SR, 0xC3, cpu65816}, {SRIndY, 0xD3, cpu65816}},
 	"cop": {{Imm8, 0x02, cpu65816}, {DP, 0x02, cpu65816}},
 	"cpx": {{ImmX, 0xE0, cpu6502}, {DP, 0xE4, cpu6502}, {Abs, 0xEC, cpu6502}},
 	"cpy": {{ImmX, 0xC0, cpu6502}, {DP, 0xC4, cpu6502}, {Abs, 0xCC, cpu6502}},

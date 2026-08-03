@@ -281,6 +281,7 @@ func (e *Env) catenate(args []string, out io.Writer) error {
 
 func (e *Env) runAsm(args []string) error {
 	var input, output string
+	var outIsDir bool
 	var incDirs []string
 	var defines []string
 	var extras []string
@@ -288,6 +289,7 @@ func (e *Env) runAsm(args []string) error {
 		switch a := args[i]; strings.ToLower(a) {
 		case "-o":
 			i++
+			outIsDir = strings.HasSuffix(args[i], ":")
 			output = e.HostPath(args[i])
 		case "-i":
 			i++
@@ -313,6 +315,10 @@ func (e *Env) runAsm(args []string) error {
 	}
 	if output == "" {
 		output = input + ".obj" // AsmIIGS default output name
+	} else if outIsDir {
+		// "-o :objs:" names a directory: the object keeps its default name
+		// there (QDAux assembles every source with "asmiigs -o :objs: X.asm")
+		output = filepath.Join(output, filepath.Base(input)+".obj")
 	}
 	// The real AsmIIGS finds the toolbox interface files through the
 	// {AIIGSIncludes} shell variable; make that automatic.
@@ -336,13 +342,20 @@ func (e *Env) runAsm(args []string) error {
 }
 
 // linkSel resolves an input spec that may select one segment of an object
-// file: "{Object}scm.obj(@oscall_seg)".
-func (e *Env) linkSel(a string) (link.Sel, error) {
+// file: "{Object}scm.obj(@oscall_seg)". The cache keeps one parsed *omf.File
+// per path across a link's selections: the linker's own-file symbol tier is
+// keyed by file identity, and gquit.obj(@seg_e0) must see the DISPLAY_MSG
+// that gquit.obj(@seg_b0) carries, not a same-named segment from another
+// file (oracle-verified in scm.lnk).
+func (e *Env) linkSel(a string, cache map[string]*omf.File) (link.Sel, error) {
 	name, seg := a, ""
 	if i := strings.Index(a, "("); i >= 0 && strings.HasSuffix(a, ")") {
 		name, seg = a[:i], strings.TrimPrefix(a[i+1:len(a)-1], "@")
 	}
 	p := e.HostPath(name)
+	if f, ok := cache[p]; ok {
+		return link.Sel{File: f, Seg: seg}, nil
+	}
 	data, err := os.ReadFile(p)
 	if err != nil {
 		return link.Sel{}, err
@@ -351,16 +364,17 @@ func (e *Env) linkSel(a string) (link.Sel, error) {
 	if err != nil {
 		return link.Sel{}, fmt.Errorf("%s: %w", filepath.Base(p), err)
 	}
+	cache[p] = f
 	return link.Sel{File: f, Seg: seg}, nil
 }
 
 func (e *Env) runLink(args []string) error {
-	var inputs []string
+	var inputs, rawInputs []string
 	var libs []string
 	var output string
 	var groups []link.Group
 	var log []string
-	apw := false
+	selCache := map[string]*omf.File{}
 	express := true
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
@@ -373,8 +387,13 @@ func (e *Env) runLink(args []string) error {
 			i++
 			groups = append(groups, link.Group{Name: args[i]})
 			log = append(log, "-lseg", args[i])
+		case "-lseg:dynamic":
+			i++
+			groups = append(groups, link.Group{Name: args[i], Dynamic: true})
+			log = append(log, "-lseg:dynamic", args[i])
 		case "-apw":
-			apw = true
+			// accepted for compatibility; the oracle emits the same
+			// ~ExpressLoad form with or without it (scm.lnk replay)
 			log = append(log, "-apw")
 		case "-lib":
 			i++
@@ -391,7 +410,7 @@ func (e *Env) runLink(args []string) error {
 				return fmt.Errorf("linkiigs: unsupported option %q", a)
 			}
 			if len(groups) > 0 {
-				sel, err := e.linkSel(a)
+				sel, err := e.linkSel(a, selCache)
 				if err != nil {
 					return fmt.Errorf("linkiigs: %w", err)
 				}
@@ -404,6 +423,7 @@ func (e *Env) runLink(args []string) error {
 				continue
 			}
 			inputs = append(inputs, e.HostPath(a))
+			rawInputs = append(rawInputs, a)
 			log = append(log, e.HostPath(a))
 		}
 	}
@@ -411,8 +431,21 @@ func (e *Env) runLink(args []string) error {
 	if output == "" || (len(inputs) == 0 && len(groups) == 0) {
 		return fmt.Errorf("linkiigs: need inputs and -o output")
 	}
+	if len(groups) > 0 && len(rawInputs) > 0 {
+		// objects listed before any -lseg form an implicit leading "main"
+		// load segment (oracle: Tool016's six ungrouped objects)
+		main := link.Group{Name: "main"}
+		for _, a := range rawInputs {
+			sel, err := e.linkSel(a, selCache)
+			if err != nil {
+				return fmt.Errorf("linkiigs: %w", err)
+			}
+			main.Sels = append(main.Sels, sel)
+		}
+		groups = append([]link.Group{main}, groups...)
+	}
 	if len(groups) > 0 {
-		res, err := link.LinkGroups(groups, apw)
+		res, err := link.LinkGroups(groups, express)
 		if err != nil {
 			return fmt.Errorf("linkiigs: %w", err)
 		}

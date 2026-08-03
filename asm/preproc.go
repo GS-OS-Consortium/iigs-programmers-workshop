@@ -65,10 +65,17 @@ type ppState struct {
 	whileBody  []string
 	whileDepth int
 	inWhile    bool
+	// numVars names variables holding ARITHMETIC values (LCLA/GBLA/SETA).
+	// Everything else a condition can name -- macro parameters, LCLC/GBLC
+	// and SETC variables -- is CHARACTER-typed (see charVarRef).
+	numVars map[string]bool
+	// strCond forces the current comparison to be evaluated as text
+	strCond bool
 }
 
 func newPP(st *asmState) *ppState {
-	return &ppState{st: st, macros: map[string]*macroDef{}, globals: map[string]string{}}
+	return &ppState{st: st, macros: map[string]*macroDef{}, globals: map[string]string{},
+		numVars: map[string]bool{}}
 }
 
 func (pp *ppState) active() bool {
@@ -127,6 +134,16 @@ func (pp *ppState) findInclude(spec string) string {
 	direct := mpwPath(filepath.Dir(pp.st.curFile), spec)
 	if _, err := os.Stat(direct); err == nil {
 		return direct
+	}
+	// A relative spec whose leading colons climb too far falls back one
+	// level at a time: WindMgr's Task.asm includes ':::ControlMgr:...'
+	// where the target is only one level up. Oracle-probed: the literal
+	// path wins when it exists, the shallower one is used when it does not.
+	for fb := spec; strings.HasPrefix(fb, "::"); {
+		fb = fb[1:]
+		if cand := mpwPath(filepath.Dir(pp.st.curFile), fb); fileExists(cand) {
+			return cand
+		}
 	}
 	base := spec
 	if i := strings.LastIndex(base, ":"); i >= 0 {
@@ -225,6 +242,11 @@ func (pp *ppState) doLoad(spec string) {
 	if err != nil {
 		st.errf("LOAD %s: %v", spec, err)
 	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func (pp *ppState) processSource(src, path string) {
@@ -446,13 +468,13 @@ func (pp *ppState) processLine(raw string) {
 			return
 		}
 		// "IF cond GOTO .sym" branches instead of opening a block.
-		if cond, target, ok := splitIfGoto(pp.subst(l.rest)); ok {
-			if pp.condEval(cond) {
-				pp.gotoTarget = target
+		if rawCond, target, ok := splitIfGoto(l.rest); ok {
+			if pp.condEvalRaw(rawCond) {
+				pp.gotoTarget = strings.TrimSpace(operandOnly(strings.TrimSpace(pp.subst(target))))
 			}
 			return
 		}
-		v := pp.condEval(pp.subst(l.rest))
+		v := pp.condEvalRaw(l.rest)
 		pp.conds = append(pp.conds, condFrame{parentActive: true, active: v, taken: v})
 		return
 	case "elseif":
@@ -467,7 +489,7 @@ func (pp *ppState) processLine(raw string) {
 		if c.taken {
 			c.active = false
 		} else {
-			v := pp.condEval(pp.subst(l.rest))
+			v := pp.condEvalRaw(l.rest)
 			c.active, c.taken = v, v
 		}
 		return
@@ -610,9 +632,11 @@ func (pp *ppState) findMacro(op string) (*macroDef, string) {
 
 func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	frame := &ppFrame{vars: map[string]string{}}
-	redirect := labelRedirect{}
+	// chainIdx always records the caller's scope slot: argument-text @locals
+	// (atMark) resolve there. name is set only for an @-labeled invocation.
+	redirect := labelRedirect{chainIdx: len(pp.st.scopeChain) - 1}
 	if def.labelVar != "" {
-		frame.vars[def.labelVar] = inv.label
+		frame.vars[def.labelVar] = markAtLocals(inv.label)
 		// The invocation's label belongs to the CALLER: a plain label
 		// delimits the caller's @local scope exactly as writing it outside
 		// would (pascal.fst's "sys_entry PROCNAME" segments reuse @no_way;
@@ -624,8 +648,7 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 			pp.st.localScopeMax++
 			pp.st.scopeChain[len(pp.st.scopeChain)-1] = pp.st.localScopeMax
 		} else if strings.HasPrefix(inv.label, "@") {
-			redirect = labelRedirect{name: pp.st.sym(inv.label),
-				chainIdx: len(pp.st.scopeChain) - 1}
+			redirect.name = pp.st.sym(inv.label)
 		}
 	} else if inv.label != "" {
 		// a label on an invocation of a label-less macro defines a code label
@@ -634,14 +657,24 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	if def.nameVar != "" {
 		frame.vars[def.nameVar] = nameSuffix
 	}
-	// A macro argument may contain blanks -- the gsos macros are invoked as
-	// "freespace SCM segment 0,seg_0_start,..." -- so the whole operand field
-	// is the argument list, not just up to the first blank.
-	args := splitArgs(strings.TrimRight(inv.rest, " \t"))
+	// Under BLANKS ON a macro argument may contain blanks -- the gsos macros
+	// are invoked as "freespace SCM segment 0,seg_0_start,..." -- so the whole
+	// operand field is the argument list. Under BLANKS OFF the list ends at
+	// the first blank and the rest is a field comment, exactly as for an
+	// instruction operand: StdFile's "PushZLong DialogPtr<tab>If in get
+	// dialog..." must pass "DialogPtr", or the nested "&A+2" appends to the
+	// comment instead (oracle-verified).
+	rest := inv.rest
+	if pp.st.blanksOff {
+		rest = operandOnly(rest)
+	}
+	args := splitArgs(strings.TrimRight(rest, " \t"))
 	for i, p := range def.params {
 		v := ""
 		if i < len(args) {
-			v = strings.TrimSpace(args[i])
+			// @locals in argument text belong to the scope that wrote the
+			// invocation; the mark keeps that provenance through expansion
+			v = markAtLocals(strings.TrimSpace(args[i]))
 		}
 		if v == "" && i < len(def.defaults) {
 			v = def.defaults[i]
@@ -686,6 +719,11 @@ func (pp *ppState) declareVars(op, rest string) {
 			continue
 		}
 		name := strings.ToUpper(v[1:])
+		if op == "lcla" || op == "gbla" {
+			pp.numVars[name] = true
+		} else {
+			delete(pp.numVars, name)
+		}
 		if op == "gbla" || op == "gblc" {
 			if _, ok := pp.globals[name]; !ok {
 				pp.globals[name] = init
@@ -699,6 +737,11 @@ func (pp *ppState) declareVars(op, rest string) {
 func (pp *ppState) setVar(op string, l line) {
 	name := strings.ToUpper(strings.TrimPrefix(l.label, "&"))
 	rest := pp.subst(operandOnly(l.rest))
+	if op == "seta" {
+		pp.numVars[name] = true
+	} else {
+		delete(pp.numVars, name)
+	}
 	var val string
 	if op == "seta" {
 		n, err := evalNumLenient(strings.TrimSpace(rest), &exprCtx{st: pp.st})
@@ -726,6 +769,40 @@ func (pp *ppState) assign(name, val string) {
 		}
 	}
 	pp.globals[name] = val
+}
+
+// charVarRef reports whether s references a CHARACTER-typed value: a macro
+// parameter, or a variable declared LCLC/GBLC (or last assigned by SETC).
+// Such a value keeps its string type through substitution -- the original
+// rejects "if &V=48" with "Strings are only allowed in relations with other
+// strings" and compares "if &V='0'" as text, while a bare "if 0='0'" is the
+// numeric 0 against the character constant 48 (all oracle-probed). Only
+// LCLA/GBLA/SETA variables are arithmetic.
+func (pp *ppState) charVarRef(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '&' {
+			continue
+		}
+		j := i + 1
+		for j < len(s) && isSymChar(s[j]) && s[j] != '&' {
+			j++
+		}
+		if j == i+1 {
+			continue
+		}
+		name := strings.ToUpper(s[i+1 : j])
+		i = j - 1
+		if j < len(s) && s[j] == '(' {
+			continue // a builtin function call, not a variable
+		}
+		if pp.numVars[name] {
+			continue
+		}
+		if _, ok := pp.lookupVar(name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (pp *ppState) lookupVar(name string) (string, bool) {
@@ -772,6 +849,7 @@ var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
 	"ORD": true, "SUBSTR": true, "TYPE": true, "S2I": true, "GETENV": true,
+	"DEFAULT": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -954,6 +1032,23 @@ func (pp *ppState) callFunc(name string, args []string) string {
 		return substr(pp.rawArg(args[:1]), pp.argNum(args[1]), pp.argNum(args[2]))
 	case "TRIM":
 		return strings.TrimSpace(pp.rawArg(args))
+	case "DEFAULT":
+		// &Default(value, default): the value unless it is empty. The result
+		// is the argument text VERBATIM -- quotes included -- so DialogMgr's
+		// "&SL setc &Default(&SizeLocals,'0')" leaves &SL as 'O' and the
+		// guard "if &SL='0'" compares two character constants and skips the
+		// stack adjustment (oracle-verified: an unquoted 0 compares against
+		// '0' as 0 vs 48 and the branch is NOT taken).
+		if len(args) == 0 {
+			return ""
+		}
+		if v := strings.TrimSpace(pp.subst(args[0])); v != "" {
+			return v
+		}
+		if len(args) > 1 {
+			return strings.TrimSpace(pp.subst(args[1]))
+		}
+		return ""
 	case "GETENV":
 		// MPW shell variable lookup; the AppleShare equates default their
 		// DebugCode from &getenv('MSDDebugFlag'). Under mpwmk this reads
@@ -1072,6 +1167,63 @@ func (pp *ppState) condEval(s string) bool {
 	return v != 0
 }
 
+// condEvalRaw evaluates a condition from its UNSUBSTITUTED text. A CHARACTER
+// variable keeps its string type through substitution, so a comparison naming
+// one is textual even when both sides look numeric: DialogMgr's link macro
+// guards its stack adjustment with "if &SL='0'" and &SL is a SETC variable
+// holding 0, which as text equals '0' but as a number is 0 against 48.
+func (pp *ppState) condEvalRaw(raw string) bool {
+	v, isBool := pp.condValueRaw(raw)
+	if isBool {
+		return v&1 != 0
+	}
+	return v != 0
+}
+
+// condValueRaw mirrors condValue's OR/AND/NOT splitting on the raw text so
+// each leaf comparison can be typed from its own operands before they are
+// substituted away.
+func (pp *ppState) condValueRaw(raw string) (int64, bool) {
+	s := strings.TrimSpace(raw)
+	if up := strings.ToUpper(s); strings.HasSuffix(up, "THEN") {
+		s = strings.TrimSpace(s[:len(s)-4])
+	}
+	if parts := splitLogical(s, "OR"); len(parts) > 1 {
+		var acc int64
+		for _, p := range parts {
+			v, _ := pp.condValueRaw(p)
+			acc |= v
+		}
+		return acc, true
+	}
+	if parts := splitLogical(s, "AND"); len(parts) > 1 {
+		acc := int64(-1)
+		for _, p := range parts {
+			v, _ := pp.condValueRaw(p)
+			acc &= v
+		}
+		return acc, true
+	}
+	if f := strings.Fields(s); len(f) > 1 && strings.EqualFold(f[0], "not") {
+		v, _ := pp.condValueRaw(strings.TrimSpace(s[len(f[0]):]))
+		return ^v, true
+	}
+	// A leaf comparison is textual when a CHARACTER operand meets a quoted
+	// string or another character operand. Character against a bare number is
+	// an error in the original; evaluate it numerically rather than fail.
+	saved := pp.strCond
+	if lhs, op, rhs := splitCompare(s); op != "" {
+		lc, rc := pp.charVarRef(lhs), pp.charVarRef(rhs)
+		lq := isQuoted(strings.TrimSpace(pp.subst(lhs)))
+		rq := isQuoted(strings.TrimSpace(pp.subst(rhs)))
+		pp.strCond = (lc && (rq || rc)) || (rc && (lq || lc))
+	} else {
+		pp.strCond = false
+	}
+	defer func() { pp.strCond = saved }()
+	return pp.condValue(pp.subst(s))
+}
+
 // condValue evaluates a condition to its value plus whether that value is
 // boolean-typed. NOT binds tighter than AND, which binds tighter than OR; all
 // three combine bitwise.
@@ -1169,10 +1321,15 @@ func (pp *ppState) condCompare(s string) (int64, bool) {
 		}
 		return n, false
 	}
-	ln, lerr := evalNum(lhs, &exprCtx{st: pp.st})
-	rn, rerr := evalNum(rhs, &exprCtx{st: pp.st})
-	if lerr == nil && rerr == nil {
-		return boolVal(compareOrdered(ln, rn, op)), true
+	// A comparison typed CHARACTER by its operands (strCond, set from the
+	// unsubstituted text) is textual whatever the substituted values look
+	// like; otherwise numbers win when both sides are numeric.
+	if !pp.strCond {
+		ln, lerr := evalNum(lhs, &exprCtx{st: pp.st})
+		rn, rerr := evalNum(rhs, &exprCtx{st: pp.st})
+		if lerr == nil && rerr == nil {
+			return boolVal(compareOrdered(ln, rn, op)), true
+		}
 	}
 	// One side did not evaluate as a number, so compare as strings. A macro
 	// argument substituted into the condition often is not numeric at all.
@@ -1325,7 +1482,11 @@ func splitCompareIn(s string, brackets bool) (string, string, string) {
 			// M16.Util's pushlong tests "&addr[1:1]='#'", and with &addr =
 			// "<last_dib" the condition is the string "<" against "#", not
 			// "<=" with an empty left side.
-			if strings.TrimSpace(s[:i]) == "" {
+			// "<>" is unambiguous even with nothing to its left: an empty
+			// macro parameter leaves exactly that, and the original still
+			// reads it as a comparison ("IF &flags<>'Y=2'" with &flags unset
+			// is true, oracle-verified in TextEdit's Deref).
+			if strings.TrimSpace(s[:i]) == "" && !(i+1 < len(s) && s[i+1] == '>') {
 				continue
 			}
 			if i+1 < len(s) {

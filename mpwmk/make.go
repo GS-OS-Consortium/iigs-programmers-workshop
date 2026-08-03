@@ -28,7 +28,8 @@ type Makefile struct {
 }
 
 // suffixPair reports the target and dependency suffixes of a rule like
-// ".oii ƒ .aii", or ok=false if it is an ordinary rule.
+// ".oii ƒ .aii", or ok=false if it is an ordinary rule. A suffix may itself
+// contain dots: StdFile's ".asm.obj ƒ .asm".
 func suffixPair(r *Rule) (tgt, dep string, ok bool) {
 	if len(r.Targets) != 1 || len(r.Deps) != 1 {
 		return "", "", false
@@ -37,7 +38,7 @@ func suffixPair(r *Rule) (tgt, dep string, ok bool) {
 	if !strings.HasPrefix(t, ".") || !strings.HasPrefix(d, ".") {
 		return "", "", false
 	}
-	if strings.ContainsAny(t[1:], ".:/ ") || strings.ContainsAny(d[1:], ".:/ ") {
+	if strings.ContainsAny(t[1:], ":/ ") || strings.ContainsAny(d[1:], ":/ ") {
 		return "", "", false
 	}
 	return t, d, true
@@ -244,9 +245,9 @@ func (b *Builder) Build(target string) error {
 	// An explicit rule may name the dependency but leave the recipe to a
 	// suffix rule (".oii ƒ .aii"), so fall back whenever no commands apply.
 	var sfx *Rule
-	var sfxDep string
+	var sfxDep, sfxBase string
 	if rule == nil || len(rule.Cmds) == 0 {
-		sfx, sfxDep = b.matchSuffix(host)
+		sfx, sfxDep, sfxBase = b.matchSuffix(host)
 	}
 	if rule == nil && sfx == nil {
 		if _, err := os.Stat(host); err != nil {
@@ -301,7 +302,7 @@ func (b *Builder) Build(target string) error {
 		for _, k := range []string{"default", "targdir", "depdir"} {
 			saved[k] = b.Env.Get(k)
 		}
-		b.Env.Set("Default", baseNoExt(host))
+		b.Env.Set("Default", sfxBase)
 		b.Env.Set("TargDir", dirWithSlash(host))
 		b.Env.Set("DepDir", dirWithSlash(b.Env.HostPath(sfxDep)))
 		defer func() {
@@ -322,7 +323,7 @@ func (b *Builder) Build(target string) error {
 // target first, then in the directories a DIRECTORY rule names: make.MSDos
 // says `"{Object}" ƒ "{MSDos}"`, so an .obj targeted into Object/ finds its
 // .aii in the MSDos source directory.
-func (b *Builder) matchSuffix(host string) (*Rule, string) {
+func (b *Builder) matchSuffix(host string) (*Rule, string, string) {
 	base := strings.TrimSuffix(filepath.Base(host), filepath.Ext(host))
 	dirs := []string{filepath.Dir(host)}
 	dirKey := strings.ToLower(filepath.Dir(host))
@@ -337,9 +338,14 @@ func (b *Builder) matchSuffix(host string) (*Rule, string) {
 	}
 	for _, r := range b.MF.suffix {
 		tgtSfx, depSfx, _ := suffixPair(r)
-		if !strings.EqualFold(filepath.Ext(host), tgtSfx) {
+		// a suffix may span several dots (".asm.obj"), so match the whole
+		// tail of the name, not just filepath.Ext
+		name := filepath.Base(host)
+		if len(name) <= len(tgtSfx) ||
+			!strings.EqualFold(name[len(name)-len(tgtSfx):], tgtSfx) {
 			continue
 		}
+		base = name[:len(name)-len(tgtSfx)]
 		for _, dir := range dirs {
 			dep := filepath.Join(dir, base+depSfx)
 			if _, err := os.Stat(dep); err != nil {
@@ -351,10 +357,10 @@ func (b *Builder) matchSuffix(host string) (*Rule, string) {
 					continue
 				}
 			}
-			return r, dep
+			return r, dep, base
 		}
 	}
-	return nil, ""
+	return nil, "", ""
 }
 
 func findCaseInsensitive(path string) (string, bool) {
@@ -371,10 +377,6 @@ func findCaseInsensitive(path string) (string, bool) {
 	return "", false
 }
 
-func baseNoExt(p string) string {
-	b := filepath.Base(p)
-	return strings.TrimSuffix(b, filepath.Ext(b))
-}
 
 func dirWithSlash(p string) string { return filepath.Dir(p) + "/" }
 

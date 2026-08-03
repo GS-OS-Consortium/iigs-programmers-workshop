@@ -15,7 +15,7 @@ func main() {
 	var inputs []string
 	var out string
 	var groups []link.Group
-	var apw bool
+
 	express := true
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -33,8 +33,14 @@ func main() {
 				die("missing argument to -lseg")
 			}
 			groups = append(groups, link.Group{Name: args[i]})
-		case a == "-apw":
-			apw = true
+		case a == "-lseg:dynamic":
+			i++
+			if i >= len(args) {
+				die("missing argument to -lseg:dynamic")
+			}
+			groups = append(groups, link.Group{Name: args[i], Dynamic: true})
+		case a == "-apw": // accepted, no output-form effect
+
 		case a == "-x":
 			express = false // no ~ExpressLoad segment
 		case a == "-l":
@@ -55,7 +61,7 @@ func main() {
 		die("usage: linkiigs file.obj... -o file")
 	}
 	if len(groups) > 0 {
-		res, err := link.LinkGroups(groups, apw)
+		res, err := link.LinkGroups(groups, express)
 		if err != nil {
 			die("%v", err)
 		}
@@ -86,12 +92,19 @@ func main() {
 }
 
 // parseSel reads an input spec, which may select one segment of an object
-// file: "scm.obj(@oscall_seg)".
+// file: "scm.obj(@oscall_seg)". One parsed *omf.File is shared across all
+// selections of the same path so the linker's own-file symbol tier sees the
+// whole file.
+var selCache = map[string]*omf.File{}
+
 func parseSel(a string) (link.Sel, error) {
 	name, seg := a, ""
 	if i := strings.Index(a, "("); i >= 0 && strings.HasSuffix(a, ")") {
 		name = a[:i]
 		seg = strings.TrimPrefix(a[i+1:len(a)-1], "@")
+	}
+	if f, ok := selCache[name]; ok {
+		return link.Sel{File: f, Seg: seg}, nil
 	}
 	data, err := os.ReadFile(name)
 	if err != nil {
@@ -101,6 +114,7 @@ func parseSel(a string) (link.Sel, error) {
 	if err != nil {
 		return link.Sel{}, fmt.Errorf("%s: %w", name, err)
 	}
+	selCache[name] = f
 	return link.Sel{File: f, Seg: seg}, nil
 }
 
