@@ -491,7 +491,7 @@ func (e *Env) runLink(args []string) error {
 			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND the
 			// attributes define outright (see segKindAttrs)
 			if strings.HasPrefix(strings.ToLower(a), "-lseg:") {
-				kind, dyn, err := segKindAttrs(a[len("-lseg:"):])
+				kind, dyn, err := link.SegKindAttrs(a[len("-lseg:"):])
 				if err != nil {
 					return fmt.Errorf("linkiigs %s: %w", a, err)
 				}
@@ -707,42 +707,3 @@ func parseMPWNum(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// segKindAttrs turns a "-lseg:" attribute list into an OMF KIND. The
-// attributes REPLACE whatever kind the group would inherit from its first
-// object segment (oracle-probed: a $4000 object becomes $0000 under
-// "-lseg:code" and $1000 under "-lseg:code:nospecial:static"). The flag bits
-// are the standard OMF ones; only those the sources actually use are
-// accepted, so a new one shows up as an error rather than silently doing
-// nothing.
-func segKindAttrs(spec string) (uint16, bool, error) {
-	var kind uint16
-	dyn := false
-	for _, a := range strings.Split(spec, ":") {
-		switch strings.ToLower(strings.TrimSpace(a)) {
-		case "", "code", "static", "public", "special", "reloadable":
-			// type 0 and the cleared-flag spellings: nothing to set
-		case "data":
-			kind |= 0x0001
-		case "dynamic":
-			kind |= 0x8000
-			dyn = true
-		case "private":
-			kind |= 0x4000
-		case "nospecial":
-			kind |= 0x1000
-		case "posindependent", "pic":
-			kind |= 0x2000
-		case "bankrelative":
-			kind |= 0x0100
-		case "skip":
-			kind |= 0x0200
-		case "reload":
-			kind |= 0x0400
-		case "absolutebank":
-			kind |= 0x0800
-		default:
-			return 0, false, fmt.Errorf("unknown -lseg attribute %q", a)
-		}
-	}
-	return kind, dyn, nil
-}

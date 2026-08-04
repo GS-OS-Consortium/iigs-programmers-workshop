@@ -33,12 +33,19 @@ func main() {
 				die("missing argument to -lseg")
 			}
 			groups = append(groups, link.Group{Name: args[i]})
-		case a == "-lseg:dynamic":
+		case strings.HasPrefix(strings.ToLower(a), "-lseg:"):
+			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND
+			// the attributes define outright ("-lseg:dynamic", "-lseg:$3000")
+			kind, dyn, err := link.SegKindAttrs(a[len("-lseg:"):])
+			if err != nil {
+				die("linkiigs %s: %v", a, err)
+			}
 			i++
 			if i >= len(args) {
-				die("missing argument to -lseg:dynamic")
+				die("missing argument to %s", a)
 			}
-			groups = append(groups, link.Group{Name: args[i], Dynamic: true})
+			groups = append(groups, link.Group{Name: args[i], Dynamic: dyn,
+				Kind: kind, KindSet: true})
 		case a == "-apw": // accepted, no output-form effect
 
 		case a == "-x":

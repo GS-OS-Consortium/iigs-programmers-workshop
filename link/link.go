@@ -8,6 +8,7 @@ import (
 	"os"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/dagenbrock/iigs-programmers-workshop/omf"
@@ -664,6 +665,11 @@ func relocRecords(patches []relocPatch) []byte {
 				// SUPER INTERSEG13..24 (types 14..25): file 1, segment =
 				// type-13, 2-byte patches carrying the target offset word
 				superIS[13+p.seg] = append(superIS[13+p.seg], p)
+			case p.shift == -16 && p.size == 2 && p.seg >= 1 && p.seg <= 12 && p.segoff < 0x10000:
+				// SUPER INTERSEG25..36 (types 26..37): as 13..24 but the
+				// patch takes the address's high word (shift -16); a -8
+				// shift stays an explicit cINTERSEG (oracle: TS2's INIT)
+				superIS[25+p.seg] = append(superIS[25+p.seg], p)
 			case p.offset < 0x10000 && p.seg < 256 && p.segoff < 0x10000:
 				out = append(out, 0xF6, byte(p.size), byte(int8(p.shift)))
 				out = append(out, byte(p.offset), byte(p.offset>>8))
@@ -708,7 +714,7 @@ func relocRecords(patches []relocPatch) []byte {
 	}
 	out = append(out, superReloc(super2, 0)...)
 	out = append(out, superReloc(super3, 1)...)
-	for typ := 2; typ <= 25; typ++ {
+	for typ := 2; typ <= 37; typ++ {
 		out = append(out, superReloc(superIS[typ], byte(typ))...)
 	}
 	return out
@@ -768,6 +774,60 @@ type Group struct {
 	// "-lseg:code:nospecial:static" becomes $1000).
 	Kind    uint16
 	KindSet bool
+}
+
+// SegKindAttrs turns a "-lseg:" attribute list into an OMF KIND. The
+// attributes REPLACE whatever kind the group would inherit from its first
+// object segment (oracle-probed: a $4000 object becomes $0000 under
+// "-lseg:code" and $1000 under "-lseg:code:nospecial:static"). A "$hhhh"
+// token gives the KIND word directly: the shipped Tool.Setup "main" segment
+// is exactly $3000 under "-lseg:$3000 main", TS2/TS3's "INIT" exactly $2000
+// under "-lseg:$2000 INIT". The named flag bits are the standard OMF ones;
+// only those the sources actually use are accepted, so a new one shows up as
+// an error rather than silently doing nothing.
+func SegKindAttrs(spec string) (uint16, bool, error) {
+	var kind uint16
+	dyn := false
+	for _, a := range strings.Split(spec, ":") {
+		a = strings.TrimSpace(a)
+		if strings.HasPrefix(a, "$") {
+			n, err := strconv.ParseUint(a[1:], 16, 16)
+			if err != nil {
+				return 0, false, fmt.Errorf("bad -lseg attribute %q", a)
+			}
+			kind |= uint16(n)
+			if kind&0x8000 != 0 {
+				dyn = true
+			}
+			continue
+		}
+		switch strings.ToLower(a) {
+		case "", "code", "static", "public", "special", "reloadable":
+			// type 0 and the cleared-flag spellings: nothing to set
+		case "data":
+			kind |= 0x0001
+		case "dynamic":
+			kind |= 0x8000
+			dyn = true
+		case "private":
+			kind |= 0x4000
+		case "nospecial":
+			kind |= 0x1000
+		case "posindependent", "pic":
+			kind |= 0x2000
+		case "bankrelative":
+			kind |= 0x0100
+		case "skip":
+			kind |= 0x0200
+		case "reload":
+			kind |= 0x0400
+		case "absolutebank":
+			kind |= 0x0800
+		default:
+			return 0, false, fmt.Errorf("unknown -lseg attribute %q", a)
+		}
+	}
+	return kind, dyn, nil
 }
 
 // Sel selects a whole object file, or the segments carrying one load name
@@ -1086,6 +1146,11 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 							b.image[pc+2] = byte(seg)
 						} else if size == 2 && shift == 0 && seg >= 1 && seg <= 12 && segoff < 0x10000 {
 							// SUPER INTERSEG13..24 payload: the target offset
+							putLE(b.image[pc:], segoff, size)
+						} else if size == 2 && shift == -16 && seg >= 1 && seg <= 12 && segoff < 0x10000 {
+							// SUPER INTERSEG25..36 payload: the target offset
+							// word; the loader shifts after adding the base
+							// (oracle: TS2's INIT bank-byte references)
 							putLE(b.image[pc:], segoff, size)
 						} else {
 							// an explicit cINTERSEG/INTERSEG record carries
