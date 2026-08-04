@@ -377,7 +377,6 @@ func findCaseInsensitive(path string) (string, bool) {
 	return "", false
 }
 
-
 func dirWithSlash(p string) string { return filepath.Dir(p) + "/" }
 
 // Targets lists all rule targets in file order (for -list).

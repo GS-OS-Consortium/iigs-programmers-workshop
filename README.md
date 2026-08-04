@@ -18,13 +18,14 @@ library resolution, and load-file generation — and boot to the Finder.
 | `asmiigs` | AsmIIGS 1.2 | 65816 assembler: full MPW macro language, RECORDs, conditionals, DUMP/LOAD symbol tables, OMF v2 output |
 | `linkiigs` | LinkIIGS 1.2 | OMF linker: `-lseg` grouping, `-lib` hash-chain library pulls, ExpressLoad |
 | `makebiniigs` | MakeBinIIGS 1.2 | Load file → binary image, applies relocation dictionaries |
-| `mpwmk` | MPW Make + Shell | Runs Apple's unmodified makefiles: `ƒ` rules, `∂` continuations, `{var}` expansion, MPW `:` paths, backquotes, built-ins, and in-process dispatch to all of the above (plus MakeLibIIGS, OverlayIIGS) |
+| `reziigs` | RezIIGS | Resource compiler: type templates, the C-like preprocessor, `$$Word`/`$$Countof` builtins, `read` of converted code resources, IIgs resource file + map |
+| `mpwmk` | MPW Make + Shell | Runs Apple's unmodified makefiles: `ƒ` rules, `∂` continuations, `{var}` expansion, MPW `:` paths, backquotes, built-ins, and in-process dispatch to all of the above (plus MakeLibIIGS, OverlayIIGS, RezIIGS) |
 | `omfdump` | DumpObjIIGS (roughly) | Segment/record structure dumper for OMF files |
 | `omfdiff` | — | Structural diff of two OMF files (exit 0 = identical) |
 
 Library packages: `omf/` (OMF v1/v2/v2.1 reader/writer — round-trips real
 object files, load files, and libraries byte-for-byte), `asm/`, `link/`,
-`mpwmk/`.
+`rez/`, `mpwmk/`.
 
 ## Build
 
@@ -57,9 +58,9 @@ arrive either raw or as UTF-8), executes the shell built-ins the makefiles
 use (`Echo`, `Directory`, `Duplicate`, `Delete`, `Catenate`, `NewFolder`,
 `Set`, backquote substitution, `If`/`Else`/`End`), and dispatches tool
 invocations (`AsmIIGS`, `LinkIIGS`, `MakeBinIIGS`, `MakeLibIIGS`,
-`OverlayIIGS`) to the in-process Go implementations. `MPWMK_TOOLLOG` records
-every tool invocation with resolved paths, which is what drives replay
-testing against the original tools.
+`OverlayIIGS`, `RezIIGS`) to the in-process Go implementations.
+`MPWMK_TOOLLOG` records every tool invocation with resolved paths, which is
+what drives replay testing against the original tools.
 
 Inspect object files:
 
@@ -90,6 +91,10 @@ result. Highlights of what that process recovered:
   absolute segments), relocation encodings (cRELOC/SUPER pages), and the
   `-lib` symbol-table discipline: 512 hash buckets, ascending sweeps, and a
   move-at-most-once chain order;
+- the resource compiler's file geometry (header, map, free list, the ten
+  spare index slots), its bit-measured labels, the attribute bits behind
+  `locked`/`convert`/`preload`, and the `rResName` resources it synthesizes
+  for named resources;
 - reproducible builds: `SOURCE_DATE_EPOCH` pins `&SYSDATE`/`&SYSTIME` so
   date-stamping sources rebuild identically.
 

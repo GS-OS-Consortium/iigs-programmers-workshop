@@ -11,6 +11,7 @@ import (
 	"github.com/dagenbrock/iigs-programmers-workshop/asm"
 	"github.com/dagenbrock/iigs-programmers-workshop/link"
 	"github.com/dagenbrock/iigs-programmers-workshop/omf"
+	"github.com/dagenbrock/iigs-programmers-workshop/rez"
 )
 
 // dispatch runs one command: MPW built-ins and the IIgs cross tools.
@@ -60,6 +61,8 @@ func (e *Env) dispatch(name string, args []string, out io.Writer) error {
 			return fmt.Errorf("rename needs two paths")
 		}
 		return os.Rename(ps[0], ps[1])
+	// Mac-side Rez is a no-op here: make.os only pipes an echo through it to
+	// stamp a file type, and the disk image takes types from NAPS names.
 	case "setfile", "setfileiigs", "rez", "setversion", "backup", "target",
 		"open", "beep", "alert", "search", "addmenu", "unset", "export",
 		"exists", "confirm", "date", "files":
@@ -120,7 +123,9 @@ func (e *Env) dispatch(name string, args []string, out io.Writer) error {
 		return os.WriteFile(ps[1], dst, 0644)
 	case "makelibiigs":
 		return e.runMakeLib(args)
-	case "reziigs", "dereziigs", "expressiigs",
+	case "reziigs":
+		return e.runRez(args)
+	case "dereziigs", "expressiigs",
 		"pascaliigs", "ciigs", "tmlpascal", "asmmatiigs":
 		return fmt.Errorf("%s: not implemented yet", name)
 
@@ -212,6 +217,25 @@ func (e *Env) logAsm(input, output string, incDirs, defines, extras []string) {
 	fmt.Fprintln(f, strings.Join(rec, "\t"))
 }
 
+// logRez records a Rez compile the same way as logAsm, so the sweep can
+// replay it against the original RezIIGS.
+func (e *Env) logRez(input, output string, incDirs []string) {
+	path := os.Getenv("MPWMK_TOOLLOG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	rec := []string{"rez", input, output}
+	for _, d := range incDirs {
+		rec = append(rec, "-i", d)
+	}
+	fmt.Fprintln(f, strings.Join(rec, "\t"))
+}
+
 // logLink records a link the same way as logAsm, with every input path
 // resolved and the "-lseg NAME file(@seg)" grouping preserved: the GS/OS
 // kernel's shape comes entirely from that grouping, so replaying it verbatim
@@ -278,6 +302,52 @@ func (e *Env) catenate(args []string, out io.Writer) error {
 }
 
 // ---- tool front ends (same option grammar as the MPW tools) ----
+
+// runRez compiles Rez source into a resource file. The compiled resources
+// belong in the RESOURCE fork; since the build tree has no forks, they go to
+// a sibling "<output>.rsrc" and the (usually empty) data fork to <output>
+// itself. tools/make-disk.py pairs the two back up as NAPS.
+func (e *Env) runRez(args []string) error {
+	var input, output string
+	var incDirs []string
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; strings.ToLower(a) {
+		case "-o":
+			i++
+			output = e.HostPath(args[i])
+		case "-i":
+			i++
+			for _, d := range strings.Split(args[i], ",") {
+				incDirs = append(incDirs, e.HostPath(d))
+			}
+		case "-t", "-c", "-align":
+			i++ // file type/creator and alignment: no effect on the fork
+		case "-rd", "-p", "-ov", "-d", "-u":
+			// redeclaration warnings, progress, overwrite: diagnostics only
+		default:
+			if strings.HasPrefix(a, "-") {
+				return fmt.Errorf("reziigs: unsupported option %q", a)
+			}
+			input = e.HostPath(a)
+		}
+	}
+	if input == "" || output == "" {
+		return fmt.Errorf("reziigs: need an input file and -o")
+	}
+	// RIIGSIncludes is where the makefiles expect TypesIIGS.r to live.
+	if v := e.Get("RIIGSIncludes"); v != "" {
+		incDirs = append(incDirs, e.HostPath(v))
+	}
+	e.logRez(input, output, incDirs)
+	res, err := rez.Compile(input, incDirs)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(output, nil, 0644); err != nil {
+		return err
+	}
+	return os.WriteFile(output+".rsrc", rez.Build(res), 0644)
+}
 
 func (e *Env) runAsm(args []string) error {
 	var input, output string

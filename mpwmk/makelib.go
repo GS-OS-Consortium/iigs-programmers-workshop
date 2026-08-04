@@ -15,13 +15,13 @@ import (
 // renumbered sequentially. The dictionary (KIND $0008, load name
 // "XXXXXXXXXX", empty segment name, LENGTH 0) holds three LCONSTs:
 //
-//	1. filename table: [fileNum:2][pstring UPPERCASED path] per member
-//	2. symbol entries: [nameDisp:4][fileNum:2][flags:2][libOffset:4] --
-//	   flags is KIND & $4000 for a segment's own name and the GLOBAL/GEQU
-//	   private byte for published symbols; libOffset is the file offset of
-//	   the DEFINING segment within the library
-//	3. names: the symbols' pstrings, in encounter order (segment name
-//	   first, then its GLOBAL/GEQUs in record order)
+//  1. filename table: [fileNum:2][pstring UPPERCASED path] per member
+//  2. symbol entries: [nameDisp:4][fileNum:2][flags:2][libOffset:4] --
+//     flags is KIND & $4000 for a segment's own name and the GLOBAL/GEQU
+//     private byte for published symbols; libOffset is the file offset of
+//     the DEFINING segment within the library
+//  3. names: the symbols' pstrings, in encounter order (segment name
+//     first, then its GLOBAL/GEQUs in record order)
 func (e *Env) runMakeLib(args []string) error {
 	var out string
 	var members []string
