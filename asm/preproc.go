@@ -398,7 +398,7 @@ func (pp *ppState) processLine(raw string) {
 		switch op {
 		case "while":
 			pp.whileDepth++
-		case "endwhile":
+		case "endwhile", "endw":
 			if pp.whileDepth > 0 {
 				pp.whileDepth--
 			} else {
@@ -417,7 +417,7 @@ func (pp *ppState) processLine(raw string) {
 		pp.whileCond, pp.whileBody, pp.inWhile = cond, nil, true
 		return
 	}
-	if op == "endwhile" {
+	if op == "endwhile" || op == "endw" {
 		// A WHILE inside an inactive conditional was skipped, so its ENDWHILE
 		// is skipped too rather than reported.
 		if pp.active() {
@@ -793,7 +793,24 @@ func (pp *ppState) charVarRef(s string) bool {
 		name := strings.ToUpper(s[i+1 : j])
 		i = j - 1
 		if j < len(s) && s[j] == '(' {
-			continue // a builtin function call, not a variable
+			// A builtin call yields a value of its OWN type, so skip the
+			// whole construct -- its arguments say nothing about the
+			// comparison. M16.UTIL2's CheckSize tests
+			// "&Eval(&size)<=&Eval(&limit)", which is numeric even though
+			// both arguments are macro parameters; reading it as text made
+			// "90" > "128" and aborted MIDISynth and the MIDI tools.
+			depth := 0
+			for ; j < len(s); j++ {
+				if s[j] == '(' {
+					depth++
+				} else if s[j] == ')' {
+					if depth--; depth == 0 {
+						break
+					}
+				}
+			}
+			i = j
+			continue
 		}
 		if pp.numVars[name] {
 			continue
@@ -849,7 +866,7 @@ var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
 	"ORD": true, "SUBSTR": true, "TYPE": true, "S2I": true, "GETENV": true,
-	"DEFAULT": true,
+	"DEFAULT": true, "MAX": true, "MIN": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -1030,6 +1047,19 @@ func (pp *ppState) callFunc(name string, args []string) string {
 			return ""
 		}
 		return substr(pp.rawArg(args[:1]), pp.argNum(args[1]), pp.argNum(args[2]))
+	case "MAX", "MIN":
+		// signed numeric extrema; ACE builds its expansion tables with
+		// "(&max(&IPt-1,1))<<5" (oracle-verified, including negatives)
+		if len(args) == 0 {
+			return "0"
+		}
+		best := pp.argNum(args[0])
+		for _, a := range args[1:] {
+			if v := pp.argNum(a); (name == "MAX") == (v > best) && v != best {
+				best = v
+			}
+		}
+		return strconv.FormatInt(best, 10)
 	case "TRIM":
 		return strings.TrimSpace(pp.rawArg(args))
 	case "DEFAULT":

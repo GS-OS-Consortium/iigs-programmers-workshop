@@ -348,13 +348,10 @@ func (e *Env) runAsm(args []string) error {
 // that gquit.obj(@seg_b0) carries, not a same-named segment from another
 // file (oracle-verified in scm.lnk).
 func (e *Env) linkSel(a string, cache map[string]*omf.File) (link.Sel, error) {
-	name, seg := a, ""
-	if i := strings.Index(a, "("); i >= 0 && strings.HasSuffix(a, ")") {
-		name, seg = a[:i], strings.TrimPrefix(a[i+1:len(a)-1], "@")
-	}
+	name, segs := splitSelSpec(a)
 	p := e.HostPath(name)
 	if f, ok := cache[p]; ok {
-		return link.Sel{File: f, Seg: seg}, nil
+		return link.Sel{File: f, Segs: segs}, nil
 	}
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -365,7 +362,26 @@ func (e *Env) linkSel(a string, cache map[string]*omf.File) (link.Sel, error) {
 		return link.Sel{}, fmt.Errorf("%s: %w", filepath.Base(p), err)
 	}
 	cache[p] = f
-	return link.Sel{File: f, Seg: seg}, nil
+	return link.Sel{File: f, Segs: segs}, nil
+}
+
+// splitSelSpec splits an input spec into its path and the segment names it
+// selects. Both MPW forms are accepted: the GS/OS makefiles' single
+// "scm.obj(@oscall_seg)" and the toolbox's comma list,
+// "cursor.obj(SETCURSOR,SHIFTONE,...)" -- MIDISynth and the MIDI tools pull
+// named segments out of shared objects that way. A trailing comma is allowed.
+func splitSelSpec(a string) (string, []string) {
+	i := strings.Index(a, "(")
+	if i < 0 || !strings.HasSuffix(a, ")") {
+		return a, nil
+	}
+	var segs []string
+	for _, n := range strings.Split(a[i+1:len(a)-1], ",") {
+		if n = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(n), "@")); n != "" {
+			segs = append(segs, n)
+		}
+	}
+	return a[:i], segs
 }
 
 func (e *Env) runLink(args []string) error {
@@ -387,10 +403,6 @@ func (e *Env) runLink(args []string) error {
 			i++
 			groups = append(groups, link.Group{Name: args[i]})
 			log = append(log, "-lseg", args[i])
-		case "-lseg:dynamic":
-			i++
-			groups = append(groups, link.Group{Name: args[i], Dynamic: true})
-			log = append(log, "-lseg:dynamic", args[i])
 		case "-apw":
 			// accepted for compatibility; the oracle emits the same
 			// ~ExpressLoad form with or without it (scm.lnk replay)
@@ -406,6 +418,19 @@ func (e *Env) runLink(args []string) error {
 			log = append(log, "-x")
 		case "-w", "-l":
 		default:
+			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND the
+			// attributes define outright (see segKindAttrs)
+			if strings.HasPrefix(strings.ToLower(a), "-lseg:") {
+				kind, dyn, err := segKindAttrs(a[len("-lseg:"):])
+				if err != nil {
+					return fmt.Errorf("linkiigs %s: %w", a, err)
+				}
+				i++
+				groups = append(groups, link.Group{Name: args[i], Dynamic: dyn,
+					Kind: kind, KindSet: true})
+				log = append(log, a, args[i])
+				continue
+			}
 			if strings.HasPrefix(a, "-") {
 				return fmt.Errorf("linkiigs: unsupported option %q", a)
 			}
@@ -454,8 +479,12 @@ func (e *Env) runLink(args []string) error {
 		}
 		return os.WriteFile(output, res, 0644)
 	}
+	// An ungrouped input may still select segments -- MIDISynth links
+	// "cursor.obj(SETCURSOR,SHIFTONE,...)" straight into the main segment --
+	// so filter the parsed file down to what was named.
 	var objs []*omf.File
-	for _, p := range inputs {
+	for _, spec := range inputs {
+		p, segs := splitSelSpec(spec)
 		data, err := os.ReadFile(p)
 		if err != nil {
 			return err
@@ -463,6 +492,16 @@ func (e *Env) runLink(args []string) error {
 		f, err := omf.Parse(data)
 		if err != nil {
 			return fmt.Errorf("linkiigs %s: %w", filepath.Base(p), err)
+		}
+		if len(segs) > 0 {
+			sel := link.Sel{Segs: segs}
+			kept := &omf.File{}
+			for i := range f.Segments {
+				if sel.Wants(&f.Segments[i]) {
+					kept.Segments = append(kept.Segments, f.Segments[i])
+				}
+			}
+			f = kept
 		}
 		objs = append(objs, f)
 	}
@@ -596,4 +635,44 @@ func parseMPWNum(s string) (int64, error) {
 		return strconv.ParseInt(s[1:], 16, 64)
 	}
 	return strconv.ParseInt(s, 10, 64)
+}
+
+// segKindAttrs turns a "-lseg:" attribute list into an OMF KIND. The
+// attributes REPLACE whatever kind the group would inherit from its first
+// object segment (oracle-probed: a $4000 object becomes $0000 under
+// "-lseg:code" and $1000 under "-lseg:code:nospecial:static"). The flag bits
+// are the standard OMF ones; only those the sources actually use are
+// accepted, so a new one shows up as an error rather than silently doing
+// nothing.
+func segKindAttrs(spec string) (uint16, bool, error) {
+	var kind uint16
+	dyn := false
+	for _, a := range strings.Split(spec, ":") {
+		switch strings.ToLower(strings.TrimSpace(a)) {
+		case "", "code", "static", "public", "special", "reloadable":
+			// type 0 and the cleared-flag spellings: nothing to set
+		case "data":
+			kind |= 0x0001
+		case "dynamic":
+			kind |= 0x8000
+			dyn = true
+		case "private":
+			kind |= 0x4000
+		case "nospecial":
+			kind |= 0x1000
+		case "posindependent", "pic":
+			kind |= 0x2000
+		case "bankrelative":
+			kind |= 0x0100
+		case "skip":
+			kind |= 0x0200
+		case "reload":
+			kind |= 0x0400
+		case "absolutebank":
+			kind |= 0x0800
+		default:
+			return 0, false, fmt.Errorf("unknown -lseg attribute %q", a)
+		}
+	}
+	return kind, dyn, nil
 }

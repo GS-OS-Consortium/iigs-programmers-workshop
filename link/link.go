@@ -760,6 +760,14 @@ type Group struct {
 	Name    string
 	Sels    []Sel
 	Dynamic bool // "-lseg:dynamic": mark the load segment dynamic
+	// Kind is the load segment's OMF KIND when the -lseg option carried
+	// attributes ("-lseg:code:nospecial:static"), which REPLACE the kind the
+	// group would otherwise inherit from its first object segment rather than
+	// adding to it (oracle-probed: a $4000 object under a bare -lseg stays
+	// $4000, under "-lseg:code" becomes $0000, and under
+	// "-lseg:code:nospecial:static" becomes $1000).
+	Kind    uint16
+	KindSet bool
 }
 
 // Sel selects a whole object file, or the segments carrying one load name
@@ -768,7 +776,29 @@ type Group struct {
 // up every segment assembled under "SEG 'oscall_seg'".
 type Sel struct {
 	File *omf.File
-	Seg  string // "" = every segment in the file
+	Seg  string   // "" = every segment in the file
+	Segs []string // an explicit list, as in "cursor.obj(SETCURSOR,SHIFTONE)"
+}
+
+// wants reports whether an object segment is covered by this selection.
+func (s Sel) Wants(seg *omf.Segment) bool {
+	if s.Seg == "" && len(s.Segs) == 0 {
+		return true
+	}
+	names := s.Segs
+	if s.Seg != "" {
+		names = append([]string{s.Seg}, names...)
+	}
+	for _, n := range names {
+		if n == "" {
+			continue // a trailing comma in the source list
+		}
+		if strings.EqualFold(strings.TrimRight(seg.LoadName, " "), n) ||
+			strings.EqualFold(seg.SegName, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // LinkGroups links each group into its own load segment of one load file.
@@ -823,9 +853,7 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 			}
 			for i := range sel.File.Segments {
 				s := &sel.File.Segments[i]
-				if sel.Seg != "" &&
-					!strings.EqualFold(strings.TrimRight(s.LoadName, " "), sel.Seg) &&
-					!strings.EqualFold(s.SegName, sel.Seg) {
+				if !sel.Wants(s) {
 					continue
 				}
 				// A SKIP segment ($0200 in KIND) is an assembly-time guard,
@@ -913,6 +941,10 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		}
 		if len(segs) == 0 {
 			return nil, fmt.Errorf("load segment %q selected no object segments", g.Name)
+		}
+		// -lseg attributes replace the inherited kind outright
+		if g.KindSet {
+			b.kind = g.Kind
 		}
 		all = append(all, segs)
 		out = append(out, b)

@@ -271,7 +271,25 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 		expandTerm := func(t term, neg bool) {
 			var tv Val
 			if t.fwd != "" {
-				if !forceAll && st.imports[t.fwd] {
+				// An IMPORTed name normally stays symbolic for the linker --
+				// and an EQU of one is just an alias (MSDos.Calls). But an
+				// import declared at FILE scope loses to a definition in the
+				// REFERENCING segment: the LaserWriter driver blanket-imports
+				// Action and then defines its own in three segments, and the
+				// original resolves each locally (oracle-verified). A
+				// same-segment import keeps winning (AppleShare's PreProcess).
+				if !forceAll && st.imports[t.fwd] && st.localBeatsImport(t) {
+					if r, ok := st.nextDefScoped(t.fwd, t.scope, t.atSeq); ok {
+						tv = r
+						if neg {
+							next, _ = next.sub(tv)
+						} else {
+							next, _ = next.add(tv)
+						}
+						return
+					}
+				}
+				if !forceAll && (st.imports[t.fwd] || st.entryEqu[t.fwd]) {
 					if neg {
 						next, _ = next.sub(Val{Pos: []term{t}})
 					} else {
@@ -378,6 +396,23 @@ func (st *asmState) nextDefChain(name string, chain []int, seq int64) (Val, bool
 		}
 	}
 	return best, found
+}
+
+// nextDefScoped finds a definition of name in one segment scope only.
+func (st *asmState) nextDefScoped(name, scope string, seq int64) (Val, bool) {
+	if scope == "" {
+		return Val{}, false
+	}
+	defs := st.symSeq[scope+name]
+	if len(defs) == 0 {
+		return Val{}, false
+	}
+	for _, d := range defs {
+		if d.defSeq > seq {
+			return d, true
+		}
+	}
+	return defs[len(defs)-1], true
 }
 
 func (st *asmState) nextDef(name, scope string, seq int64) (Val, bool) {
@@ -578,7 +613,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			t = st.preferLocal(t, segIdx)
-			t = t.cancelForSeg(segIdx)
+			t = t.cancelForSegIn(segIdx, st)
 			if !t.isNum() && st.branchDeferred(t, segIdx) {
 				pos, gained := st.termRefs(t.Pos, segIdx)
 				neg, lost := st.termRefs(t.Neg, segIdx)
@@ -613,7 +648,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			t = st.preferLocal(t, segIdx)
-			t = t.cancelForSeg(segIdx)
+			t = t.cancelForSegIn(segIdx, st)
 			if t.isNum() {
 				c := applyShift(applyPost(t.C, t.Post), a.shift)
 				var b []byte
@@ -644,7 +679,7 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 				return nil, fmt.Errorf("%s:%d: %v", a.file, a.line, err)
 			}
 			t = st.preferLocal(t, segIdx)
-			t = t.cancelForSeg(segIdx)
+			t = t.cancelForSegIn(segIdx, st)
 			if t.isNum() {
 				// resolved to a constant after all (e.g. forward EQU)
 				c := applyShift(applyPost(t.C, t.Post), a.shift)

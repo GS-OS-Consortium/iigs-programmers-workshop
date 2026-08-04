@@ -128,6 +128,9 @@ type asmState struct {
 	// labels that name the segments themselves.
 	fileWide map[string]bool
 	segNames map[string]bool
+	// fileImports are IMPORTs declared outside any segment; unlike segment
+	// imports they lose to a definition in the referencing segment
+	fileImports map[string]bool
 	// definingSegName is set while beginSegment defines a segment's own name,
 	// which is the one definition of that name that stays file-wide
 	definingSegName bool
@@ -786,7 +789,8 @@ func newState() *asmState {
 		pubGseq:    map[string]int{},
 		lastPubSeq: map[string]int64{},
 		fileWide:   map[string]bool{},
-		segNames:   map[string]bool{},
+		segNames:    map[string]bool{},
+		fileImports: map[string]bool{},
 		scopeSeg:   -1,
 		scopeChain: []int{0},
 		recSize:    map[string]int64{},
@@ -891,7 +895,7 @@ func (st *asmState) doLine(l line) {
 		seg.skip = st.skipMode
 		st.openSegment(seg)
 		return
-	case "endp", "endproc", "endf":
+	case "endp", "endproc", "endf", "endfunc":
 		if st.cur != nil {
 			st.cur.endPC = st.pc
 		}
@@ -1079,8 +1083,12 @@ func (st *asmState) doLine(l line) {
 		st.blanksOff = strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "off")
 		return
 	case "title", "eject", "print", "space", "page", "pagesize",
-		"list", "nolist", "trace", "err", "obj", "noobj", "ttl":
-		return // listing/diagnostic control: no object-file effect
+		"list", "nolist", "trace", "err", "obj", "noobj", "ttl", "actr":
+		// listing/diagnostic control: no object-file effect. ACTR sets the
+		// assembler's runaway-expansion statement limit (ACE says 16384);
+		// our WHILE guard already covers that and it emits nothing
+		// (oracle-verified).
+		return
 	case "datachk", "codechk":
 		on := strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "on")
 		if op == "datachk" {
@@ -1118,9 +1126,18 @@ func (st *asmState) doLine(l line) {
 			if nm == "" {
 				continue
 			}
+			// An IMPORT standing INSIDE a segment makes the name external
+			// there even when another segment of the same file defines it
+			// (AppleShare's PreProcess). One at FILE SCOPE is weaker: a
+			// definition in the referencing segment wins over it, which is
+			// how the LaserWriter driver reaches its own jump tables after a
+			// blanket "IMPORT Action" (oracle-verified -- the original emits
+			// BADREDUCE+$DA, not a named ACTION).
 			st.imports[nm] = true // union, for resolve()
 			if st.cur != nil {
 				st.cur.imports[nm] = true
+			} else {
+				st.fileImports[nm] = true
 			}
 			// The ":TYPE" suffix may name a RECORD template, which makes the
 			// external symbol's fields reachable as NAME.FIELD (Start.aii
@@ -1398,7 +1415,11 @@ func (st *asmState) defineCodeLabel(name string) {
 	// qualified "record.field" form, as a template's fields are; the
 	// qualified name stays file-wide even though the plain name is scoped
 	// to the data segment.
-	if st.cur.kind&0x1F == 0x01 && u != st.cur.name {
+	// ...but an @local is a scratch label, not a field: qualifying it would
+	// define a non-local name, and THAT would delimit the @scope it was just
+	// defined in -- which broke every forward "@end-@start" in a data segment
+	// (the ImageWriter/LQ/StyleWriter version strings).
+	if st.cur.kind&0x1F == 0x01 && u != st.cur.name && !strings.HasPrefix(u, "@") {
 		q := st.cur.name + "." + u
 		st.fileWide[q] = true
 		st.define(q, segVal(st.curSegIndex(), st.pc))
@@ -1507,7 +1528,7 @@ func (st *asmState) doRecordLine(op string, l line) {
 		}
 	}
 	switch op {
-	case "endr", "endp", "endf", "end":
+	case "endr", "endp", "endf", "endfunc", "end":
 		// MPW closes a RECORD template with ENDR or ENDP (both appear in the
 		// GS/OS sources); END closes everything.
 		if st.recName != "" {
@@ -1767,14 +1788,17 @@ func (st *asmState) doDCB(op string, l line) {
 	if !st.storageLine(l.label) && l.label != "" {
 		st.defineCodeLabel(l.label)
 	}
-	args := splitArgs(l.rest)
+	// The operand field is cut like a DC's -- a DCB carries a field comment
+	// after its count,value just as often (ResourceMgr's
+	// "dcb.b 10*resRecSize,0<tab>10 unused index references.").
+	args := splitArgs(st.dcOperand(l.rest))
 	if len(args) != 2 {
-		st.errf("DCB.B needs count,value")
+		st.errf("DCB needs count,value (got %q)", strings.TrimSpace(l.rest))
 		return
 	}
 	n, err1 := evalNum(strings.TrimSpace(args[0]), &exprCtx{st: st})
 	if err1 != nil {
-		st.errf("DCB.B: bad operands")
+		st.errf("DCB count %q: %v", strings.TrimSpace(args[0]), err1)
 		return
 	}
 	// The fill value is a data item like any other, so under STRING PASCAL a

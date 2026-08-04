@@ -56,6 +56,18 @@ type term struct {
 // forward/backward and published/local).
 func (t term) blocksFold() bool { return t.pub && t.viaFwd }
 
+// blocksFoldIn is blocksFold with the defining segment known. In a DATA
+// segment a published symbol is named in BOTH directions (see exprRef), so it
+// blocks the fold either way: the printer drivers' templates open with
+// "StatusWindowTemp dc.w StatusWindowTempEnd-StatusWindowTemp" and the
+// original keeps the exported StatusWindowTemp symbolic (oracle-verified).
+func (st *asmState) blocksFoldIn(t term) bool {
+	if t.blocksFold() {
+		return true
+	}
+	return t.pub && t.seg >= 0 && t.seg < len(st.segs) && st.segs[t.seg].kind&0x0001 != 0
+}
+
 // postOp is an operation the linker applies after the linear part, using the
 // OMF expression opcodes ($03 multiply, $04 divide, $05 mod, $07 shift,
 // $08 AND, $09 OR, $0A EOR). It exists because an expression over published
@@ -106,17 +118,30 @@ func (v Val) isLabel() bool { return !v.isNum() }
 // hasUnresolvedFwd: any forward term that could still resolve from syms
 // (external IMPORTs never resolve and are kept symbolic).
 func (v Val) hasUnresolvedFwd(st *asmState) bool {
-	for _, t := range v.Pos {
-		if t.fwd != "" && !st.imports[t.fwd] {
-			return true
+	for _, t := range append(append([]term(nil), v.Pos...), v.Neg...) {
+		// An EXPORTed EQU is published as a GEQU, and a FORWARD reference to
+		// one is emitted by name rather than folded to its value -- the same
+		// rule published labels follow (oracle-probed; a backward reference
+		// folds). The printer drivers' dialog templates are full of them.
+		if t.fwd != "" && st.entryEqu[t.fwd] {
+			continue
 		}
-	}
-	for _, t := range v.Neg {
-		if t.fwd != "" && !st.imports[t.fwd] {
+		if t.fwd != "" && (!st.imports[t.fwd] || st.localBeatsImport(t)) {
 			return true
 		}
 	}
 	return false
+}
+
+// localBeatsImport reports whether a term names a FILE-scope import that the
+// referencing segment defines itself -- the LaserWriter case, where the local
+// label wins (see resolveMode).
+func (st *asmState) localBeatsImport(t term) bool {
+	if !st.fileImports[t.fwd] {
+		return false
+	}
+	_, ok := st.nextDefScoped(t.fwd, t.scope, t.atSeq)
+	return ok
 }
 
 func (v Val) hasFwd() bool {
@@ -163,14 +188,22 @@ outer:
 // referencing segment is known: a pair of labels in the reference's OWN
 // segment cancels even when published (a forward reference to a published
 // symbol still blocks, per blocksFold).
-func (v Val) cancelForSeg(curSeg int) Val {
+func (v Val) cancelForSeg(curSeg int) Val { return v.cancelForSegIn(curSeg, nil) }
+
+func (v Val) cancelForSegIn(curSeg int, st *asmState) Val {
+	blocks := func(t term) bool {
+		if st != nil {
+			return st.blocksFoldIn(t)
+		}
+		return t.blocksFold()
+	}
 	pos := append([]term(nil), v.Pos...)
 	var neg []term
 outer:
 	for _, n := range v.Neg {
-		if n.fwd == "" && n.seg == curSeg && !n.blocksFold() {
+		if n.fwd == "" && n.seg == curSeg && !blocks(n) {
 			for i, p := range pos {
-				if p.fwd == "" && p.seg == curSeg && !p.blocksFold() {
+				if p.fwd == "" && p.seg == curSeg && !blocks(p) {
 					pos = append(pos[:i], pos[i+1:]...)
 					continue outer
 				}

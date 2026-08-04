@@ -173,10 +173,14 @@ var opTable = map[string][]modeEnt{
 	"tay": {{Implied, 0xA8, cpu6502}},
 	"tcd": {{Implied, 0x5B, cpu65816}},
 	"tcs": {{Implied, 0x1B, cpu65816}},
+	// TAS/TSA are the MPW IIGS spellings of TCS/TSC (oracle-verified);
+	// Sys.Resources' Thermodial uses them.
+	"tas": {{Implied, 0x1B, cpu65816}},
 	"tdc": {{Implied, 0x7B, cpu65816}},
 	"trb": {{DP, 0x14, cpu65C02}, {Abs, 0x1C, cpu65C02}},
 	"tsb": {{DP, 0x04, cpu65C02}, {Abs, 0x0C, cpu65C02}},
 	"tsc": {{Implied, 0x3B, cpu65816}},
+	"tsa": {{Implied, 0x3B, cpu65816}},
 	"tsx": {{Implied, 0xBA, cpu6502}},
 	"txa": {{Implied, 0x8A, cpu6502}},
 	"txs": {{Implied, 0x9A, cpu6502}},
