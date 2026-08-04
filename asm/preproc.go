@@ -793,12 +793,14 @@ func (pp *ppState) charVarRef(s string) bool {
 		name := strings.ToUpper(s[i+1 : j])
 		i = j - 1
 		if j < len(s) && s[j] == '(' {
-			// A builtin call yields a value of its OWN type, so skip the
-			// whole construct -- its arguments say nothing about the
-			// comparison. M16.UTIL2's CheckSize tests
-			// "&Eval(&size)<=&Eval(&limit)", which is numeric even though
-			// both arguments are macro parameters; reading it as text made
-			// "90" > "128" and aborted MIDISynth and the MIDI tools.
+			// A builtin call has a value of its OWN type -- its arguments say
+			// nothing about the comparison. "&Eval(&size)<=&Eval(&limit)" is
+			// NUMERIC even though both arguments are macro parameters (reading
+			// it as text made "90" > "128" and aborted MIDISynth on its own
+			// size assertion), while "&SETTING('LONGA')='ON'" is CHARACTER
+			// and must compare as text -- VideoMix defines "On equ true", so
+			// comparing numerically silently took the wrong branch of
+			// M16's pushword and cost a byte per push.
 			depth := 0
 			for ; j < len(s); j++ {
 				if s[j] == '(' {
@@ -810,6 +812,9 @@ func (pp *ppState) charVarRef(s string) bool {
 				}
 			}
 			i = j
+			if !numericFuncs[name] {
+				return true
+			}
 			continue
 		}
 		if pp.numVars[name] {
@@ -861,6 +866,13 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 }
 
 // ---------- & substitution ----------
+
+// numericFuncs are the builtins whose RESULT is arithmetic; every other one
+// yields a character value (see charVarRef).
+var numericFuncs = map[string]bool{
+	"EVAL": true, "ORD": true, "LEN": true, "S2I": true,
+	"MAX": true, "MIN": true,
+}
 
 var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,

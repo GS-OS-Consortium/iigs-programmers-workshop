@@ -673,8 +673,11 @@ func (st *asmState) dcOperand(s string) string {
 			// "++"/"--"/"**"/"<<" are the word-form OR/XOR/AND and shift
 			// operators, so a doubled character continues too (DOS3.3's
 			// copy_tbl is "dc.w 0 ++ \" continued over 16 "copy << n ++"
-			// lines).
-			if k < len(s) && strings.IndexByte("+-*/&|^<>=", s[k]) >= 0 {
+			// lines). A COMMA continues it as well: the ImageWriter drivers
+			// space out their tables as "dc.b $5B,50 , $5D,50 , $43,00" and
+			// the whole line is one item list (oracle-verified -- stopping at
+			// the first blank cost 6 of every 8 bytes of intl_tbl).
+			if k < len(s) && strings.IndexByte(",+-*/&|^<>=", s[k]) >= 0 {
 				continue
 			}
 			return s[:i]

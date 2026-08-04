@@ -68,6 +68,13 @@ omfdump -v file.obj
 omfdiff a.obj b.obj
 ```
 
+When a byte-diff says "our segment is N bytes short", `ASMIIGS_SEGMAP` maps a
+segment's image offsets back to the source lines that produced them:
+
+```sh
+ASMIIGS_SEGMAP=IMAGERPROC asmiigs imager.aii -o /dev/null    # writes to stderr
+```
+
 ## How correctness is established
 
 None of the MPW IIGS file formats or tool behaviors are fully documented, so

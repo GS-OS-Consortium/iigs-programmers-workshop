@@ -158,6 +158,13 @@ func (v Val) hasFwd() bool {
 	return false
 }
 
+// sameSymbol reports whether two resolved terms denote the very same
+// definition -- same segment, same offset, and the same published name.
+func sameSymbol(a, b term) bool {
+	return a.seg == b.seg && a.symOff == b.symOff && a.name == b.name &&
+		a.defSeq == b.defSeq
+}
+
 // cancel removes resolved same-segment pos/neg pairs. A pair naming a
 // PUBLISHED symbol is left alone here: whether it folds depends on where the
 // REFERENCE stands (same segment as the labels: folds, like ud3.5's
@@ -170,6 +177,18 @@ func (v Val) cancel() Val {
 	var neg []term
 outer:
 	for _, n := range v.Neg {
+		// A symbol minus ITSELF is zero however it is published: the
+		// GraphiCard driver writes "ldy #(ApplePic-ApplePic)" against an
+		// EXPORTed label and the original folds it (oracle-verified, while
+		// two DIFFERENT published labels stay symbolic).
+		if n.fwd == "" {
+			for i, p := range pos {
+				if p.fwd == "" && sameSymbol(p, n) {
+					pos = append(pos[:i], pos[i+1:]...)
+					continue outer
+				}
+			}
+		}
 		if n.fwd == "" && !n.pub && !n.blocksFold() {
 			for i, p := range pos {
 				if p.fwd == "" && p.seg == n.seg && !p.pub && !p.blocksFold() {

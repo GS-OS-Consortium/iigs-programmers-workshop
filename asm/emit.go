@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // OMF record opcodes emitted by the assembler (kept local to avoid a
@@ -575,7 +576,25 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 			break
 		}
 	}
+	// ASMIIGS_SEGMAP=<segment> prints an offset -> source line map for one
+	// segment on stderr. Byte-diffing against the original constantly turns
+	// up "our segment is N bytes short"; this is how you get from an image
+	// offset back to the line that produced it.
+	segMap := os.Getenv("ASMIIGS_SEGMAP") != "" &&
+		strings.EqualFold(os.Getenv("ASMIIGS_SEGMAP"), seg.name)
+	mapPos := int64(0)
 	for _, a := range seg.actions {
+		if segMap {
+			fmt.Fprintf(os.Stderr, "SEGMAP $%04X %s:%d\n", mapPos, a.file, a.line)
+			switch a.kind {
+			case aBytes:
+				mapPos += int64(len(a.bytes))
+			case aDS:
+				mapPos += a.count
+			case aBranch, aExpr, aDefer:
+				mapPos += int64(a.size)
+			}
+		}
 		switch a.kind {
 		case aBytes:
 			e.bytes(a.bytes)
