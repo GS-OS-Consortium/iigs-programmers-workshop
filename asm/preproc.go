@@ -392,6 +392,19 @@ func (pp *ppState) processLine(raw string) {
 	l := splitLine(raw)
 	op := strings.ToLower(l.op)
 
+	// A GOTO skips forward to the line whose label field holds the matching
+	// sequence symbol (".tl1"); everything in between is not assembled --
+	// including any WHILE...ENDWHILE it passes over, so this check comes
+	// before the WHILE capture (ExitCode's "IF ... GOTO .LARGEFRAME" jumps
+	// across .SMALLFRAME's pull loops). The target line itself still
+	// assembles -- ".a phb" both marks the target and holds an instruction.
+	if pp.gotoTarget != "" && !pp.inWhile {
+		if !strings.EqualFold(l.label, pp.gotoTarget) {
+			return
+		}
+		pp.gotoTarget = ""
+	}
+
 	// WHILE cond DO ... ENDWHILE: capture the body, then run it while the
 	// condition holds. The gsos HEX macro walks a string this way.
 	if pp.inWhile {
@@ -426,10 +439,6 @@ func (pp *ppState) processLine(raw string) {
 		return
 	}
 
-	// A GOTO skips forward to the line whose label field holds the matching
-	// sequence symbol (".tl1"); everything in between is not assembled. The
-	// target line itself still is -- ".a phb" both marks the target and
-	// assembles an instruction.
 	if pp.gotoTarget != "" {
 		if !strings.EqualFold(l.label, pp.gotoTarget) {
 			return

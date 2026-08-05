@@ -268,6 +268,15 @@ func (e *constEval) builtin(t token) (int64, error) {
 
 	switch name {
 	case "countof", "optionalcount":
+		// inside an array element, the per-element count (recorded by
+		// setCount under "name#i") wins over whatever the previous element
+		// left under the bare key
+		if l := len(e.em.arrStack); l > 0 {
+			key := fmt.Sprintf("%s#%d", arg, e.em.arrStack[l-1].idx)
+			if v, ok := e.em.counts[key]; ok {
+				return v, nil
+			}
+		}
 		return e.em.counts[arg], nil
 	case "arrayindex":
 		// index (1-based) of the element being emitted in the named

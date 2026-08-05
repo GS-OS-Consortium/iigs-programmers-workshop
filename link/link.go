@@ -233,6 +233,12 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 						v <<= uint(shift)
 					}
 					putLE(image[pc:], v, size)
+				} else if kind&0x0100 != 0 && size == 2 && shift == 0 {
+					// a BANK-RELATIVE segment ($0100) is loaded on a bank
+					// boundary, so a 2-byte in-segment reference IS the
+					// target's offset: resolved absolutely, no relocation
+					// record (oracle-verified: the Finder's -lseg:$1100)
+					putLE(image[pc:], val, size)
 				} else {
 					putLE(image[pc:], val, size)
 					patches = append(patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
@@ -1143,6 +1149,14 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 							v <<= uint(shift)
 						}
 						putLE(b.image[pc:], v, size)
+					case tgt >= 0 && tgt != gi &&
+						out[tgt].kind&0x0100 != 0 && !isDynamic(tgt) &&
+						size == 2 && shift == 0:
+						// a 2-byte reference INTO a bank-relative segment is
+						// the target's own bank offset -- absolute, no
+						// relocation, from any segment (oracle-verified:
+						// references into the Finder's FINDER group)
+						putLE(b.image[pc:], val, size)
 					case tgt >= 0 && tgt != gi:
 						// cross-segment: an interseg relocation. A target in
 						// a dynamic segment is reached through its ~JumpTable
@@ -1174,7 +1188,13 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 							interseg: true, seg: seg, segoff: segoff})
 					default:
 						putLE(b.image[pc:], val, size)
-						b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
+						// a BANK-RELATIVE load segment ($0100) sits on a bank
+						// boundary: a 2-byte in-segment reference is the
+						// target's own offset, absolute, with no relocation
+						// (oracle-verified: the Finder's -lseg:$1100 FINDER)
+						if b.kind&0x0100 == 0 || size != 2 || shift != 0 {
+							b.patches = append(b.patches, relocPatch{size: size, shift: shift, offset: pc, value: val})
+						}
 					}
 					pc += int64(size)
 				case r.Op == omf.RecRelexpr:

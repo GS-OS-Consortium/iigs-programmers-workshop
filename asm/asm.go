@@ -1809,6 +1809,10 @@ func (st *asmState) doDC(op string, l line) {
 			} else if st.strMode == "C" {
 				// STRING C: NUL-terminated (DOS3.3.FST's volume name table)
 				b = append(b, 0)
+			} else if st.strMode == "GSOS" {
+				// STRING GSOS: word length prefix (the Finder's wstrSystem
+				// -- oracle-verified "06 00 SYSTEM")
+				b = append([]byte{byte(len(b)), byte(len(b) >> 8)}, b...)
 			}
 			st.emitBytes(b...)
 			continue
@@ -1892,11 +1896,12 @@ func (st *asmState) doDCB(op string, l line) {
 			}
 		}
 		b = append([]byte{byte(len(b))}, b...)
-		var out []byte
+		// each repeat is its own emission unit: a CONST/LCONST run fills
+		// out to 255 THROUGH a DCB fill instead of flushing before it
+		// (oracle-verified: the Finder's alert-frame "dcb.b 58,'_'")
 		for i := int64(0); i < n; i++ {
-			out = append(out, b...)
+			st.emitBytes(b...)
 		}
-		st.emitBytes(out...)
 		return
 	}
 	v, err2 := evalNum(strings.TrimSpace(args[1]), &exprCtx{st: st})
@@ -1919,13 +1924,14 @@ func (st *asmState) doDCB(op string, l line) {
 		st.pc += n * unit
 		return
 	}
-	b := make([]byte, 0, n*unit)
-	for i := int64(0); i < n; i++ {
-		for k := int64(0); k < unit; k++ {
-			b = append(b, byte(v>>(8*k)))
-		}
+	// each repeat is its own emission unit (see the string form above)
+	b := make([]byte, unit)
+	for k := int64(0); k < unit; k++ {
+		b[k] = byte(v >> (8 * k))
 	}
-	st.emitBytes(b...)
+	for i := int64(0); i < n; i++ {
+		st.emitBytes(b...)
+	}
 }
 
 func unquote(s string) (string, error) {
@@ -2221,6 +2227,21 @@ func parseOperand(mn, s string) (Mode, string, error) {
 		return Accum, "", nil
 	}
 	if s[0] == '#' {
+		// A '#' on a mnemonic with no immediate mode is tolerated and the
+		// operand is an address: the Finder's PushZLong writes "pei #dp"
+		// (oracle-verified: pei #$10, pei <$10 and pei $10 all emit D4 10).
+		if ents, ok := opTable[strings.ToLower(mn)]; ok {
+			hasImm := false
+			for _, e := range ents {
+				if e.m == ImmM || e.m == ImmX || e.m == Imm8 {
+					hasImm = true
+					break
+				}
+			}
+			if !hasImm {
+				return DP, s[1:], nil
+			}
+		}
 		return ImmM, s[1:], nil
 	}
 	low := strings.ToLower(s)

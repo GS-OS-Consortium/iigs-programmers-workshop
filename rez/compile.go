@@ -345,6 +345,11 @@ func (c *Compiler) parseRead(p *parser, baseDir string) error {
 	p.accept(";")
 
 	path := ft.text
+	// an MPW relative path: ":Sub:File" is Sub/File from the source's
+	// directory (the Finder reads ":KeyboardNav:KeyboardNavRsrc")
+	if strings.HasPrefix(path, ":") {
+		path = strings.ReplaceAll(strings.TrimPrefix(path, ":"), ":", "/")
+	}
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(baseDir, path)
 	}

@@ -29,9 +29,12 @@ type segEmitter struct {
 }
 
 // bytes appends one emission unit, flushing first if the unit would push the
-// pending run past 255 bytes (oracle-verified chunking rule).
+// pending run past 255 bytes (oracle-verified chunking rule). An OVERSIZED
+// unit (a single string longer than 255 bytes -- the Finder's TextAlertStr)
+// does not flush first: the pending run fills out to 255 and the unit chunks
+// straight through.
 func (e *segEmitter) bytes(b []byte) {
-	if len(e.pending) > 0 && len(e.pending)+len(b) > 0xFF {
+	if len(e.pending) > 0 && len(e.pending)+len(b) > 0xFF && len(b) <= 0xFF {
 		e.flush()
 	}
 	e.pending = append(e.pending, b...)

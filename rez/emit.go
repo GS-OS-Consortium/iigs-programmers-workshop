@@ -178,6 +178,21 @@ func (e *emitter) dataEnd() bool {
 	return t.kind == tEOF || t.is("}") || t.is(";")
 }
 
+
+// setCount records an array/optional-group element count. Inside an array
+// element the count is also keyed per element ("name#i"), the same way
+// labels are: each OneDoc in the Finder's rBundle has its own
+// $$OptionalCount(Results), and the bare key alone would hand element i the
+// count element i-1 left behind (the scouting passes make the per-element
+// key available before it is read).
+func (e *emitter) setCount(name string, n int64) {
+	key := strings.ToLower(name)
+	e.counts[key] = n
+	if l := len(e.arrStack); l > 0 {
+		e.counts[fmt.Sprintf("%s#%d", key, e.arrStack[l-1].idx)] = n
+	}
+}
+
 func (e *emitter) field(f *field) error {
 	if f.label != "" {
 		key := strings.ToLower(f.label)
@@ -213,7 +228,7 @@ func (e *emitter) field(f *field) error {
 				e.p.accept(",")
 				n++
 			}
-			e.counts[strings.ToLower(f.arrayName)] = n
+			e.setCount(f.arrayName, n)
 		} else if err := e.fields(f.sub); err != nil {
 			return err
 		}
@@ -304,7 +319,7 @@ func (e *emitter) field(f *field) error {
 			}
 		}
 		if f.arrayName != "" {
-			e.counts[strings.ToLower(f.arrayName)] = n
+			e.setCount(f.arrayName, n)
 		}
 		return nil
 

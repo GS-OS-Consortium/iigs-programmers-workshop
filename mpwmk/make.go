@@ -347,6 +347,9 @@ func (b *Builder) matchSuffix(host string) (*Rule, string, string) {
 			dirs = append(dirs, strings.TrimRight(b.Env.HostPath(d), "/"))
 		}
 	}
+	if os.Getenv("MPWMK_DBGSFX") != "" {
+		fmt.Fprintf(os.Stderr, "DBGSFX host=%s dirs=%v nsuffix=%d\n", host, dirs, len(b.MF.suffix))
+	}
 	for _, r := range b.MF.suffix {
 		tgtSfx, depSfx, _ := suffixPair(r)
 		// a suffix may span several dots (".asm.obj"), so match the whole

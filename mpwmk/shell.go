@@ -115,7 +115,9 @@ func (e *Env) HostPath(p string) string {
 		return ""
 	}
 	// MPW quotes protect spaces in names; they are not part of the path.
+	// Both kinds: the Finder writes SrcDir = ':'.
 	p = strings.ReplaceAll(p, "\"", "")
+	p = strings.ReplaceAll(p, "'", "")
 	if strings.HasPrefix(p, "/") { // already a host path
 		// MPW directory values keep a trailing ':' and may use ':' separators
 		p = strings.TrimSuffix(p, ":")
