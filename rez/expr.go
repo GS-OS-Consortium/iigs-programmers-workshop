@@ -184,17 +184,38 @@ func (e *constEval) primary() (int64, error) {
 				return v, nil
 			}
 		}
-		// a label recorded during emission
+		// a label recorded during emission; "label[expr]" addresses one
+		// instance of a label defined inside an array element (rPicture)
 		if e.em != nil {
-			if off, ok := e.em.labels[strings.ToLower(t.text)]; ok {
+			key := strings.ToLower(t.text)
+			if e.peek().is("[") {
+				e.next()
+				idx, err := e.expr(0)
+				if err != nil {
+					return 0, err
+				}
+				if !e.peek().is("]") {
+					return 0, fmt.Errorf("missing ] after %s[", t.text)
+				}
+				e.next()
+				key = fmt.Sprintf("%s#%d", key, idx)
+				if off, ok := e.em.labels[key]; ok {
+					return int64(off), nil
+				}
+				if e.em.pass1 {
+					return 0, nil
+				}
+				return 0, fmt.Errorf("%s:%d: unknown label instance %q", t.file, t.line, key)
+			}
+			if off, ok := e.em.labels[key]; ok {
 				return int64(off), nil
 			}
 		}
-		if body, ok := e.c.defs[t.text]; ok {
+		if body, ok := e.c.defs[strings.ToLower(t.text)]; ok {
 			if e.seen == nil {
 				e.seen = map[string]bool{}
 			}
-			if e.seen[t.text] {
+			if e.seen[strings.ToLower(t.text)] {
 				return 0, fmt.Errorf("recursive definition of %q", t.text)
 			}
 			e.seen[t.text] = true
@@ -224,17 +245,39 @@ func (e *constEval) builtin(t token) (int64, error) {
 	e.next()
 	argTok := e.next()
 	arg := strings.ToLower(argTok.text)
+	if e.em == nil {
+		return 0, fmt.Errorf("%s is only valid while emitting a resource", t.text)
+	}
+	// the argument may be an indexed label instance: $$Word(ClipStart[expr])
+	if e.peek().is("[") {
+		e.next()
+		idx, err := e.expr(0)
+		if err != nil {
+			return 0, err
+		}
+		if !e.peek().is("]") {
+			return 0, fmt.Errorf("missing ] in %s argument", t.text)
+		}
+		e.next()
+		arg = fmt.Sprintf("%s#%d", arg, idx)
+	}
 	if !e.peek().is(")") {
 		return 0, fmt.Errorf("%s(: missing )", t.text)
 	}
 	e.next()
 
-	if e.em == nil {
-		return 0, fmt.Errorf("%s is only valid while emitting a resource", t.text)
-	}
 	switch name {
 	case "countof", "optionalcount":
 		return e.em.counts[arg], nil
+	case "arrayindex":
+		// index (1-based) of the element being emitted in the named
+		// enclosing array
+		for i := len(e.em.arrStack) - 1; i >= 0; i-- {
+			if e.em.arrStack[i].name == arg {
+				return e.em.arrStack[i].idx, nil
+			}
+		}
+		return 0, fmt.Errorf("$$ArrayIndex(%s): not inside that array", argTok.text)
 	case "word", "byte", "long":
 		bitOff, ok := e.em.labels[arg]
 		off := bitOff / 8 // labels are bit offsets; these builtins read bytes

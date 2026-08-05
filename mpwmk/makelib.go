@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/dagenbrock/iigs-programmers-workshop/omf"
@@ -70,7 +71,10 @@ func (e *Env) runMakeLib(args []string) error {
 
 	var fntab []byte
 	for fi, f := range files {
-		p := strings.ToUpper(f.path)
+		// the table holds the member's FILENAME, uppercased -- not the path
+		// it was given by (":Objects:GString.lib.obj" -> "GSTRING.LIB.OBJ",
+		// oracle-verified against the Installer's GSOString.lib)
+		p := strings.ToUpper(filepath.Base(f.path))
 		fntab = le.AppendUint16(fntab, uint16(fi+1))
 		fntab = append(fntab, byte(len(p)))
 		fntab = append(fntab, p...)

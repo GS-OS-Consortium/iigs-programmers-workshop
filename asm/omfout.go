@@ -13,6 +13,7 @@ type Segment struct {
 	Kind       uint16 // OMF KIND: $4000 private code, $4001 private data
 	KindSet    bool   // Kind is explicit, so a zero value means KIND $0000
 	Skip       bool   // KIND SKIP bit ($0200), set by the sticky PROC SKIP mode
+	Attrs      uint16 // KIND attribute bits from the sticky SegAttr mode
 	Align      int64  // PROC ALIGN n (segment alignment), 0 = none
 	Length     int64
 	Records    []byte
@@ -61,10 +62,11 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	if s.Skip {
 		kind |= 0x0200
 	}
-	// The low five bits of KIND are the segment type; type 1 is data, and a
-	// data segment carries BANKSIZE 0 whatever its attribute bits say
-	// (oracle-verified for both $4001 and the exported $0001).
-	if kind&0x1F != 0x01 {
+	kind |= s.Attrs
+	// The low five bits of KIND are the segment type; data ($01) and
+	// DP/stack ($12) segments carry BANKSIZE 0 whatever their attribute
+	// bits say (oracle-verified for $4001, the exported $0001, and $4012).
+	if t := kind & 0x1F; t != 0x01 && t != 0x12 {
 		le.PutUint32(hdr[0x10:], 0x10000) // BANKSIZE
 	}
 	le.PutUint16(hdr[0x14:], kind)          // KIND

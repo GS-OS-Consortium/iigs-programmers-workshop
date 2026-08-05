@@ -279,7 +279,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 				// Action and then defines its own in three segments, and the
 				// original resolves each locally (oracle-verified). A
 				// same-segment import keeps winning (AppleShare's PreProcess).
-				if !forceAll && st.imports[t.fwd] && st.localBeatsImport(t) {
+				if !forceAll && st.fileImports[t.fwd] && !st.segImports[t.scope+t.fwd] {
 					if r, ok := st.nextDefScoped(t.fwd, t.scope, t.atSeq); ok {
 						tv = r
 						if neg {
@@ -290,7 +290,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 						return
 					}
 				}
-				if !forceAll && (st.imports[t.fwd] || st.entryEqu[t.fwd]) {
+				if !forceAll && (st.importSymbolic(t) || st.entryEqu[t.fwd]) {
 					if neg {
 						next, _ = next.sub(Val{Pos: []term{t}})
 					} else {
@@ -315,6 +315,7 @@ func (st *asmState) resolveMode(v Val, forceAll bool) (Val, error) {
 					// ("brl main_exit" in MSDos.Calls) becomes a RELEXPR
 					// naming the target (oracle-probed).
 					st.imports[t.fwd] = true
+					st.assumedImports[t.fwd] = true
 					if neg {
 						next, _ = next.sub(Val{Pos: []term{t}})
 					} else {
@@ -727,6 +728,6 @@ func (st *asmState) emitSegment(seg *segState) (*Segment, error) {
 		}
 	}
 	return &Segment{Name: seg.name, LoadName: seg.loadName, Org: seg.org, Kind: seg.kind, KindSet: seg.kindSet,
-		Skip: seg.skip, Align: seg.align, TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
+		Skip: seg.skip, Attrs: seg.attrs, Align: seg.align, TempOrg: seg.tempOrg, HasTempOrg: seg.hasTempOrg,
 		Length: seg.endPC, Records: e.end()}, nil
 }

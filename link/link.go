@@ -552,7 +552,9 @@ func segHeader(name string, segNum, byteCnt, imageLen int, org int64, kind uint1
 	le.PutUint32(hdr[0x08:], uint32(imageLen))
 	hdr[0x0E] = 4
 	hdr[0x0F] = 2
-	if banksize {
+	// a DP/stack segment (type $12) carries BANKSIZE 0 like a data segment
+	// (oracle-verified against the Installer's ~direct)
+	if banksize && kind&0x1F != 0x12 {
 		le.PutUint32(hdr[0x10:], 0x10000)
 	}
 	le.PutUint16(hdr[0x14:], kind)
@@ -838,6 +840,10 @@ type Sel struct {
 	File *omf.File
 	Seg  string   // "" = every segment in the file
 	Segs []string // an explicit list, as in "cursor.obj(SETCURSOR,SHIFTONE)"
+	// Exact selects by load name only, case-sensitively: automatic
+	// per-load-name grouping must keep the Installer's 'Main' and the
+	// library default 'main' apart (the original linker does).
+	Exact bool
 }
 
 // wants reports whether an object segment is covered by this selection.
@@ -852,6 +858,12 @@ func (s Sel) Wants(seg *omf.Segment) bool {
 	for _, n := range names {
 		if n == "" {
 			continue // a trailing comma in the source list
+		}
+		if s.Exact {
+			if strings.TrimRight(seg.LoadName, " ") == n {
+				return true
+			}
+			continue
 		}
 		if strings.EqualFold(strings.TrimRight(seg.LoadName, " "), n) ||
 			strings.EqualFold(seg.SegName, n) {
@@ -1323,7 +1335,7 @@ func groupByLoadName(objs []*omf.File) []Group {
 	for _, n := range order {
 		g := Group{Name: n}
 		for _, f := range objs {
-			g.Sels = append(g.Sels, Sel{File: f, Seg: n})
+			g.Sels = append(g.Sels, Sel{File: f, Seg: n, Exact: true})
 		}
 		gs = append(gs, g)
 	}

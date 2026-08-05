@@ -30,8 +30,11 @@ func newPreproc(incDirs []string) *preproc {
 		defs:    map[string][]token{},
 		seen:    map[string]bool{},
 	}
-	p.defs["RezIIGS"] = []token{{kind: tNumber, num: 1, text: "1"}}
-	p.defs["DeRezIIGS"] = []token{{kind: tNumber, num: 0, text: "0"}}
+	// Rez's preprocessor is case-insensitive like the rest of the language
+	// (the Installer writes "resource rPstring" against "#define rPString"),
+	// so define names are keyed lowercased everywhere.
+	p.defs["reziigs"] = []token{{kind: tNumber, num: 1, text: "1"}}
+	p.defs["dereziigs"] = []token{{kind: tNumber, num: 0, text: "0"}}
 	return p
 }
 
@@ -191,10 +194,10 @@ func (p *preproc) text(src, path string) error {
 			if !active() || len(line) == 0 {
 				break
 			}
-			p.defs[line[0].text] = append([]token(nil), line[1:]...)
+			p.defs[strings.ToLower(line[0].text)] = append([]token(nil), line[1:]...)
 		case "undef":
 			if active() && len(line) > 0 {
-				delete(p.defs, line[0].text)
+				delete(p.defs, strings.ToLower(line[0].text))
 			}
 		case "include":
 			if !active() {
@@ -226,9 +229,10 @@ func (p *preproc) text(src, path string) error {
 // emit appends a token, expanding object-like macros.
 func (p *preproc) emit(t token, l *lexer) error {
 	if t.kind == tIdent {
-		if body, ok := p.defs[t.text]; ok && !p.seen[t.text] {
-			p.seen[t.text] = true
-			defer delete(p.seen, t.text)
+		key := strings.ToLower(t.text)
+		if body, ok := p.defs[key]; ok && !p.seen[key] {
+			p.seen[key] = true
+			defer delete(p.seen, key)
 			for _, b := range body {
 				b.file, b.line = t.file, t.line
 				if err := p.emit(b, l); err != nil {
@@ -263,7 +267,7 @@ func (p *preproc) restOfLine(l *lexer) ([]token, error) {
 }
 
 func (p *preproc) defined(name string) bool {
-	_, ok := p.defs[name]
+	_, ok := p.defs[strings.ToLower(name)]
 	return ok
 }
 
@@ -319,7 +323,7 @@ func (p *preproc) expandCond(line []token, depth int) ([]token, error) {
 			continue
 		}
 		if t.kind == tIdent {
-			if body, ok := p.defs[t.text]; ok {
+			if body, ok := p.defs[strings.ToLower(t.text)]; ok {
 				sub, err := p.expandCond(body, depth+1)
 				if err != nil {
 					return nil, err

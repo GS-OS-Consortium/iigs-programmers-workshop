@@ -29,9 +29,10 @@ type Makefile struct {
 
 // suffixPair reports the target and dependency suffixes of a rule like
 // ".oii ƒ .aii", or ok=false if it is an ordinary rule. A suffix may itself
-// contain dots: StdFile's ".asm.obj ƒ .asm".
+// contain dots: StdFile's ".asm.obj ƒ .asm". Deps after the first are plain
+// extra dependencies (the Finder's ".obj ƒ .aii DP.equ Finder.equ ...").
 func suffixPair(r *Rule) (tgt, dep string, ok bool) {
-	if len(r.Targets) != 1 || len(r.Deps) != 1 {
+	if len(r.Targets) != 1 || len(r.Deps) < 1 {
 		return "", "", false
 	}
 	t, d := r.Targets[0], r.Deps[0]
@@ -262,6 +263,16 @@ func (b *Builder) Build(target string) error {
 		}
 		if fi, err := os.Stat(b.Env.HostPath(sfxDep)); err == nil {
 			newest = fi.ModTime()
+		}
+		// deps after the suffix are plain extra dependencies
+		// (".obj ƒ .aii DP.equ Finder.equ ...")
+		for _, d := range sfx.Deps[1:] {
+			if err := b.Build(d); err != nil {
+				return err
+			}
+			if fi, err := os.Stat(b.Env.HostPath(d)); err == nil && fi.ModTime().After(newest) {
+				newest = fi.ModTime()
+			}
 		}
 	}
 	if rule == nil {

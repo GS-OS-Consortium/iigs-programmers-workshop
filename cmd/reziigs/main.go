@@ -19,7 +19,7 @@ import (
 
 func main() {
 	var input, out string
-	var incDirs []string
+	var incDirs, defines []string
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
@@ -37,6 +37,12 @@ func main() {
 			incDirs = append(incDirs, strings.Split(args[i], ",")...)
 		case a == "-t" || a == "-c":
 			i++ // ProDOS type / creator: file metadata, not fork content
+		case a == "-d":
+			i++
+			if i >= len(args) {
+				die("missing argument to -d")
+			}
+			defines = append(defines, args[i])
 		case a == "-rd" || a == "-p" || a == "-ov":
 			// -rd: no redeclaration warnings; -p: progress; -ov: overwrite
 		case strings.HasPrefix(a, "-"):
@@ -49,9 +55,15 @@ func main() {
 		die("usage: reziigs [-i dir] file.r -o outfile")
 	}
 
-	res, err := rez.Compile(input, incDirs)
+	res, err := rez.Compile(input, incDirs, defines...)
 	if err != nil {
 		die("%v", err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		if err := os.WriteFile(out+".rsrc", rez.Build(res), 0644); err != nil {
+			die("%v", err)
+		}
+		return
 	}
 	if err := os.WriteFile(out, nil, 0644); err != nil {
 		die("%v", err)

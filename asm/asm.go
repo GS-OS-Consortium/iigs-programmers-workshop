@@ -58,6 +58,7 @@ type segState struct {
 	kind       uint16 // OMF KIND ($4001 for a data segment from bare RECORD)
 	kindSet    bool   // kind was set explicitly (PROC EXPORT clears to $0000)
 	skip       bool   // OMF KIND SKIP bit ($0200), from the sticky PROC SKIP mode
+	attrs      uint16 // OMF KIND attribute bits from the sticky SegAttr mode
 	actions    []action
 	endPC      int64
 	// storage marks the one-line data segment a file-scope storage
@@ -117,7 +118,15 @@ type asmState struct {
 	// labels (common in this corpus) must not collapse to the last one.
 	symSeq  map[string][]Val
 	defSeq  int64           // monotonically increasing definition counter
-	imports map[string]bool // IMPORTed external symbols
+	imports map[string]bool // IMPORTed external symbols (union of all scopes)
+	// segImports records IMPORTs declared inside a segment, keyed
+	// scopePrefix+name: they force a reference symbolic only in THAT
+	// segment. The Installer's seg 6 "Import inControl" must not stop seg
+	// 2's forward reference from binding to seg 2's own local inControl
+	// (oracle-verified). assumedImports are names made external globally:
+	// RECORD IMPORT and the -unsafe "Undefined ID -- IMPORT assumed" path.
+	segImports     map[string]bool
+	assumedImports map[string]bool
 	entries map[string]bool // ENTRY/EXPORT labels awaiting definition
 	// entryPriv is the GLOBAL record's private byte: ENTRY publishes 1,
 	// EXPORT 0. entryEqu holds the names declared "name:EQU", which resolve
@@ -199,6 +208,11 @@ type asmState struct {
 	// once a PROC carries SKIP every later segment keeps the KIND bit until a
 	// PROC carries NOSKIP (oracle-probed).
 	skipMode bool
+	// segAttrMode is the sticky SegAttr state, OR'd into every later
+	// segment's KIND: Dynamic sets $8000, Bank $nn sets $0800 with the bank
+	// number in ORG, Static clears everything (oracle-probed).
+	segAttrMode uint16
+	segAttrBank int64
 
 	// preprocessor state (conditionals, macros, set-vars) lives in preproc.go
 	pp *ppState
@@ -319,9 +333,15 @@ func (st *asmState) lookup(name string) Val {
 		}
 	}
 	// An IMPORT declared in the current segment makes the symbol external
-	// there, even when another segment in the same file defines it.
+	// there, even when another segment in the same file defines it. The term
+	// still carries its scope, or resolution cannot tell WHICH segment's
+	// import covers it (importSymbolic) and a global "IMPORT assumed" would
+	// leak onto same-named references in other segments.
 	if st.cur != nil && st.cur.imports[name] {
-		return fwdVal(name)
+		f := fwdVal(name)
+		f.Pos[0].scope = st.scopePrefix()
+		f.Pos[0].atSeq = st.defSeq
+		return f
 	}
 	scope := st.scopePrefix()
 	for _, key := range [2]string{scope + name, name} {
@@ -792,8 +812,10 @@ func newState() *asmState {
 		pubGseq:    map[string]int{},
 		lastPubSeq: map[string]int64{},
 		fileWide:   map[string]bool{},
-		segNames:    map[string]bool{},
-		fileImports: map[string]bool{},
+		segNames:       map[string]bool{},
+		fileImports:    map[string]bool{},
+		segImports:     map[string]bool{},
+		assumedImports: map[string]bool{},
 		scopeSeg:   -1,
 		scopeChain: []int{0},
 		recSize:    map[string]int64{},
@@ -896,9 +918,28 @@ func (st *asmState) doLine(l line) {
 			}
 		}
 		seg.skip = st.skipMode
+		seg.attrs = st.segAttrMode
+		if seg.attrs&0x0800 != 0 && seg.org == 0 {
+			seg.org = st.segAttrBank
+		}
 		st.openSegment(seg)
 		return
-	case "endp", "endproc", "endf", "endfunc":
+	case "stackdp":
+		// A direct-page/stack segment (OMF type $12), load name "~direct",
+		// closed by EndS; DS reserves its bytes (oracle-probed).
+		name := st.sym(l.label)
+		if name == "" {
+			st.errf("STACKDP requires a label")
+			return
+		}
+		seg := &segState{name: name, loadName: "~direct", imports: map[string]bool{},
+			kind: 0x4012, kindSet: true, skip: st.skipMode, attrs: st.segAttrMode}
+		if seg.attrs&0x0800 != 0 {
+			seg.org = st.segAttrBank
+		}
+		st.openSegment(seg)
+		return
+	case "endp", "endproc", "endf", "endfunc", "ends":
 		if st.cur != nil {
 			st.cur.endPC = st.pc
 		}
@@ -1025,6 +1066,7 @@ func (st *asmState) doLine(l line) {
 					return
 				}
 				st.imports[name] = true
+				st.assumedImports[name] = true
 				st.inRecord = true
 				st.recImport = true
 				st.recHigh = 0
@@ -1122,6 +1164,35 @@ func (st *asmState) doLine(l line) {
 		}
 		st.loadName = name
 		return
+	case "segattr":
+		// the operand may contain a blank ("Bank $00"), so split the raw
+		// field; anything after the value is a field comment
+		f := strings.Fields(l.rest)
+		if len(f) == 0 {
+			st.errf("SegAttr requires an operand")
+			return
+		}
+		switch strings.ToLower(f[0]) {
+		case "dynamic":
+			st.segAttrMode |= 0x8000
+		case "static":
+			st.segAttrMode, st.segAttrBank = 0, 0
+		case "bank":
+			if len(f) < 2 {
+				st.errf("SegAttr Bank requires a value")
+				return
+			}
+			v, err := evalNum(f[1], &exprCtx{st: st})
+			if err != nil {
+				st.errf("SegAttr Bank: %v", err)
+				return
+			}
+			st.segAttrMode |= 0x0800
+			st.segAttrBank = v
+		default:
+			st.errf("unsupported SegAttr operand %q", f[0])
+		}
+		return
 	case "import":
 		for _, a := range symbolList(operandOnly(l.rest)) {
 			name, kind, _ := strings.Cut(a, ":")
@@ -1139,6 +1210,7 @@ func (st *asmState) doLine(l line) {
 			st.imports[nm] = true // union, for resolve()
 			if st.cur != nil {
 				st.cur.imports[nm] = true
+				st.segImports[st.scopePrefix()+nm] = true
 			} else {
 				st.fileImports[nm] = true
 			}

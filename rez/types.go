@@ -169,8 +169,11 @@ func (p *parser) parseField() (*field, error) {
 		f.label = p.next().text
 		p.next() // ':'
 		// A label on a line by itself just names an offset; rFileType's
-		// "end:" is measured against "start:" by $$Word().
-		if p.peek().is(";") || p.peek().is("}") {
+		// "end:" is measured against "start:" by $$Word(). It may also stand
+		// last in a switch case, directly before the next "case" (rPicture's
+		// ClipEnd).
+		if p.peek().is(";") || p.peek().is("}") || p.peek().is("case") ||
+			(p.peek().kind == tIdent && p.pos+1 < len(p.toks) && p.toks[p.pos+1].is(":")) {
 			p.accept(";")
 			f.kind = fLabel
 			return f, nil

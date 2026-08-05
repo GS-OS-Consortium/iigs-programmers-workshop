@@ -27,12 +27,30 @@ type Compiler struct {
 }
 
 // Compile reads a Rez source file and returns its resources in source order.
-func Compile(path string, incDirs []string) ([]Resource, error) {
+// Each define is a command-line "-d name[=value]" operand: the name is
+// defined before the source is read, empty when no value is given.
+func Compile(path string, incDirs []string, defines ...string) ([]Resource, error) {
 	c := &Compiler{
 		IncDirs: incDirs,
 		types:   map[string]*typeDecl{},
 	}
 	pp := newPreproc(incDirs)
+	for _, d := range defines {
+		name, val, _ := strings.Cut(d, "=")
+		var toks []token
+		l := newLexer(val, "<-d "+name+">")
+		for {
+			t, err := l.next()
+			if err != nil {
+				return nil, fmt.Errorf("-d %s: %v", d, err)
+			}
+			if t.kind == tEOF {
+				break
+			}
+			toks = append(toks, t)
+		}
+		pp.defs[strings.ToLower(name)] = toks
+	}
 	if err := pp.file(path); err != nil {
 		return nil, err
 	}

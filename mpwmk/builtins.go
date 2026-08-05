@@ -219,7 +219,7 @@ func (e *Env) logAsm(input, output string, incDirs, defines, extras []string) {
 
 // logRez records a Rez compile the same way as logAsm, so the sweep can
 // replay it against the original RezIIGS.
-func (e *Env) logRez(input, output string, incDirs []string) {
+func (e *Env) logRez(input, output string, incDirs, defines []string) {
 	path := os.Getenv("MPWMK_TOOLLOG")
 	if path == "" {
 		return
@@ -232,6 +232,9 @@ func (e *Env) logRez(input, output string, incDirs []string) {
 	rec := []string{"rez", input, output}
 	for _, d := range incDirs {
 		rec = append(rec, "-i", d)
+	}
+	for _, d := range defines {
+		rec = append(rec, "-d", d)
 	}
 	fmt.Fprintln(f, strings.Join(rec, "\t"))
 }
@@ -254,9 +257,23 @@ func (e *Env) logLink(rec []string) {
 }
 
 func (e *Env) duplicate(args []string) error {
+	// "-d" copies only the source's data fork, "-r" only its resource fork.
+	// Forks are carried as ".rsrc" siblings on the host (a Rez output's
+	// resources land in "<out>.rsrc"), so "-r src dst" copies src's
+	// resources -- src.rsrc when src's own data is the resource fork's
+	// sibling, or src itself when it IS a bare .rsrc file -- to dst.rsrc,
+	// leaving dst's data fork alone. The Installer builds itself with
+	// "duplicate -d Installer.Load Installer" + "-r Installer.Res Installer".
 	var ps []string
+	dataOnly, rsrcOnly := false, false
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
+			switch strings.ToLower(a) {
+			case "-d":
+				dataOnly = true
+			case "-r":
+				rsrcOnly = true
+			}
 			continue
 		}
 		ps = append(ps, a)
@@ -267,10 +284,6 @@ func (e *Env) duplicate(args []string) error {
 	dst := e.HostPath(ps[len(ps)-1])
 	for _, src := range ps[:len(ps)-1] {
 		sp := e.HostPath(src)
-		data, err := os.ReadFile(sp)
-		if err != nil {
-			return err
-		}
 		target := dst
 		if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
 			target = filepath.Join(dst, filepath.Base(sp))
@@ -278,8 +291,34 @@ func (e *Env) duplicate(args []string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 			return err
 		}
+		if rsrcOnly {
+			rsp := sp + ".rsrc"
+			if _, err := os.Stat(rsp); err != nil {
+				rsp = sp // the source file itself holds the resources
+			}
+			data, err := os.ReadFile(rsp)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(target+".rsrc", data, 0644); err != nil {
+				return err
+			}
+			continue
+		}
+		data, err := os.ReadFile(sp)
+		if err != nil {
+			return err
+		}
 		if err := os.WriteFile(target, data, 0644); err != nil {
 			return err
+		}
+		if !dataOnly {
+			// a plain duplicate carries a fork sibling along too
+			if rd, err := os.ReadFile(sp + ".rsrc"); err == nil {
+				if err := os.WriteFile(target+".rsrc", rd, 0644); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
@@ -309,7 +348,7 @@ func (e *Env) catenate(args []string, out io.Writer) error {
 // itself. tools/make-disk.py pairs the two back up as NAPS.
 func (e *Env) runRez(args []string) error {
 	var input, output string
-	var incDirs []string
+	var incDirs, defines []string
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
 		case "-o":
@@ -322,7 +361,10 @@ func (e *Env) runRez(args []string) error {
 			}
 		case "-t", "-c", "-align":
 			i++ // file type/creator and alignment: no effect on the fork
-		case "-rd", "-p", "-ov", "-d", "-u":
+		case "-d":
+			i++
+			defines = append(defines, args[i])
+		case "-rd", "-p", "-ov", "-u":
 			// redeclaration warnings, progress, overwrite: diagnostics only
 		default:
 			if strings.HasPrefix(a, "-") {
@@ -338,13 +380,18 @@ func (e *Env) runRez(args []string) error {
 	if v := e.Get("RIIGSIncludes"); v != "" {
 		incDirs = append(incDirs, e.HostPath(v))
 	}
-	e.logRez(input, output, incDirs)
-	res, err := rez.Compile(input, incDirs)
+	e.logRez(input, output, incDirs, defines)
+	res, err := rez.Compile(input, incDirs, defines...)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(output, nil, 0644); err != nil {
-		return err
+	// RezIIGS adds a resource fork to the output; an existing data fork (the
+	// Finder links code into the same file the resources land on) is left
+	// alone, and only a fresh output gets an empty one.
+	if _, err := os.Stat(output); os.IsNotExist(err) {
+		if err := os.WriteFile(output, nil, 0644); err != nil {
+			return err
+		}
 	}
 	return os.WriteFile(output+".rsrc", rez.Build(res), 0644)
 }

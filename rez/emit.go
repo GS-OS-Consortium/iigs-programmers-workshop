@@ -25,7 +25,7 @@ const (
 	attrConvert     uint16 = 0x0800
 	attrPreload     uint16 = 0x0040
 	attrNoSpecial   uint16 = 0x0008
-	attrNoCrossBank uint16 = 0x0004
+	attrNoCrossBank uint16 = 0x0010 // resNoCross (shipped Installer script)
 	attrAbsolute    uint16 = 0x0002
 	attrPurgeable   uint16 = 0x0300
 )
@@ -87,12 +87,25 @@ type emitter struct {
 	counts map[string]int64 // array name -> element count
 	consts map[string]int64 // named constants in scope for the current field
 
+	// arrStack tracks the enclosing array elements being emitted, innermost
+	// last, for $$ArrayIndex(name) and label arrays: a label defined inside
+	// an array element is also recorded as "name#index" (1-based, keyed by
+	// the innermost array's current element) so "ClipEnd[$$ArrayIndex(...)]"
+	// can address one instance (rPicture).
+	arrStack []arrFrame
+
 	// A resource body is emitted twice. Labels are freely used before they
 	// are defined -- rIcon sizes its image as "(Mask-Image)/8 - 6", naming a
 	// label three fields further down -- so the first pass resolves unknown
 	// labels to zero just to discover where they land, and the second pass
 	// emits for real with them all in scope.
 	pass1 bool
+}
+
+// arrFrame is one enclosing array element on the emitter's stack.
+type arrFrame struct {
+	name string
+	idx  int64
 }
 
 func (e *emitter) flush() []byte {
@@ -167,7 +180,11 @@ func (e *emitter) dataEnd() bool {
 
 func (e *emitter) field(f *field) error {
 	if f.label != "" {
-		e.labels[strings.ToLower(f.label)] = e.bitOffset()
+		key := strings.ToLower(f.label)
+		e.labels[key] = e.bitOffset()
+		if n := len(e.arrStack); n > 0 {
+			e.labels[fmt.Sprintf("%s#%d", key, e.arrStack[n-1].idx)] = e.bitOffset()
+		}
 	}
 	e.consts = f.named
 
@@ -260,14 +277,19 @@ func (e *emitter) field(f *field) error {
 			if !braced && e.dataEnd() {
 				break
 			}
-			if e.p.accept(",") {
+			// inside a braced list ";" separates elements just like ","
+			// (the Installer's "{ FirstDisk,...,FifthDisk; }")
+			if e.p.accept(",") || (braced && e.p.accept(";")) {
 				continue
 			}
-			if err := e.fields(f.sub); err != nil {
+			e.arrStack = append(e.arrStack, arrFrame{name: strings.ToLower(f.arrayName), idx: n + 1})
+			err := e.fields(f.sub)
+			e.arrStack = e.arrStack[:len(e.arrStack)-1]
+			if err != nil {
 				return err
 			}
 			n++
-			if !e.p.accept(",") {
+			if !e.p.accept(",") && !(braced && e.p.accept(";")) {
 				if braced && e.p.peek().is("}") {
 					break
 				}

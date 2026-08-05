@@ -126,9 +126,27 @@ func (v Val) hasUnresolvedFwd(st *asmState) bool {
 		if t.fwd != "" && st.entryEqu[t.fwd] {
 			continue
 		}
-		if t.fwd != "" && (!st.imports[t.fwd] || st.localBeatsImport(t)) {
+		if t.fwd != "" && !st.importSymbolic(t) {
 			return true
 		}
+	}
+	return false
+}
+
+// importSymbolic reports whether a forward term must stay symbolic for the
+// linker because of an IMPORT. An import declared in the REFERENCING segment
+// always keeps it symbolic; one in a different segment has no effect there;
+// a FILE-scope import loses to a definition in the referencing segment; and
+// RECORD IMPORT / "IMPORT assumed" names are symbolic everywhere
+// (oracle-verified -- the Installer's seg-2 forward inControl binds locally
+// despite "Import inControl" in later segments).
+func (st *asmState) importSymbolic(t term) bool {
+	if st.segImports[t.scope+t.fwd] || st.assumedImports[t.fwd] {
+		return true
+	}
+	if st.fileImports[t.fwd] {
+		_, ok := st.nextDefScoped(t.fwd, t.scope, t.atSeq)
+		return !ok
 	}
 	return false
 }
