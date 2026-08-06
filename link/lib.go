@@ -39,6 +39,25 @@ func libHash(name string) int {
 // ~arrays even though the root object and CSANELIB both define the same
 // name).
 func SelectLib(objs []*omf.File, lib *omf.File) *omf.File {
+	return SelectLibAllowed(objs, lib, nil)
+}
+
+// IsLibrary reports whether the parsed file carries a MakeLib dictionary.
+func IsLibrary(f *omf.File) bool {
+	for i := range f.Segments {
+		if f.Segments[i].Kind&0x1F == 0x08 {
+			return true
+		}
+	}
+	return false
+}
+
+// SelectLibAllowed is SelectLib restricted to library segments allow()
+// admits. "PLib(@main,@PLib,@~globals)" pulls need-based like -lib, but
+// only from those load segments: an excluded segment neither satisfies nor
+// publishes anything, so a reference into ~arrays resolves to zero exactly
+// as the original warns.
+func SelectLibAllowed(objs []*omf.File, lib *omf.File, allow func(*omf.Segment) bool) *omf.File {
 	le := binary.LittleEndian
 
 	// Member identity and private names, from the library dictionary.
@@ -76,6 +95,9 @@ func SelectLib(objs []*omf.File, lib *omf.File) *omf.File {
 				continue
 			}
 			memberOf[si] = fn
+			if allow != nil && !allow(&lib.Segments[si]) {
+				continue
+			}
 			if fl != 0 && int(nd) < len(names) {
 				n := int(names[nd])
 				name := string(names[nd+1 : nd+1+uint32(n)])
@@ -97,6 +119,9 @@ func SelectLib(objs []*omf.File, lib *omf.File) *omf.File {
 		s := &lib.Segments[i]
 		segIndex[s] = i
 		if s.Kind&0x1F == 0x08 { // the dictionary
+			continue
+		}
+		if allow != nil && !allow(s) {
 			continue
 		}
 		if s.Kind&0x4000 == 0 && provides[s.SegName] == nil {

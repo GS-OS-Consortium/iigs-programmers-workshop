@@ -5,9 +5,10 @@
 package link
 
 import (
-	"os"
 	"encoding/binary"
 	"fmt"
+	"os"
+	stdos "os"
 	"strconv"
 	"strings"
 
@@ -287,7 +288,8 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 				pc += int64(size)
 			case r.Op == omf.RecOrg:
 				pc += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
-			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
+			case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ,
+				r.Op == omf.RecStrong, r.Op == omf.RecUsing:
 			default:
 				return nil, fmt.Errorf("segment %s: unsupported record %s in linker", os.name, omf.RecName(r.Op))
 			}
@@ -335,7 +337,8 @@ func segImage(s *omf.Segment) ([]byte, error) {
 			if pos < 0 {
 				return nil, fmt.Errorf("segment %s: ORG before segment start", s.SegName)
 			}
-		case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
+		case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ,
+			r.Op == omf.RecStrong, r.Op == omf.RecUsing:
 		default:
 			return nil, fmt.Errorf("unsupported record %s", omf.RecName(r.Op))
 		}
@@ -429,13 +432,17 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals map[string]gs
 			pos += 1 + n
 			if os.Getenv("LINKDEBUG") == name {
 				src := "?"
-				if cur != nil { src = cur.name }
+				if cur != nil {
+					src = cur.name
+				}
 				_, inFileSegs := cur.fileSegs[name]
 				_, inFileGlob := cur.fileGlobals[name]
 				bn, inByName := byName[name]
 				gv, inGlob := globals[name]
 				bnb := int64(-1)
-				if inByName { bnb = bn.base }
+				if inByName {
+					bnb = bn.base
+				}
 				fmt.Fprintf(os.Stderr, "LDBG ref %s from %s fileSegs=%v fileGlob=%v byName=%v(base=%x) globals=%v(%x)\n",
 					name, src, inFileSegs, inFileGlob, inByName, bnb, inGlob, gv.val)
 			}
@@ -481,7 +488,12 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals map[string]gs
 			} else if v, ok := absolutes[name]; ok {
 				push(v, 0, -1) // an EQU symbol is absolute, not a location
 			} else {
-				return 0, 0, false, -1, fmt.Errorf("undefined label %q", name)
+				// the original resolves a reference with no visible
+				// definition to ZERO with a "Missing symbol" warning
+				// (SetStart selects PLib(@main,...) without @~arrays, and
+				// atof's _0float has nowhere to point)
+				fmt.Fprintf(stdos.Stderr, "linkiigs: Missing symbol %s (resolved to zero)\n", name)
+				push(0, 0, -1)
 			}
 		case tok == 0x01, tok == 0x02: // + -
 			x, y, cx, cy, gx, gy, ok := pop2()
@@ -578,9 +590,9 @@ type exMember struct {
 	org      int64
 	kind     uint16
 	banksize uint32
-	align  int64
-	segNum int
-	relocs []byte
+	align    int64
+	segNum   int
+	relocs   []byte
 }
 
 // segHeader builds a load-segment header (the DISPDATA prefix). The load
@@ -932,9 +944,9 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		org      int64
 		kind     uint16
 		banksize uint32
-		align   int64
-		dynamic bool
-		patches []relocPatch
+		align    int64
+		dynamic  bool
+		patches  []relocPatch
 	}
 
 	// First pass over every group: place segments and collect symbols. The
@@ -960,6 +972,35 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		m int
 	}
 	fileMaps := map[scopeKey]*fileScope{}
+	// A library named as a group input -- SetStart's
+	// "PLib(@main,@PLib,@~globals)" -- pulls need-based like -lib, but only
+	// from the selected load segments, and the pulls land in THIS group.
+	// Replace each library Sel with its pulled segments before placement.
+	{
+		var roots []*omf.File
+		seenFile := map[*omf.File]bool{}
+		for _, g := range groups {
+			for _, sel := range g.Sels {
+				if !seenFile[sel.File] && !IsLibrary(sel.File) {
+					seenFile[sel.File] = true
+					roots = append(roots, sel.File)
+				}
+			}
+		}
+		for gi := range groups {
+			for si := range groups[gi].Sels {
+				sel := &groups[gi].Sels[si]
+				if !IsLibrary(sel.File) {
+					continue
+				}
+				pulled := SelectLibAllowed(roots, sel.File, sel.Wants)
+				if pulled == nil {
+					pulled = &omf.File{}
+				}
+				*sel = Sel{File: pulled}
+			}
+		}
+	}
 	var all [][]*objSeg
 	var out []built
 	for gi, g := range groups {
@@ -1263,7 +1304,8 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 					pc += int64(size)
 				case r.Op == omf.RecOrg:
 					pc += int64(int32(binary.LittleEndian.Uint32(r.Raw[1:])))
-				case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ:
+				case r.Op == omf.RecEnd || r.Op == omf.RecGlobal || r.Op == omf.RecGequ,
+					r.Op == omf.RecStrong, r.Op == omf.RecUsing:
 				default:
 					return nil, fmt.Errorf("segment %s: unsupported record %s in linker",
 						os.name, omf.RecName(r.Op))

@@ -210,6 +210,12 @@ func (l *lexer) next() (token, error) {
 	case c == '"':
 		return l.lexString()
 
+	case c == '\'':
+		// 'GB' -- a character literal; same lexical shape as a string, and
+		// the expression evaluator packs its bytes big-endian into a number
+		// (FolderPriv's "#define myCtrlList 'GB'" resource IDs)
+		return l.lexCharLit()
+
 	case c == '$' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '"':
 		return l.lexHexString()
 
@@ -303,6 +309,39 @@ func parseUint(s string, base int) (int64, error) {
 		n = n*int64(base) + d
 	}
 	return n, nil
+}
+
+// lexCharLit reads a '...' literal into a tString token.
+func (l *lexer) lexCharLit() (token, error) {
+	t := token{file: l.file, line: l.line, kind: tString}
+	l.pos++ // opening quote
+	var sb strings.Builder
+	for {
+		if l.pos >= len(l.src) {
+			return t, l.errf("unterminated character literal")
+		}
+		c := l.src[l.pos]
+		if c == '\'' {
+			l.pos++
+			break
+		}
+		if c == '\n' {
+			return t, l.errf("newline in character literal")
+		}
+		if c == '\\' {
+			b, err := l.escape()
+			if err != nil {
+				return t, err
+			}
+			sb.WriteByte(b)
+			continue
+		}
+		sb.WriteByte(c)
+		l.pos++
+	}
+	t.text = sb.String()
+	t.raw = macRomanString(t.text)
+	return t, nil
 }
 
 // lexString reads a "..." literal. The source is MacRoman-decoded before it

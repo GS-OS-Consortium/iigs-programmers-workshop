@@ -535,7 +535,7 @@ func (e *Env) runLink(args []string) error {
 		case "-x":
 			express = false // no ~ExpressLoad segment
 			log = append(log, "-x")
-		case "-w", "-l", "-s": // -s lists the symbol table; output-identical
+		case "-w", "-w1", "-w2", "-w3", "-l", "-s": // warnings/listing: output-identical
 		default:
 			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND the
 			// attributes define outright (see segKindAttrs)
