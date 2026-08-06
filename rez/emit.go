@@ -50,6 +50,11 @@ func resAttr(name string) (uint16, bool) {
 		return attrAbsolute, true
 	case "purgeable":
 		return attrPurgeable, true
+	case "purgeable1", "purgeable2", "purgeable3":
+		// IIGS purge LEVELS (bits 8-9): purgeableN -> N<<8. The original
+		// RezIIGS rejects a bare "purgeable"; Apple.Bowl's Read.Me.r says
+		// purgeable3 (oracle-probed encodings $0100/$0200/$0300).
+		return uint16(name[len(name)-1]-'0') << 8, true
 	case "nonpurgeable", "unprotected", "crossbank", "specialmemory", "nopreload":
 		return 0, true
 	}

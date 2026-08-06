@@ -39,7 +39,16 @@ func libHash(name string) int {
 // ~arrays even though the root object and CSANELIB both define the same
 // name).
 func SelectLib(objs []*omf.File, lib *omf.File) *omf.File {
-	return SelectLibAllowed(objs, lib, nil)
+	return SelectLibs(objs, []*omf.File{lib})
+}
+
+// SelectLibs pulls from SEVERAL libraries with ONE symbol-table sweep: the
+// original linker resolves each unresolved symbol against every -lib in
+// command order, so pulls from different libraries INTERLEAVE in bucket
+// order (Apple.Bowl: ProgAid's DRAW lands between IntBasicLib's ~ASSIGNSTRING
+// and ~INTSGN).
+func SelectLibs(objs []*omf.File, libs []*omf.File) *omf.File {
+	return selectLibs(objs, libs, nil)
 }
 
 // IsLibrary reports whether the parsed file carries a MakeLib dictionary.
@@ -58,84 +67,90 @@ func IsLibrary(f *omf.File) bool {
 // publishes anything, so a reference into ~arrays resolves to zero exactly
 // as the original warns.
 func SelectLibAllowed(objs []*omf.File, lib *omf.File, allow func(*omf.Segment) bool) *omf.File {
+	return selectLibs(objs, []*omf.File{lib}, allow)
+}
+
+func selectLibs(objs []*omf.File, libs []*omf.File, allow func(*omf.Segment) bool) *omf.File {
 	le := binary.LittleEndian
 
-	// Member identity and private names, from the library dictionary.
-	segByOff := map[uint32]int{}
-	off := uint32(0)
-	for i := range lib.Segments {
-		segByOff[off] = i
-		off += lib.Segments[i].ByteCnt
-	}
-	memberOf := make([]int, len(lib.Segments))
+	// Member identity and private names, from each library dictionary.
+	// Member ids carry the library index in the high bits so two -libs'
+	// members stay distinct.
+	memberOfSeg := map[*omf.Segment]int{}
 	privProvides := map[int]map[string]*omf.Segment{} // member -> private name -> defining segment
-	for i := range lib.Segments {
-		s := &lib.Segments[i]
-		if s.Kind&0x1F != 0x08 {
-			continue
-		}
-		var lconsts [][]byte
-		for _, r := range s.Records {
-			if r.Op == omf.RecLconst {
-				lconsts = append(lconsts, r.Raw[5:])
-			}
-		}
-		if len(lconsts) < 3 {
-			continue
-		}
-		names := lconsts[2]
-		d := lconsts[1]
-		for j := 0; j+12 <= len(d); j += 12 {
-			nd := le.Uint32(d[j:])
-			fn := int(le.Uint16(d[j+4:]))
-			fl := le.Uint16(d[j+6:])
-			so := le.Uint32(d[j+8:])
-			si, ok := segByOff[so]
-			if !ok {
-				continue
-			}
-			memberOf[si] = fn
-			if allow != nil && !allow(&lib.Segments[si]) {
-				continue
-			}
-			if fl != 0 && int(nd) < len(names) {
-				n := int(names[nd])
-				name := string(names[nd+1 : nd+1+uint32(n)])
-				if privProvides[fn] == nil {
-					privProvides[fn] = map[string]*omf.Segment{}
-				}
-				if privProvides[fn][name] == nil {
-					privProvides[fn][name] = &lib.Segments[si]
-				}
-			}
-		}
-	}
-
-	// Public definitions only: a private name never satisfies (or shadows) a
-	// reference from another file.
 	provides := map[string]*omf.Segment{}
-	segIndex := map[*omf.Segment]int{}
-	for i := range lib.Segments {
-		s := &lib.Segments[i]
-		segIndex[s] = i
-		if s.Kind&0x1F == 0x08 { // the dictionary
-			continue
+	for li, lib := range libs {
+		segByOff := map[uint32]int{}
+		off := uint32(0)
+		for i := range lib.Segments {
+			segByOff[off] = i
+			off += lib.Segments[i].ByteCnt
 		}
-		if allow != nil && !allow(s) {
-			continue
-		}
-		if s.Kind&0x4000 == 0 && provides[s.SegName] == nil {
-			provides[s.SegName] = s
-		}
-		for _, r := range s.Records {
-			if r.Op == omf.RecGlobal || r.Op == omf.RecGequ {
-				if globalPrivate(r.Raw) != 0 {
+		for i := range lib.Segments {
+			s := &lib.Segments[i]
+			if s.Kind&0x1F != 0x08 {
+				continue
+			}
+			var lconsts [][]byte
+			for _, r := range s.Records {
+				if r.Op == omf.RecLconst {
+					lconsts = append(lconsts, r.Raw[5:])
+				}
+			}
+			if len(lconsts) < 3 {
+				continue
+			}
+			names := lconsts[2]
+			d := lconsts[1]
+			for j := 0; j+12 <= len(d); j += 12 {
+				nd := le.Uint32(d[j:])
+				fn := li<<16 | int(le.Uint16(d[j+4:]))
+				fl := le.Uint16(d[j+6:])
+				so := le.Uint32(d[j+8:])
+				si, ok := segByOff[so]
+				if !ok {
 					continue
 				}
-				n := int(r.Raw[1])
-				name := string(r.Raw[2 : 2+n])
-				if provides[name] == nil {
-					provides[name] = s
+				memberOfSeg[&lib.Segments[si]] = fn
+				if allow != nil && !allow(&lib.Segments[si]) {
+					continue
+				}
+				if fl != 0 && int(nd) < len(names) {
+					n := int(names[nd])
+					name := string(names[nd+1 : nd+1+uint32(n)])
+					if privProvides[fn] == nil {
+						privProvides[fn] = map[string]*omf.Segment{}
+					}
+					if privProvides[fn][name] == nil {
+						privProvides[fn][name] = &lib.Segments[si]
+					}
+				}
+			}
+		}
+
+		// Public definitions only: a private name never satisfies (or
+		// shadows) a reference from another file. First -lib wins a name.
+		for i := range lib.Segments {
+			s := &lib.Segments[i]
+			if s.Kind&0x1F == 0x08 { // the dictionary
+				continue
+			}
+			if allow != nil && !allow(s) {
+				continue
+			}
+			if s.Kind&0x4000 == 0 && provides[s.SegName] == nil {
+				provides[s.SegName] = s
+			}
+			for _, r := range s.Records {
+				if r.Op == omf.RecGlobal || r.Op == omf.RecGequ {
+					if globalPrivate(r.Raw) != 0 {
+						continue
+					}
+					n := int(r.Raw[1])
+					name := string(r.Raw[2 : 2+n])
+					if provides[name] == nil {
+						provides[name] = s
+					}
 				}
 			}
 		}
@@ -303,12 +318,12 @@ func SelectLibAllowed(objs []*omf.File, lib *omf.File, allow func(*omf.Segment) 
 	out := &omf.File{}
 	pullSeg := func(s *omf.Segment) {
 		pulled[s] = true
-		m := memberOf[segIndex[s]]
+		m := memberOfSeg[s]
 		cp := *s
 		cp.LibMember = m
 		out.Segments = append(out.Segments, cp)
 		if os.Getenv("LINKIIGS_LIBPULLS") != "" {
-			fmt.Fprintf(os.Stderr, "pull #%d %q len=$%X member=%d\n", segIndex[s], s.SegName, s.Length, m)
+			fmt.Fprintf(os.Stderr, "pull %q len=$%X member=%d\n", s.SegName, s.Length, m)
 		}
 		g := memberGate[m]
 		if g == nil {

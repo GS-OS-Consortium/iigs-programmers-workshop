@@ -699,11 +699,32 @@ func (pp *ppState) expand(def *macroDef, nameSuffix string, inv line) {
 	pp.st.scopeChain = append(pp.st.scopeChain, pp.st.localScopeMax)
 	pp.st.labelRedirect = append(pp.st.labelRedirect, redirect)
 	condDepth := len(pp.conds)
-	for _, bl := range def.body {
+	jumps := 0
+	for bi := 0; bi < len(def.body); bi++ {
 		if pp.st.ended || pp.mexit {
 			break
 		}
-		pp.processLine(bl)
+		pp.processLine(def.body[bi])
+		if pp.gotoTarget != "" {
+			// A GOTO whose sequence symbol lies at or BEFORE this line jumps
+			// backward (the subroutine macro's parameter loop ends with
+			// "IF &i GOTO .b"); forward skipping is processLine's usual
+			// line-by-line match.
+			tgt := -1
+			for k := range def.body {
+				if strings.EqualFold(splitLine(def.body[k]).label, pp.gotoTarget) {
+					tgt = k
+					break
+				}
+			}
+			if tgt >= 0 && tgt <= bi {
+				if jumps++; jumps > 200000 {
+					pp.st.errf("GOTO %s: loop does not terminate", pp.gotoTarget)
+					break
+				}
+				bi = tgt - 1 // next iteration re-reads the label line, clearing the target
+			}
+		}
 	}
 	pp.st.labelRedirect = pp.st.labelRedirect[:len(pp.st.labelRedirect)-1]
 	pp.st.scopeChain = pp.st.scopeChain[:chainDepth]
@@ -880,14 +901,14 @@ func (pp *ppState) lookupVar(name string) (string, bool) {
 // yields a character value (see charVarRef).
 var numericFuncs = map[string]bool{
 	"EVAL": true, "ORD": true, "LEN": true, "S2I": true,
-	"MAX": true, "MIN": true,
+	"MAX": true, "MIN": true, "NBR": true,
 }
 
 var ppFuncs = map[string]bool{
 	"EVAL": true, "TRIM": true, "LEN": true, "UC": true, "LC": true,
 	"CONCAT": true, "I2S": true, "SETTING": true, "FINDSYM": true,
 	"ORD": true, "SUBSTR": true, "TYPE": true, "S2I": true, "GETENV": true,
-	"DEFAULT": true, "MAX": true, "MIN": true,
+	"DEFAULT": true, "MAX": true, "MIN": true, "NBR": true,
 }
 
 // subst evaluates & references (variables, substrings, builtin functions) in
@@ -921,12 +942,22 @@ func (pp *ppState) subst(s string) string {
 			continue
 		}
 		if v, ok := pp.lookupVar(upper); ok {
-			// optional substring suffix [start:len]
+			// optional subscript suffix: [start:len] substring, or [n] --
+			// the n-th element when the value is a "(a,b,c)" list (the
+			// subroutine macro walks its parameter list with &parms[&i]),
+			// else the n-th character
 			if j < len(s) && s[j] == '[' {
 				if k := strings.IndexByte(s[j:], ']'); k >= 0 {
 					inner := pp.subst(s[j+1 : j+k])
 					if a, b, ok := parseSubstring(inner, pp); ok {
 						v = substr(v, a, b)
+						j = j + k + 1
+					} else if n, err := evalNum(strings.TrimSpace(inner), &exprCtx{st: pp.st}); err == nil {
+						if el, ok := listElem(v, n); ok {
+							v = el
+						} else {
+							v = substr(v, n, 1)
+						}
 						j = j + k + 1
 					}
 				}
@@ -966,6 +997,48 @@ func substr(s string, start, length int64) string {
 		end = int64(len(s))
 	}
 	return s[start-1 : end]
+}
+
+// listElems splits a parenthesized "(a,b,c)" value into its top-level
+// comma-separated elements. ok is false when the value is not a list.
+func listElems(v string) ([]string, bool) {
+	t := strings.TrimSpace(v)
+	if len(t) < 2 || t[0] != '(' || t[len(t)-1] != ')' {
+		return nil, false
+	}
+	inner := t[1 : len(t)-1]
+	var els []string
+	depth, inStr, start := 0, false, 0
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '\'':
+			inStr = !inStr
+		case '(', '[':
+			if !inStr {
+				depth++
+			}
+		case ')', ']':
+			if !inStr {
+				depth--
+			}
+		case ',':
+			if !inStr && depth == 0 {
+				els = append(els, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	els = append(els, inner[start:])
+	return els, true
+}
+
+// listElem returns the 1-based n-th element of a list value.
+func listElem(v string, n int64) (string, bool) {
+	els, ok := listElems(v)
+	if !ok || n < 1 || n > int64(len(els)) {
+		return "", false
+	}
+	return els[n-1], true
 }
 
 // parseCallArgs parses "(a,b,...)" starting at the '(' in s[open]; returns
@@ -1061,6 +1134,17 @@ func (pp *ppState) callFunc(name string, args []string) string {
 			}
 		}
 		return "UNDEFINED"
+	case "NBR":
+		// &NBR(list) -- the number of elements in a "(a,b,c)" list value;
+		// 1 for a plain non-empty value, 0 for an empty one
+		v := pp.rawArg(args[:1])
+		if els, ok := listElems(v); ok {
+			return strconv.Itoa(len(els))
+		}
+		if strings.TrimSpace(v) == "" {
+			return "0"
+		}
+		return "1"
 	case "SUBSTR":
 		// &SUBSTR(str, start, length) -- the function form of the &var[a:b]
 		// substring syntax.

@@ -423,9 +423,22 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals map[string]gs
 				return 0, 0, false, -1, fmt.Errorf("bad expression stack depth %d", len(stack))
 			}
 			return stack[0], shift, base[0] != 0, grp[0], nil
-		case tok == 0x81 || tok == 0x80 || tok == 0x87: // numeric operand
+		case tok == 0x81 || tok == 0x80: // numeric operand
 			push(int64(int32(binary.LittleEndian.Uint32(b[pos:]))), 0, -1)
 			pos += 4
+		case tok == 0x87: // displacement from the CURRENT segment's start --
+			// relocatable (IntBasicIIGS emits "87:$0 >> 16" for the bank
+			// byte of the BASIC segment; treating it as a constant lost the
+			// shifted cRELOCs Apple.Bowl's runtime needs)
+			v := int64(int32(binary.LittleEndian.Uint32(b[pos:])))
+			pos += 4
+			if cur != nil && cur.abs != 0 {
+				push(cur.abs+v, 0, -1)
+			} else if cur != nil {
+				push(cur.base+v, 1, cur.group)
+			} else {
+				push(v, 0, -1)
+			}
 		case tok == 0x82 || tok == 0x83: // label reference
 			n := int(b[pos])
 			name := string(b[pos+1 : pos+1+n])

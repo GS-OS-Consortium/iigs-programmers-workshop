@@ -624,7 +624,10 @@ func (e *Env) runLink(args []string) error {
 		}
 		objs = append(objs, f)
 	}
-	// "-lib X.lib": pull the library segments the objects need
+	// "-lib X.lib": pull the library segments the objects need. ALL the
+	// libraries feed ONE symbol-table sweep -- pulls interleave across
+	// -libs in bucket order (Apple.Bowl's IntBasicLib + ProgAid.lib).
+	var libFiles []*omf.File
 	for _, p := range libs {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -634,7 +637,10 @@ func (e *Env) runLink(args []string) error {
 		if err != nil {
 			return fmt.Errorf("linkiigs %s: %w", filepath.Base(p), err)
 		}
-		if sel := link.SelectLib(objs, f); sel != nil {
+		libFiles = append(libFiles, f)
+	}
+	if len(libFiles) > 0 {
+		if sel := link.SelectLibs(objs, libFiles); sel != nil {
 			objs = append(objs, sel)
 		}
 	}
