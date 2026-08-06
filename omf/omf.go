@@ -100,6 +100,12 @@ type Segment struct {
 	rawHeader []byte
 	// Trailing bytes between the END record and ByteCnt boundary (padding).
 	trailer []byte
+
+	// LibMember tags a segment pulled from a library with its member file
+	// number from the library dictionary (0 = not a library pull). Private
+	// symbols resolve per member, so the linker scopes its per-file symbol
+	// tier by (file, LibMember). In-memory only; never serialized.
+	LibMember int
 }
 
 // File is a parsed OMF file: one or more segments. Libraries and ExpressLoad

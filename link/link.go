@@ -105,13 +105,28 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	var image []byte
 	var org int64
 	var kind uint16 = 0x4000
+	var banksize uint32
 	var align int64 // load segment ALIGN = max member alignment
-	for _, f := range objs {
-		fileSegs := map[string]*objSeg{}
-		fileGlobals := map[string]gsym{}
-		fileAbs := map[string]int64{}
+	// Per-file symbol scopes; a library pull carries per-MEMBER scopes (a
+	// member's private ~arrays/~string0 must not shadow another's), so the
+	// key is (file, LibMember).
+	type fileTier struct {
+		segs    map[string]*objSeg
+		globals map[string]gsym
+		abs     map[string]int64
+	}
+	tiers := map[int]*fileTier{}
+	for fi, f := range objs {
 		for i := range f.Segments {
 			s := &f.Segments[i]
+			tk := fi<<16 | s.LibMember
+			tier := tiers[tk]
+			if tier == nil {
+				tier = &fileTier{segs: map[string]*objSeg{},
+					globals: map[string]gsym{}, abs: map[string]int64{}}
+				tiers[tk] = tier
+			}
+			fileSegs, fileGlobals, fileAbs := tier.segs, tier.globals, tier.abs
 			// A TEMPORG segment is assembled for the address it will be
 			// copied to and run at, so references into it are absolute and
 			// need no relocation record. AD3.5's read1to1 is built for
@@ -143,6 +158,13 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 			if len(segs) == 1 {
 				org = int64(s.Org)
 				kind = s.Kind
+			}
+			// the load segment's BANKSIZE is the largest any member asks
+			// for (oracle: DOS3.3.FST's DS-only members carry 0, its code
+			// $10000, and the load segment takes $10000; GSCalc's ~arrays
+			// members are all 0 and the load segment stays 0)
+			if s.BankSize > banksize {
+				banksize = s.BankSize
 			}
 			img, err := segImage(s)
 			if err != nil {
@@ -185,16 +207,27 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 					}
 				case r.Op == omf.RecGequ:
 					// "EXPORT name:EQU" publishes a constant rather than a
-					// location, so its value is absolute, not image-relative.
+					// location, so its value is absolute, not image-relative
+					// -- except PascalIIGS's segment-relative GEQUs (see
+					// gequSelfRef), which behave like GLOBALs.
 					n := int(r.Raw[1])
+					name := string(r.Raw[2 : 2+n])
+					if disp, ok := gequSelfRef(r.Raw[2+n+4:], s.SegName); ok && !isAbs {
+						globals[name] = gsym{os.base + disp, 0}
+						fileGlobals[name] = gsym{os.base + disp, 0}
+						if globalPrivate(r.Raw) == 0 {
+							flat[name] = flatSym{os.base + disp, true, 0}
+						}
+						continue
+					}
 					v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil, nil)
 					if err != nil {
-						return nil, fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
+						return nil, fmt.Errorf("GEQU %s: %w", name, err)
 					}
-					absolutes[string(r.Raw[2:2+n])] = v
-					fileAbs[string(r.Raw[2:2+n])] = v
+					absolutes[name] = v
+					fileAbs[name] = v
 					if globalPrivate(r.Raw) == 0 {
-						flat[string(r.Raw[2:2+n])] = flatSym{v, false, 0}
+						flat[name] = flatSym{v, false, 0}
 					}
 				}
 			}
@@ -262,9 +295,9 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 	}
 
 	if !express {
-		return loadSegment(mainName, 1, image, org, kind, align, patches), nil
+		return loadSegment(mainName, 1, image, org, kind, banksize, align, patches), nil
 	}
-	return buildLoadFile(image, org, kind, align, patches)
+	return buildLoadFile(image, org, kind, banksize, align, patches)
 }
 
 // segImage extracts the raw code image of an object segment (expression
@@ -532,25 +565,29 @@ const (
 
 // buildLoadFile emits ~ExpressLoad + the "main" load segment, matching
 // LinkIIGS 1.2 byte-for-byte.
-func buildLoadFile(image []byte, org int64, kind uint16, align int64, patches []relocPatch) ([]byte, error) {
+func buildLoadFile(image []byte, org int64, kind uint16, banksize uint32, align int64, patches []relocPatch) ([]byte, error) {
 	return buildExpressFile([]exMember{{name: mainName, image: image, org: org,
-		kind: kind, align: align, segNum: 2, relocs: relocRecords(patches)}}), nil
+		kind: kind, banksize: banksize, align: align, segNum: 2,
+		relocs: relocRecords(patches)}}), nil
 }
 
 // exMember is one real load segment of an ExpressLoad file.
 type exMember struct {
-	name   string
-	image  []byte
-	org    int64
-	kind   uint16
+	name     string
+	image    []byte
+	org      int64
+	kind     uint16
+	banksize uint32
 	align  int64
 	segNum int
 	relocs []byte
 }
 
-// segHeader builds a load-segment header (the DISPDATA prefix). banksize
-// selects the $10000 BANKSIZE real segments carry; ~ExpressLoad leaves it 0.
-func segHeader(name string, segNum, byteCnt, imageLen int, org int64, kind uint16, align int64, banksize bool) []byte {
+// segHeader builds a load-segment header (the DISPDATA prefix). The load
+// segment's BANKSIZE is inherited from its FIRST member object segment
+// (oracle-verified: GSCalc's ~arrays takes %GSCALC.arr's 0 while ~globals
+// takes %GSCALC.glob's $10000); ~ExpressLoad carries 0.
+func segHeader(name string, segNum, byteCnt, imageLen int, org int64, kind uint16, align int64, banksize uint32) []byte {
 	le := binary.LittleEndian
 	dispData := mainDispName + 10 + 1 + len(name)
 	hdr := make([]byte, dispData)
@@ -558,10 +595,10 @@ func segHeader(name string, segNum, byteCnt, imageLen int, org int64, kind uint1
 	le.PutUint32(hdr[0x08:], uint32(imageLen))
 	hdr[0x0E] = 4
 	hdr[0x0F] = 2
-	// a DP/stack segment (type $12) carries BANKSIZE 0 like a data segment
-	// (oracle-verified against the Installer's ~direct)
-	if banksize && kind&0x1F != 0x12 {
-		le.PutUint32(hdr[0x10:], 0x10000)
+	// a DP/stack segment (type $12) carries BANKSIZE 0 whatever its members
+	// say (oracle-verified against the Installer's ~direct)
+	if kind&0x1F != 0x12 {
+		le.PutUint32(hdr[0x10:], banksize)
 	}
 	le.PutUint16(hdr[0x14:], kind)
 	le.PutUint32(hdr[0x18:], uint32(org))
@@ -625,7 +662,7 @@ func buildExpressFile(members []exMember) []byte {
 			le.PutUint32(blk[8:], uint32(dataOff+len(m.image)))
 			le.PutUint32(blk[12:], uint32(len(m.relocs)))
 		}
-		hdr := segHeader(m.name, m.segNum, byteCnt[i], len(m.image), m.org, m.kind, m.align, true)
+		hdr := segHeader(m.name, m.segNum, byteCnt[i], len(m.image), m.org, m.kind, m.align, m.banksize)
 		copy(blk[16:48], hdr[0x0C:0x2C])
 		blk[16+(0x2A-0x0C)] = 0 // DISPDATA zeroed inside the copy
 		blk[16+(0x2A-0x0C)+1] = 0
@@ -634,7 +671,7 @@ func buildExpressFile(members []exMember) []byte {
 		running += byteCnt[i]
 	}
 
-	out := segHeader(exName, 1, exByteCnt, exDataLen, 0, 0x8001, 0, false)
+	out := segHeader(exName, 1, exByteCnt, exDataLen, 0, 0x8001, 0, 0)
 	out = append(out, 0xF2)
 	var cnt [4]byte
 	le.PutUint32(cnt[:], uint32(exDataLen))
@@ -642,7 +679,7 @@ func buildExpressFile(members []exMember) []byte {
 	out = append(out, exData...)
 	out = append(out, 0x00)
 	for i, m := range members {
-		out = append(out, segHeader(m.name, m.segNum, byteCnt[i], len(m.image), m.org, m.kind, m.align, true)...)
+		out = append(out, segHeader(m.name, m.segNum, byteCnt[i], len(m.image), m.org, m.kind, m.align, m.banksize)...)
 		out = append(out, 0xF2)
 		le.PutUint32(cnt[:], uint32(len(m.image)))
 		out = append(out, cnt[:]...)
@@ -890,10 +927,11 @@ func (s Sel) Wants(seg *omf.Segment) bool {
 // plain form without it.
 func LinkGroups(groups []Group, express bool) ([]byte, error) {
 	type built struct {
-		name    string
-		image   []byte
-		org     int64
-		kind    uint16
+		name     string
+		image    []byte
+		org      int64
+		kind     uint16
+		banksize uint32
 		align   int64
 		dynamic bool
 		patches []relocPatch
@@ -915,7 +953,13 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		globals map[string]gsym
 		abs     map[string]int64
 	}
-	fileMaps := map[*omf.File]*fileScope{}
+	// keyed by (file, LibMember): library pulls scope per member (private
+	// names resolve within their member, not across the whole pull)
+	type scopeKey struct {
+		f *omf.File
+		m int
+	}
+	fileMaps := map[scopeKey]*fileScope{}
 	var all [][]*objSeg
 	var out []built
 	for gi, g := range groups {
@@ -923,16 +967,16 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		var segs []*objSeg
 		pos := int64(0)
 		for _, sel := range g.Sels {
-			fs := fileMaps[sel.File]
-			if fs == nil {
-				fs = &fileScope{segs: map[string]*objSeg{},
-					globals: map[string]gsym{}, abs: map[string]int64{}}
-				fileMaps[sel.File] = fs
-			}
 			for i := range sel.File.Segments {
 				s := &sel.File.Segments[i]
 				if !sel.Wants(s) {
 					continue
+				}
+				fs := fileMaps[scopeKey{sel.File, s.LibMember}]
+				if fs == nil {
+					fs = &fileScope{segs: map[string]*objSeg{},
+						globals: map[string]gsym{}, abs: map[string]int64{}}
+					fileMaps[scopeKey{sel.File, s.LibMember}] = fs
 				}
 				// A SKIP segment ($0200 in KIND) is an assembly-time guard,
 				// not content: b00segR's overflow check is an empty segment
@@ -963,6 +1007,10 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 					// purely to leave that gap.
 					pos = int64(s.Org) - b.org
 					at = pos
+				}
+				if s.BankSize > b.banksize {
+					// largest member BANKSIZE wins (see LinkOpts)
+					b.banksize = s.BankSize
 				}
 				absAt := int64(0)
 				if s.TempOrg != 0 {
@@ -1026,6 +1074,14 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		}
 		all = append(all, segs)
 		out = append(out, b)
+	}
+	if os.Getenv("LINKIIGS_MAP") != "" {
+		for gi := range out {
+			fmt.Fprintf(os.Stderr, "MAP group %q kind=$%04X banksize=$%X\n", out[gi].name, out[gi].kind, out[gi].banksize)
+			for _, s := range all[gi] {
+				fmt.Fprintf(os.Stderr, "  %08X %s\n", s.base, s.name)
+			}
+		}
 	}
 
 	// A group is dynamic if the -lseg:dynamic flag or its object KIND says so.
@@ -1218,20 +1274,21 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 
 	// Assemble the members in final order, splicing in the ~JumpTable.
 	type member struct {
-		name    string
-		image   []byte
-		org     int64
-		kind    uint16
-		align   int64
-		patches []relocPatch
-		segNum  int
+		name     string
+		image    []byte
+		org      int64
+		kind     uint16
+		banksize uint32
+		align    int64
+		patches  []relocPatch
+		segNum   int
 	}
 	var members []member
 	jtDone := false
 	for _, gi := range order {
 		b := &out[gi]
 		if len(jtOrder) > 0 && !jtDone && isDynamic(gi) {
-			members = append(members, member{name: "~JumpTable", image: jtImage, kind: 0x0002, segNum: jtSegNum})
+			members = append(members, member{name: "~JumpTable", image: jtImage, kind: 0x0002, banksize: 0x10000, segNum: jtSegNum})
 			jtDone = true
 		}
 		kind := b.kind
@@ -1239,23 +1296,24 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 			kind |= 0x8000
 		}
 		members = append(members, member{name: b.name, image: b.image, org: b.org,
-			kind: kind, align: b.align, patches: b.patches, segNum: segNum[gi]})
+			kind: kind, banksize: b.banksize, align: b.align, patches: b.patches, segNum: segNum[gi]})
 	}
 	if len(jtOrder) > 0 && !jtDone {
-		members = append(members, member{name: "~JumpTable", image: jtImage, kind: 0x0002, segNum: jtSegNum})
+		members = append(members, member{name: "~JumpTable", image: jtImage, kind: 0x0002, banksize: 0x10000, segNum: jtSegNum})
 	}
 
 	if !express {
 		var file []byte
 		for _, m := range members {
-			file = append(file, loadSegment(m.name, m.segNum, m.image, m.org, m.kind, m.align, m.patches)...)
+			file = append(file, loadSegment(m.name, m.segNum, m.image, m.org, m.kind, m.banksize, m.align, m.patches)...)
 		}
 		return file, nil
 	}
 	exMembers := make([]exMember, len(members))
 	for i, m := range members {
 		exMembers[i] = exMember{name: m.name, image: m.image, org: m.org,
-			kind: m.kind, align: m.align, segNum: m.segNum, relocs: relocRecords(m.patches)}
+			kind: m.kind, banksize: m.banksize, align: m.align, segNum: m.segNum,
+			relocs: relocRecords(m.patches)}
 	}
 	return buildExpressFile(exMembers), nil
 }
@@ -1289,21 +1347,54 @@ func collectSymbols(s *omf.Segment, base int64, group int, isAbs bool, globals m
 			}
 		case r.Op == omf.RecGequ:
 			n := int(r.Raw[1])
+			name := string(r.Raw[2 : 2+n])
+			// A PascalIIGS GEQU may be RELOCATABLE: "GSCALC.arr equ
+			// %GSCALC.arr+$418" publishes an offset into the segment that
+			// carries the record. Such a symbol behaves like a GLOBAL at
+			// (base+disp, group), not an absolute (oracle: GSCalc links).
+			if disp, ok := gequSelfRef(r.Raw[2+n+4:], s.SegName); ok && !isAbs {
+				globals[name] = gsym{base + disp, group}
+				if flat != nil && globalPrivate(r.Raw) == 0 {
+					flat[name] = flatSym{base + disp, true, group}
+				}
+				continue
+			}
 			v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil, nil)
 			if err != nil {
-				return fmt.Errorf("GEQU %s: %w", r.Raw[2:2+n], err)
+				return fmt.Errorf("GEQU %s: %w", name, err)
 			}
 			if flat != nil && globalPrivate(r.Raw) == 0 {
-				flat[string(r.Raw[2:2+n])] = flatSym{v, false, -1}
+				flat[name] = flatSym{v, false, -1}
 			}
-			absolutes[string(r.Raw[2:2+n])] = v
+			absolutes[name] = v
 		}
 	}
 	return nil
 }
 
+// gequSelfRef matches the one relocatable GEQU shape PascalIIGS emits: a
+// reference to the CONTAINING segment's own name plus an optional constant
+// ($83 <pstr segname> [$81 <disp:4> $01] $00), returning the displacement.
+func gequSelfRef(b []byte, segName string) (int64, bool) {
+	if len(b) < 2 || b[0] != 0x83 {
+		return 0, false
+	}
+	n := int(b[1])
+	if len(b) < 2+n || string(b[2:2+n]) != segName {
+		return 0, false
+	}
+	rest := b[2+n:]
+	if len(rest) >= 1 && rest[0] == 0x00 {
+		return 0, true
+	}
+	if len(rest) >= 7 && rest[0] == 0x81 && rest[5] == 0x01 && rest[6] == 0x00 {
+		return int64(binary.LittleEndian.Uint32(rest[1:])), true
+	}
+	return 0, false
+}
+
 // loadSegment emits one load-file segment carrying image plus its relocations.
-func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, align int64, patches []relocPatch) []byte {
+func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, banksize uint32, align int64, patches []relocPatch) []byte {
 	le := binary.LittleEndian
 	dispData := mainDispName + 10 + 1 + len(name)
 	relocBytes := relocRecords(patches)

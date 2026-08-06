@@ -125,8 +125,10 @@ func (e *Env) dispatch(name string, args []string, out io.Writer) error {
 		return e.runMakeLib(args)
 	case "reziigs":
 		return e.runRez(args)
-	case "dereziigs", "expressiigs",
-		"pascaliigs", "ciigs", "tmlpascal", "asmmatiigs":
+	case "pascaliigs", "ciigs", "tmlpascal", "tmlpas", "tmlclean", "pasasmiigs":
+		// no reimplementation: run the ORIGINAL compiler under emulation
+		return e.runOracleTool(name, args)
+	case "dereziigs", "expressiigs", "asmmatiigs":
 		return fmt.Errorf("%s: not implemented yet", name)
 
 	// ---- the Aristotle display.0 patch (make.aristotle) ----
@@ -413,7 +415,7 @@ func (e *Env) runAsm(args []string) error {
 			for _, d := range strings.Split(args[i], ",") {
 				incDirs = append(incDirs, e.HostPath(d))
 			}
-		case "-d":
+		case "-d", "-define": // TimeCDEV spells it out: "-define seconds=1"
 			i++
 			defines = append(defines, args[i])
 		case "-l", "-m", "-lo", "-pagesize", "-font", "-print":
@@ -528,12 +530,12 @@ func (e *Env) runLink(args []string) error {
 			i++
 			libs = append(libs, e.HostPath(args[i]))
 			log = append(log, "-lib", e.HostPath(args[i]))
-		case "-t", "-at", "-org", "-s":
+		case "-t", "-at", "-org":
 			i++ // consume the option's argument (type/aux stamping is metadata)
 		case "-x":
 			express = false // no ~ExpressLoad segment
 			log = append(log, "-x")
-		case "-w", "-l":
+		case "-w", "-l", "-s": // -s lists the symbol table; output-identical
 		default:
 			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND the
 			// attributes define outright (see segKindAttrs)
