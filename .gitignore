@@ -1,3 +1,20 @@
-/omfdump
 .DS_Store
+._*
+
+# Build output
+/bin/
 /obj/
+
+# Stray binaries from `go build` in the repo root (named for their cmd/ dir)
+/asmiigs
+/linkiigs
+/makebiniigs
+/mpwmk
+/omfdiff
+/omfdump
+/reziigs
+
+# Apple-derived test fixtures are NEVER committed. Tests that need them read
+# the IIGS_FIXTURES environment variable and skip when it is unset.
+/fixtures/
+/testdata/apple/
