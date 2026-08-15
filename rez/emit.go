@@ -183,7 +183,6 @@ func (e *emitter) dataEnd() bool {
 	return t.kind == tEOF || t.is("}") || t.is(";")
 }
 
-
 // setCount records an array/optional-group element count. Inside an array
 // element the count is also keyed per element ("name#i"), the same way
 // labels are: each OneDoc in the Finder's rBundle has its own

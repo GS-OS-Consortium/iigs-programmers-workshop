@@ -69,10 +69,10 @@ func (s *Segment) writeSeg(segNum int) []byte {
 	if t := kind & 0x1F; t != 0x01 && t != 0x12 {
 		le.PutUint32(hdr[0x10:], 0x10000) // BANKSIZE
 	}
-	le.PutUint16(hdr[0x14:], kind)          // KIND
-	le.PutUint32(hdr[0x18:], uint32(s.Org)) // ORG
+	le.PutUint16(hdr[0x14:], kind)            // KIND
+	le.PutUint32(hdr[0x18:], uint32(s.Org))   // ORG
 	le.PutUint32(hdr[0x1C:], uint32(s.Align)) // ALIGN
-	hdr[0x20] = 0                           // NUMSEX
+	hdr[0x20] = 0                             // NUMSEX
 	if s.HasTempOrg {
 		hdr[0x21] = 1 // v2.1 marker (oracle-verified)
 		le.PutUint32(hdr[0x2C:], uint32(s.TempOrg))

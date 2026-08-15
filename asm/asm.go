@@ -100,11 +100,11 @@ type asmState struct {
 	// the body's "&lab" definition belongs to the CALLER's scope, not the
 	// expansion's -- the outer "beq @hitReturn" must reach it.
 	labelRedirect []labelRedirect
-	cpu        int
-	longA      bool
-	longI      bool
-	msb        bool
-	strMode    string // "ASIS" or "PASCAL"
+	cpu           int
+	longA         bool
+	longI         bool
+	msb           bool
+	strMode       string // "ASIS" or "PASCAL"
 	// blanksOff is BLANKS OFF: the operand field ends at the first blank
 	// after a complete operand. The DEFAULT is BLANKS ON (oracle-probed),
 	// where the field runs to the ';' comment or end of line -- hfs.fst.btree
@@ -127,7 +127,7 @@ type asmState struct {
 	// RECORD IMPORT and the -unsafe "Undefined ID -- IMPORT assumed" path.
 	segImports     map[string]bool
 	assumedImports map[string]bool
-	entries map[string]bool // ENTRY/EXPORT labels awaiting definition
+	entries        map[string]bool // ENTRY/EXPORT labels awaiting definition
 	// entryPriv is the GLOBAL record's private byte: ENTRY publishes 1,
 	// EXPORT 0. entryEqu holds the names declared "name:EQU", which resolve
 	// to a constant and so are published as GEQU rather than GLOBAL.
@@ -796,33 +796,33 @@ func AssembleSource(src, dir string) (*Object, error) {
 
 func newState() *asmState {
 	st := &asmState{
-		cpu:        cpu65816,
-		longA:      true,
-		longI:      true,
-		msb:        false,
-		strMode:    "ASIS",
-		syms:       map[string]Val{},
-		symSeq:     map[string][]Val{},
-		imports:    map[string]bool{},
-		entries:    map[string]bool{},
-		entryPriv:  map[string]byte{},
-		codeChk:    true,
-		globalNth:  map[string]int{},
-		entrySeg:   map[string]int{},
-		pubGseq:    map[string]int{},
-		lastPubSeq: map[string]int64{},
-		fileWide:   map[string]bool{},
+		cpu:            cpu65816,
+		longA:          true,
+		longI:          true,
+		msb:            false,
+		strMode:        "ASIS",
+		syms:           map[string]Val{},
+		symSeq:         map[string][]Val{},
+		imports:        map[string]bool{},
+		entries:        map[string]bool{},
+		entryPriv:      map[string]byte{},
+		codeChk:        true,
+		globalNth:      map[string]int{},
+		entrySeg:       map[string]int{},
+		pubGseq:        map[string]int{},
+		lastPubSeq:     map[string]int64{},
+		fileWide:       map[string]bool{},
 		segNames:       map[string]bool{},
 		fileImports:    map[string]bool{},
 		segImports:     map[string]bool{},
 		assumedImports: map[string]bool{},
-		scopeSeg:   -1,
-		scopeChain: []int{0},
-		recSize:    map[string]int64{},
-		recFields:  map[string]map[string]int64{},
-		recEqus:    map[string]map[string]bool{},
-		entryEqu:   map[string]bool{},
-		loadName:   "main",
+		scopeSeg:       -1,
+		scopeChain:     []int{0},
+		recSize:        map[string]int64{},
+		recFields:      map[string]map[string]int64{},
+		recEqus:        map[string]map[string]bool{},
+		entryEqu:       map[string]bool{},
+		loadName:       "main",
 	}
 	st.pp = newPP(st)
 	return st

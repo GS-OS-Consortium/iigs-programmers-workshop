@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build / vet / test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # Tests that need Apple-derived reference binaries read IIGS_FIXTURES and
+      # skip when it is unset -- which it always is here. This job proves the
+      # toolchain builds and its self-authored tests pass with no Apple material
+      # present, which is the only tier anyone outside the project can run.
+      - name: go test
+        run: go test ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l . )"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: commands build
+        run: go build -o /tmp/bin/ ./cmd/...
