@@ -1,15 +1,15 @@
 # IIgs Programmers Workshop
 
 A from-scratch, modern reimplementation (in Go) of the Apple **MPW IIGS**
-cross-development toolchain — the Mac-hosted tools Apple used to build Apple
-IIgs GS/OS System 6.0.1 — plus the MPW Make/Shell dialect the build system
+cross-development toolchain - the Mac-hosted tools Apple used to build Apple
+IIgs GS/OS System 6.0.1 - plus the MPW Make/Shell dialect the build system
 depends on.
 
 The fidelity bar is **byte-identical output**: every behavior is developed
 against the original tools running under emulation (the "oracle"), and the
 proof of correctness is that Apple's unmodified GS/OS 6.0.1 makefiles build
-binaries that match the originals byte for byte — through assembly, linking,
-library resolution, and load-file generation — and boot to the Finder.
+binaries that match the originals byte for byte - through assembly, linking,
+library resolution, and load-file generation - and boot to the Finder.
 
 ## Tools
 
@@ -21,9 +21,9 @@ library resolution, and load-file generation — and boot to the Finder.
 | `reziigs` | RezIIGS | Resource compiler: type templates, the C-like preprocessor, `$$Word`/`$$Countof` builtins, `read` of converted code resources, IIgs resource file + map |
 | `mpwmk` | MPW Make + Shell | Runs Apple's unmodified makefiles: `ƒ` rules, `∂` continuations, `{var}` expansion, MPW `:` paths, backquotes, built-ins, and in-process dispatch to all of the above (plus MakeLibIIGS, OverlayIIGS, RezIIGS) |
 | `omfdump` | DumpObjIIGS (roughly) | Segment/record structure dumper for OMF files |
-| `omfdiff` | — | Structural diff of two OMF files (exit 0 = identical) |
+| `omfdiff` | - | Structural diff of two OMF files (exit 0 = identical) |
 
-Library packages: `omf/` (OMF v1/v2/v2.1 reader/writer — round-trips real
+Library packages: `omf/` (OMF v1/v2/v2.1 reader/writer - round-trips real
 object files, load files, and libraries byte-for-byte), `asm/`, `link/`,
 `rez/`, `mpwmk/`.
 
