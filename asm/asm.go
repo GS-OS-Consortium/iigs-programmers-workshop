@@ -251,17 +251,34 @@ func (st *asmState) sym(name string) string {
 // segment, and anything published with ENTRY/EXPORT.
 func (st *asmState) scopePrefix() string {
 	if st.scopeSeg >= 0 {
-		return fmt.Sprintf("%d\x00", st.scopeSeg)
+		return st.segScope(st.scopeSeg)
 	}
-	// A data segment's PLAIN field names are scoped to the segment like any
-	// PROC label (oracle-probed: "sta save1" from another segment is
-	// "Undefined ID", or "IMPORT assumed" under -unsafe). Only EXPORTed
-	// fields and the qualified RECORD.FIELD form reach across segments --
-	// hfs.fst.main relies on the IMPORT-assumed form for save_gbuf_ptr1.
+	// A data segment's PLAIN field names are hidden from CODE, like any PROC
+	// label (oracle-probed: "sta save1" from another segment is "Undefined
+	// ID", or "IMPORT assumed" under -unsafe). Only EXPORTed fields and the
+	// qualified RECORD.FIELD form reach code across segments -- hfs.fst.main
+	// relies on the IMPORT-assumed form for save_gbuf_ptr1.
 	if st.cur == nil || st.inRecord {
 		return ""
 	}
-	return fmt.Sprintf("%d\x00", st.curSegIndex())
+	return st.segScope(st.curSegIndex())
+}
+
+// segScope is the symbol-scope key for segment index i. Each CODE segment
+// scopes its own labels, but every DATA segment shares ONE scope: a plain
+// field of one data segment is invisible to code yet perfectly visible to
+// another DATA segment, which reaches it and emits segmentname+offset.
+// MacRez.asm's PutDialog640 reads OpenStr/CloseStr/DriveStr straight out of
+// the GetDialog640 record that way, and the two records name their own fields
+// apart (CloseBut640 vs CloseButP640) precisely because they share a
+// namespace. Both directions oracle-probed; the code direction is
+// testcases/asm/dataseg-field-scope.aii and the data one
+// testcases/asm/dataseg-field-crossref.aii.
+func (st *asmState) segScope(i int) string {
+	if i >= 0 && i < len(st.segs) && st.segs[i].kind&0x0001 != 0 {
+		return "D\x00"
+	}
+	return fmt.Sprintf("%d\x00", i)
 }
 
 func (st *asmState) lookup(name string) Val {
@@ -307,14 +324,15 @@ func (st *asmState) lookup(name string) Val {
 	// Tag with the symbol's own name/offset so cross-segment references
 	// can be emitted by name; same-segment backward refs still use
 	// segment+offset (see exprRef).
-	tag := func(v Val) Val {
+	tagAs := func(v Val, n string) Val {
 		if len(v.Pos) == 1 && len(v.Neg) == 0 && v.Pos[0].fwd == "" && v.Pos[0].name == "" {
-			t := term{seg: v.Pos[0].seg, name: name, symOff: v.C, defSeq: v.defSeq}
+			t := term{seg: v.Pos[0].seg, name: n, symOff: v.C, defSeq: v.defSeq}
 			t.pub = st.publishedAt(t)
 			v.Pos = []term{t}
 		}
 		return v
 	}
+	tag := func(v Val) Val { return tagAs(v, name) }
 	// WITH wins -- even over an IMPORT of the same name in the same segment
 	// (oracle-probed: AppleShare's PreProcess does "with dp,mydata" AND
 	// "import my_fork_bitmap", and the reference emits MYDATA+offset; nothing
@@ -350,6 +368,23 @@ func (st *asmState) lookup(name string) Val {
 			continue
 		}
 		return tag(v)
+	}
+	// CASE ON does not reach BACKWARDS. A definition made while the file was
+	// still CASE OFF was folded to upper case, and a later reference under
+	// CASE ON must still find it: E16.Dialog defines "buttonItem" (folded to
+	// BUTTONITEM), and MacRez.asm's "dc.w ButtonItem" 1900 lines later --
+	// after "case on" -- is the same symbol. Only definitions made UNDER
+	// CASE ON keep their spelling, which is what makes a reference to FOO2
+	// fail to find a "Foo2" defined after the directive (oracle-probed).
+	// The symbol keeps the DEFINITION's spelling, not the reference's.
+	if st.caseSens {
+		if u := strings.ToUpper(name); u != name {
+			for _, key := range [2]string{scope + u, u} {
+				if v, ok := st.syms[key]; ok {
+					return tagAs(v, u)
+				}
+			}
+		}
 	}
 	f := fwdVal(name)
 	f.Pos[0].scope = scope
@@ -1122,7 +1157,20 @@ func (st *asmState) doLine(l line) {
 		st.strMode = strings.ToUpper(operandOnly(l.rest))
 		return
 	case "case":
-		st.caseSens = strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "on")
+		// CASE ON|OFF|OBJECT. Only OFF turns case folding back on: OBJECT
+		// asks for the source spelling in the OBJECT FILE, so it cannot be
+		// the "not ON" that this once read it as -- MacRez.asm writes
+		// "case on" and "case object" on consecutive lines, and treating the
+		// second as OFF upper-cased the very segment names (GetDialog640,
+		// PutDialog640) the pair exists to preserve. Those two lines are the
+		// corpus's only use of OBJECT, so what is pinned here is that it does
+		// not CLEAR sensitivity, not how it behaves on its own.
+		switch strings.ToLower(strings.TrimSpace(operandOnly(l.rest))) {
+		case "on", "object":
+			st.caseSens = true
+		case "off":
+			st.caseSens = false
+		}
 		return
 	case "blanks":
 		st.blanksOff = strings.EqualFold(strings.TrimSpace(operandOnly(l.rest)), "off")

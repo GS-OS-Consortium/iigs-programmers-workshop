@@ -509,6 +509,7 @@ func (e *Env) runLink(args []string) error {
 	var output string
 	var groups []link.Group
 	var log []string
+	var aliases map[string]string
 	selCache := map[string]*omf.File{}
 	express := true
 	for i := 0; i < len(args); i++ {
@@ -532,6 +533,20 @@ func (e *Env) runLink(args []string) error {
 			log = append(log, "-lib", e.HostPath(args[i]))
 		case "-t", "-at", "-org":
 			i++ // consume the option's argument (type/aux stamping is metadata)
+		case "-a":
+			// "-a old=new" aliases a symbol REFERENCE (see link.SetAliases).
+			// The original rejects an operand with no "=" as an unknown
+			// option rather than ignoring it.
+			i++
+			old, new, ok := strings.Cut(args[i], "=")
+			if !ok {
+				return fmt.Errorf("linkiigs: Unknown option (-A %s) specified", args[i])
+			}
+			if aliases == nil {
+				aliases = map[string]string{}
+			}
+			aliases[old] = new
+			log = append(log, "-a", args[i])
 		case "-x":
 			express = false // no ~ExpressLoad segment
 			log = append(log, "-x")
@@ -572,6 +587,8 @@ func (e *Env) runLink(args []string) error {
 		}
 	}
 	e.logLink(log)
+	// unconditional, so a previous link's aliases cannot leak into this one
+	link.SetAliases(aliases)
 	if output == "" || (len(inputs) == 0 && len(groups) == 0) {
 		return fmt.Errorf("linkiigs: need inputs and -o output")
 	}

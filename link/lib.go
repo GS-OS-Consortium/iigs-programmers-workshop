@@ -184,17 +184,21 @@ func selectLibs(objs []*omf.File, libs []*omf.File, allow func(*omf.Segment) boo
 	var buckets [512][]string
 	seen := map[string]bool{}
 	defined := map[string]bool{}
-	// A reference lookup can move a symbol to its chain's head, but each
-	// symbol moves AT MOST ONCE (oracle-probed: mount_volume rises at its
-	// second reference but not its third), and only when the re-reference
-	// comes from a DIFFERENT file than the earlier ones: lookups dedup per
-	// FILE -- a root object counts as one file, a library member counts as
-	// one file. (GSCalc pinned the granularity: GETROUND re-references
-	// getenvironment right after its member-mate SETROUND first referenced
-	// it, and the oracle does NOT hoist; likewise the root object's many
-	// segments re-reference _wsign_extend / TRACKCONTROL / HILITECONTROL
-	// with no hoist.)
-	hoisted := map[string]bool{}
+	// A reference lookup moves its symbol to the head of its chain, EVERY
+	// time, but only when the re-reference comes from a DIFFERENT file than
+	// the earlier ones: lookups dedup per FILE -- a root object counts as one
+	// file, a library member counts as one file. (GSCalc pinned the
+	// granularity: GETROUND re-references getenvironment right after its
+	// member-mate SETROUND first referenced it, and the oracle does NOT
+	// hoist.)
+	//
+	// This used to hoist each symbol at most once, which fitted every target
+	// then in the corpus -- a symbol that is already at the head cannot be
+	// seen to rise, so "rises at its second reference but not its third" also
+	// reads as "was already at the head". Teach separates the two: its
+	// _wsign_extend is referenced from three files with GETPORT's reference
+	// in between, so the third lookup has somewhere to rise FROM, and the
+	// oracle raises it.
 	dbgBuckets := map[int]bool{}
 	if v := os.Getenv("LINKIIGS_LIBDEBUG"); v != "" {
 		for _, s := range strings.Split(v, ",") {
@@ -205,17 +209,13 @@ func selectLibs(objs []*omf.File, libs []*omf.File, allow func(*omf.Segment) boo
 	insert := func(key, name string) {
 		b := libHash(name)
 		if dbgBuckets[b] {
-			fmt.Fprintf(os.Stderr, "insert %q b=%d seen=%v hoisted=%v chain=%v\n", key, b, seen[key], hoisted[key], buckets[b])
+			fmt.Fprintf(os.Stderr, "insert %q b=%d seen=%v chain=%v\n", key, b, seen[key], buckets[b])
 		}
 		if !seen[key] {
 			seen[key] = true
 			buckets[b] = append([]string{key}, buckets[b]...)
 			return
 		}
-		if hoisted[key] {
-			return
-		}
-		hoisted[key] = true
 		ch := buckets[b]
 		for i, x := range ch {
 			if x == key {
@@ -253,6 +253,11 @@ func selectLibs(objs []*omf.File, libs []*omf.File, allow func(*omf.Segment) boo
 				}
 				return
 			}
+			// Only now is the name resolved ACROSS files, which is the one
+			// place "-a old=new" applies: the pull follows the alias, so the
+			// member defining new comes in and the one defining old does not
+			// (link.go's evalOMFExprReloc aliases at the matching point).
+			n = alias(n)
 			insert(n, n)
 		}
 		def := func(r omf.Record) {

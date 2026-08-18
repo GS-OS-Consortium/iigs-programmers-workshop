@@ -82,6 +82,153 @@ func globalPrivate(raw []byte) byte {
 	return raw[2+n+3]
 }
 
+// deferredGequ is a GEQU whose expression names OTHER symbols, held back
+// until every segment is placed.
+//
+// PascalIIGS chains a unit's storage off its own globals segment -- uUtils
+// publishes "UUTILS equ %UUTILS.glob+8" (a self-reference, see gequSelfRef)
+// and then "OOMFLAG equ UUTILS-2", "RESERVEHNDL equ UUTILS-6" off THAT. The
+// second kind was evaluated in an empty environment, so every such symbol
+// came out zero and Teach's and FindFileGS's references to them linked to
+// nothing. The symbols a GEQU names may live in a segment, or a whole load
+// segment, placed after the one carrying the record, so they cannot be
+// resolved where they are collected.
+type deferredGequ struct {
+	name   string
+	expr   []byte
+	cur    *objSeg // containing segment: own-file tiers and $87 resolve here
+	public bool
+	// the tables this collection pass writes into (flat may be nil for a
+	// file-scope pass)
+	globals   map[string]gsym
+	absolutes map[string]int64
+	flat      map[string]flatSym
+}
+
+// exprLabels lists every symbol an OMF expression references by name.
+func exprLabels(b []byte) []string {
+	var out []string
+	for i := 0; i < len(b) && b[i] != 0x00; {
+		switch b[i] {
+		case 0x81, 0x80, 0x87:
+			i += 5
+		case 0x82, 0x83:
+			n := int(b[i+1])
+			if i+2+n > len(b) {
+				return out
+			}
+			out = append(out, string(b[i+2:i+2+n]))
+			i += 2 + n
+		default:
+			i++
+		}
+	}
+	return out
+}
+
+// resolveDeferredGequs evaluates the held-back GEQUs now that every segment
+// is placed, repeating while a pass resolves something new: a GEQU may name
+// another GEQU, and the two can appear in either order.
+//
+// A GEQU whose symbols are STILL unknown after the fixpoint is evaluated
+// anyway on the last pass, so the original linker's "Missing symbol ...
+// resolved to zero" behaviour is reached rather than silently skipped.
+func resolveDeferredGequs(d []deferredGequ, byName map[string]*objSeg,
+	globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym) error {
+	known := func(g deferredGequ) bool {
+		for _, n := range exprLabels(g.expr) {
+			n = alias(n) // resolution below goes through the same table
+			if g.cur != nil {
+				if _, ok := g.cur.fileSegs[n]; ok {
+					continue
+				}
+				if _, ok := g.cur.fileGlobals[n]; ok {
+					continue
+				}
+				if _, ok := g.cur.fileAbs[n]; ok {
+					continue
+				}
+			}
+			_, a := flat[n]
+			_, b := byName[n]
+			_, c := globals[n]
+			_, e := absolutes[n]
+			if !a && !b && !c && !e {
+				return false
+			}
+		}
+		return true
+	}
+	apply := func(g deferredGequ) error {
+		v, _, isBase, grp, err := evalOMFExprReloc(g.expr, byName, globals, absolutes, flat, g.cur)
+		if err != nil {
+			return fmt.Errorf("GEQU %s: %w", g.name, err)
+		}
+		if isBase {
+			g.globals[g.name] = gsym{v, grp}
+			if g.public && g.flat != nil {
+				g.flat[g.name] = flatSym{v, true, grp}
+			}
+			return nil
+		}
+		g.absolutes[g.name] = v
+		if g.public && g.flat != nil {
+			g.flat[g.name] = flatSym{v, false, -1}
+		}
+		return nil
+	}
+	for len(d) > 0 {
+		var again []deferredGequ
+		for _, g := range d {
+			if !known(g) {
+				again = append(again, g)
+				continue
+			}
+			if err := apply(g); err != nil {
+				return err
+			}
+		}
+		if len(again) == len(d) { // no progress: evaluate and let it warn
+			for _, g := range again {
+				if err := apply(g); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		d = again
+	}
+	return nil
+}
+
+// aliases is LinkIIGS's "-a old=new" table: every REFERENCE to old resolves
+// as if it named new, in both expression evaluation and library selection.
+// DEFINITIONS keep their own names -- aliasing a defined symbol to another
+// leaves the first defined and unreferenced, and aliasing to a name nothing
+// defines produces the ordinary "Missing symbol" warning (both oracle-probed
+// on FindFileGS's objects).
+//
+// Matching is CASE-SENSITIVE: "-a reallyopen=x" does not touch REALLYOPEN,
+// which is why FindFileGS's own "-a period=20 -a mask=$0FF7" are inert -- its
+// symbols are PERIOD and MASK, and DAInterface.asm EQUs both locally anyway.
+//
+// Process-level rather than a parameter because a reference is resolved in a
+// dozen places; SetAliases is called at the start of every link (with nil
+// when there are none), so nothing leaks between the many links one mpwmk run
+// performs.
+var aliases map[string]string
+
+// SetAliases installs the "-a old=new" table for the next link.
+func SetAliases(a map[string]string) { aliases = a }
+
+// alias resolves a referenced name through the -a table.
+func alias(n string) string {
+	if v, ok := aliases[n]; ok {
+		return v
+	}
+	return n
+}
+
 // Link links object segments (currently: one load segment named "main",
 // which is what every GS/OS-era makefile default produces for single-file
 // links) into a load file.
@@ -117,6 +264,8 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 		abs     map[string]int64
 	}
 	tiers := map[int]*fileTier{}
+	// GEQUs that name other symbols, resolved once placement is complete
+	var deferred []deferredGequ
 	for fi, f := range objs {
 		for i := range f.Segments {
 			s := &f.Segments[i]
@@ -221,7 +370,18 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 						}
 						continue
 					}
-					v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil, nil)
+					// naming any other symbol defers it (see deferredGequ)
+					expr := r.Raw[2+n+4:]
+					if len(exprLabels(expr)) > 0 {
+						pub := globalPrivate(r.Raw) == 0
+						deferred = append(deferred,
+							deferredGequ{name: name, expr: expr, cur: os, public: pub,
+								globals: globals, absolutes: absolutes, flat: flat},
+							deferredGequ{name: name, expr: expr, cur: os, public: pub,
+								globals: fileGlobals, absolutes: fileAbs, flat: nil})
+						continue
+					}
+					v, _, err := evalOMFExpr(expr, nil, nil, nil, nil, nil)
 					if err != nil {
 						return nil, fmt.Errorf("GEQU %s: %w", name, err)
 					}
@@ -234,6 +394,11 @@ func LinkOpts(objs []*omf.File, express bool) ([]byte, error) {
 			}
 			image = append(image, img...)
 		}
+	}
+
+	// every segment is placed: resolve the GEQUs that name other symbols
+	if err := resolveDeferredGequs(deferred, byName, globals, absolutes, flat); err != nil {
+		return nil, err
 	}
 
 	// second pass: apply expression patches
@@ -343,6 +508,14 @@ func segImage(s *omf.Segment) ([]byte, error) {
 			return nil, fmt.Errorf("unsupported record %s", omf.RecName(r.Op))
 		}
 	}
+	// The header's LENGTH is the memory the segment requires; a body that
+	// emits fewer bytes is implicitly zero-filled to it. PLib's STACKMIN
+	// declares $1000 with no body records at all -- it is the Pascal direct
+	// page and stack -- and taking the body as the size left Teach's
+	// ~Direct load segment empty and the file $1000 short.
+	if int64(len(img)) < int64(s.Length) {
+		img = append(img, make([]byte, int64(s.Length)-int64(len(img)))...)
+	}
 	return img, nil
 }
 
@@ -445,11 +618,12 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals map[string]gs
 			pos += 1 + n
 			if os.Getenv("LINKDEBUG") == name {
 				src := "?"
-				if cur != nil {
+				var inFileSegs, inFileGlob bool
+				if cur != nil { // nil where a GEQU expression is evaluated
 					src = cur.name
+					_, inFileSegs = cur.fileSegs[name]
+					_, inFileGlob = cur.fileGlobals[name]
 				}
-				_, inFileSegs := cur.fileSegs[name]
-				_, inFileGlob := cur.fileGlobals[name]
 				bn, inByName := byName[name]
 				gv, inGlob := globals[name]
 				bnb := int64(-1)
@@ -484,6 +658,11 @@ func evalOMFExprReloc(b []byte, byName map[string]*objSeg, globals map[string]gs
 			// byName/globals/absolutes chain stays as a fallback for names
 			// with no public definition; the gated corpus never exercises
 			// it (the original zeroes such references with a warning).
+			//
+			// "-a old=new" applies HERE and not above: a reference that
+			// binds inside its own file is untouched by an alias, which is
+			// what testcases/link/symbol-alias.aii pins.
+			name = alias(name)
 			if fs, ok := flat[name]; ok {
 				if fs.isBase {
 					push(fs.val, 1, fs.group)
@@ -985,6 +1164,8 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		m int
 	}
 	fileMaps := map[scopeKey]*fileScope{}
+	// GEQUs that name other symbols, resolved once placement is complete
+	var deferred []deferredGequ
 	// A library named as a group input -- SetStart's
 	// "PLib(@main,@PLib,@~globals)" -- pulls need-based like -lib, but only
 	// from the selected load segments, and the pulls land in THIS group.
@@ -1098,10 +1279,10 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 				if os.abs != 0 {
 					symBase = os.abs
 				}
-				if err := collectSymbols(s, symBase, gi, os.abs != 0, globals, absolutes, flat); err != nil {
+				if err := collectSymbols(s, symBase, gi, os.abs != 0, globals, absolutes, flat, os, &deferred); err != nil {
 					return nil, err
 				}
-				if err := collectSymbols(s, symBase, gi, os.abs != 0, fs.globals, fs.abs, nil); err != nil {
+				if err := collectSymbols(s, symBase, gi, os.abs != 0, fs.globals, fs.abs, nil, os, &deferred); err != nil {
 					return nil, err
 				}
 				if skip {
@@ -1128,6 +1309,12 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 		}
 		all = append(all, segs)
 		out = append(out, b)
+	}
+	// Every segment is placed, so the GEQUs that name other symbols can be
+	// resolved. This must precede the dynamic-group prescan below: that pass
+	// already evaluates expressions against the symbol tables.
+	if err := resolveDeferredGequs(deferred, byName, globals, absolutes, flat); err != nil {
+		return nil, err
 	}
 	if os.Getenv("LINKIIGS_MAP") != "" {
 		for gi := range out {
@@ -1376,7 +1563,7 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 // collectSymbols records a segment's GLOBAL and GEQU definitions. GLOBALs of
 // a relocatable segment are offsets within load segment `group`; those of an
 // absolute (org'd/TEMPORG) segment are fixed addresses and go to absolutes.
-func collectSymbols(s *omf.Segment, base int64, group int, isAbs bool, globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym) error {
+func collectSymbols(s *omf.Segment, base int64, group int, isAbs bool, globals map[string]gsym, absolutes map[string]int64, flat map[string]flatSym, cur *objSeg, deferred *[]deferredGequ) error {
 	off := base
 	for _, r := range s.Records {
 		switch {
@@ -1414,7 +1601,17 @@ func collectSymbols(s *omf.Segment, base int64, group int, isAbs bool, globals m
 				}
 				continue
 			}
-			v, _, err := evalOMFExpr(r.Raw[2+n+4:], nil, nil, nil, nil, nil)
+			// A GEQU that names any OTHER symbol has to wait until every
+			// segment is placed (see deferredGequ).
+			expr := r.Raw[2+n+4:]
+			if len(exprLabels(expr)) > 0 {
+				*deferred = append(*deferred, deferredGequ{
+					name: name, expr: expr, cur: cur,
+					public:  globalPrivate(r.Raw) == 0,
+					globals: globals, absolutes: absolutes, flat: flat})
+				continue
+			}
+			v, _, err := evalOMFExpr(expr, nil, nil, nil, nil, nil)
 			if err != nil {
 				return fmt.Errorf("GEQU %s: %w", name, err)
 			}

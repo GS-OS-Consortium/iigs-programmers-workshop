@@ -14,6 +14,7 @@ package mpwmk
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,6 +73,27 @@ func isTextFile(data []byte) bool {
 	return !strings.Contains(string(data), "\x00") && utf8.Valid(data)
 }
 
+// isDirArg reports whether an expanded MPW operand names a DIRECTORY. The
+// trailing separator is the only evidence available and it is authoritative:
+// Teach's "{ObjDir}" is ":objs:" and the directory does not exist yet on a
+// clean tree, so asking the filesystem answers "file" and the compiler then
+// writes its object OVER the name make wanted to be a directory.
+func isDirArg(raw string) bool {
+	return strings.HasSuffix(raw, ":") || strings.HasSuffix(raw, "/")
+}
+
+// belowDir reports the path of hp relative to dir when hp names a
+// SUBDIRECTORY of dir, or a file inside one. A file sitting directly in dir
+// is not "below" it: those stage flat, which is the bridge's normal case,
+// and rewriting them would change every target that already works.
+func belowDir(dir, hp string, isDir bool) (string, bool) {
+	rel, err := filepath.Rel(dir, hp)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return "", false
+	}
+	return rel, isDir || strings.Contains(rel, string(filepath.Separator))
+}
+
 // runOracleTool stages e.Dir, runs the named original tool there, and pulls
 // the outputs back.
 func (e *Env) runOracleTool(name string, args []string) error {
@@ -124,13 +146,38 @@ func (e *Env) runOracleTool(name string, args []string) error {
 
 	// Arguments: path-like operands become their base names (everything the
 	// tool needs sits flat in the work dir); flags pass through.
+	//
+	// An operand naming a path BELOW the invocation directory keeps its
+	// relative shape instead, and the directory is created in the work tree
+	// so the tool can write there. Flattening those was wrong in both
+	// directions: Teach compiles with "-o :objs:", where the base name
+	// "objs" collided with the directory itself, and FindFileGS with
+	// "-o :obj:FindFileDA.p.obj", which landed the object one level up from
+	// the file make was waiting for.
 	var targs []string
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") || !strings.ContainsAny(a, ":/") {
 			targs = append(targs, a)
 			continue
 		}
-		targs = append(targs, filepath.Base(strings.ReplaceAll(strings.TrimSuffix(e.HostPath(a), "/"), ":", "/")))
+		raw := strings.TrimSpace(e.Expand(a))
+		hp := strings.TrimSuffix(e.HostPath(a), "/")
+		if rel, ok := belowDir(e.Dir, hp, isDirArg(raw)); ok {
+			dir := filepath.Dir(rel)
+			if isDirArg(raw) {
+				dir = rel
+			}
+			if err := os.MkdirAll(filepath.Join(work, dir), 0755); err != nil {
+				return err
+			}
+			mpw := ":" + strings.ReplaceAll(rel, string(filepath.Separator), ":")
+			if isDirArg(raw) {
+				mpw += ":" // MPW marks a directory by the trailing separator
+			}
+			targs = append(targs, mpw)
+			continue
+		}
+		targs = append(targs, filepath.Base(strings.ReplaceAll(hp, ":", "/")))
 	}
 
 	cmd := exec.Command(runner, append([]string{tool}, targs...)...)
@@ -146,30 +193,37 @@ func (e *Env) runOracleTool(name string, args []string) error {
 	e.logOracle(name, args)
 
 	// Copy back everything the tool created or rewrote, byte-exact, with its
-	// Finder type mirrored so a later staging round-trips it.
-	after, err := os.ReadDir(work)
-	if err != nil {
-		return err
-	}
-	for _, ent := range after {
-		if ent.IsDir() {
-			continue
+	// Finder type mirrored so a later staging round-trips it. The walk is
+	// recursive because an output argument may name a subdirectory (see
+	// belowDir); staging is still flat, so a file below the top level is by
+	// construction new and has no snapshot entry.
+	err = filepath.WalkDir(work, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
 		}
-		data, err := os.ReadFile(filepath.Join(work, ent.Name()))
+		rel, err := filepath.Rel(work, p)
 		if err != nil {
-			continue
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
 		}
 		sig := fmt.Sprintf("%d:%x", len(data), data[:min(len(data), 64)])
-		if prev, ok := snapshot[ent.Name()]; ok && prev == sig {
-			continue
+		if prev, ok := snapshot[rel]; ok && prev == sig {
+			return nil
 		}
-		dst := filepath.Join(e.Dir, ent.Name())
+		dst := filepath.Join(e.Dir, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return err
+		}
 		if err := os.WriteFile(dst, data, 0644); err != nil {
 			return err
 		}
-		setFinderInfo(dst, getFinderInfo(filepath.Join(work, ent.Name())))
-	}
-	return nil
+		setFinderInfo(dst, getFinderInfo(p))
+		return nil
+	})
+	return err
 }
 
 func macToUTF8(b []byte) string {

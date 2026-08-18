@@ -15,6 +15,7 @@ func main() {
 	var inputs []string
 	var out string
 	var groups []link.Group
+	var aliases map[string]string
 
 	express := true
 	args := os.Args[1:]
@@ -46,6 +47,20 @@ func main() {
 			}
 			groups = append(groups, link.Group{Name: args[i], Dynamic: dyn,
 				Kind: kind, KindSet: true})
+		case a == "-a":
+			// "-a old=new" aliases a symbol REFERENCE (link.SetAliases)
+			i++
+			if i >= len(args) {
+				die("Alias missing after -a option")
+			}
+			old, new, ok := strings.Cut(args[i], "=")
+			if !ok {
+				die("Unknown option (-A %s) specified", args[i])
+			}
+			if aliases == nil {
+				aliases = map[string]string{}
+			}
+			aliases[old] = new
 		case a == "-apw": // accepted, no output-form effect
 
 		case a == "-x":
@@ -64,6 +79,7 @@ func main() {
 			inputs = append(inputs, a)
 		}
 	}
+	link.SetAliases(aliases)
 	if out == "" || (len(inputs) == 0 && len(groups) == 0) {
 		die("usage: linkiigs file.obj... -o file")
 	}
