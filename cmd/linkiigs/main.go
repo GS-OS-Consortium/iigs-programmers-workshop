@@ -28,12 +28,18 @@ func main() {
 			}
 			out = args[i]
 		case a == "-lseg":
-			// "-lseg NAME obj..." starts a named load segment
+			// "-lseg NAME obj..." starts a named load segment. The operand
+			// may be "Name:$hhhh" or "$hhhh:Name"; the hex piece is the KIND.
 			i++
 			if i >= len(args) {
 				die("missing argument to -lseg")
 			}
-			groups = append(groups, link.Group{Name: args[i]})
+			name, kind, kindSet, dyn, err := link.ParseLsegOperand(args[i])
+			if err != nil {
+				die("linkiigs -lseg %s: %v", args[i], err)
+			}
+			groups = append(groups, link.Group{Name: name, Dynamic: dyn,
+				Kind: kind, KindSet: kindSet})
 		case strings.HasPrefix(strings.ToLower(a), "-lseg:"):
 			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND
 			// the attributes define outright ("-lseg:dynamic", "-lseg:$3000")

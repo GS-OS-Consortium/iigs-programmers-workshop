@@ -1135,6 +1135,41 @@ func SegKindAttrs(spec string) (uint16, bool, error) {
 	return kind, dyn, nil
 }
 
+// ParseLsegOperand reads the operand of a bare "-lseg". With no colon the
+// operand is the segment name and the kind is inherited from the object.
+// "Name:$hhhh" and "$hhhh:Name" (SetStart:$1000, $1000:CDev) split into a
+// name and a KIND: every piece SegKindAttrs accepts is a kind attribute,
+// and the one piece it rejects as unknown is the name. The KIND replaces
+// the kind the group would inherit. A "$8000" bit marks the group dynamic,
+// as SegKindAttrs already does for "-lseg:$8000".
+func ParseLsegOperand(operand string) (name string, kind uint16, kindSet bool, dynamic bool, err error) {
+	if !strings.Contains(operand, ":") {
+		return operand, 0, false, false, nil
+	}
+	var names, attrs []string
+	for _, p := range strings.Split(operand, ":") {
+		p = strings.TrimSpace(p)
+		if _, _, perr := SegKindAttrs(p); perr == nil {
+			attrs = append(attrs, p)
+			continue
+		} else if !strings.HasPrefix(perr.Error(), "unknown -lseg attribute") {
+			return "", 0, false, false, perr
+		}
+		names = append(names, p)
+	}
+	if len(names) == 0 {
+		return "", 0, false, false, fmt.Errorf("-lseg %q has no segment name", operand)
+	}
+	if len(names) > 1 {
+		return "", 0, false, false, fmt.Errorf("-lseg %q has more than one segment name", operand)
+	}
+	kind, dynamic, err = SegKindAttrs(strings.Join(attrs, ":"))
+	if err != nil {
+		return "", 0, false, false, err
+	}
+	return names[0], kind, true, dynamic, nil
+}
+
 // Sel selects a whole object file, or the segments carrying one load name
 // when Seg is set. The "file(@name)" form the GS/OS makefiles use to split
 // scm.obj across load segments names a SEG, not a PROC: "@oscall_seg" picks

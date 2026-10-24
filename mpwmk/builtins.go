@@ -610,10 +610,7 @@ func (e *Env) runLink(args []string) error {
 		if err != nil {
 			return fmt.Errorf("linkiigs: %w", err)
 		}
-		if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
-			return err
-		}
-		return os.WriteFile(output, res, 0644)
+		return e.writeLinked(output, res)
 	}
 	// An ungrouped input may still select segments -- MIDISynth links
 	// "cursor.obj(SETCURSOR,SHIFTONE,...)" straight into the main segment --
@@ -665,10 +662,17 @@ func (e *Env) runLink(args []string) error {
 	if err != nil {
 		return fmt.Errorf("linkiigs: %w", err)
 	}
+	return e.writeLinked(output, res)
+}
+
+// writeLinked stores a finished load file. The FINDER startup pad is applied
+// here, after the bytes link.Link produced, so a replay of the logged link
+// command still matches public LinkIIGS.
+func (e *Env) writeLinked(output string, res []byte) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(output, res, 0644)
+	return os.WriteFile(output, patchFinderStartup(res), 0644)
 }
 
 func (e *Env) runMakeBin(args []string) error {
