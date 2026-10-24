@@ -519,9 +519,18 @@ func (e *Env) runLink(args []string) error {
 			output = e.HostPath(args[i])
 			log = append(log, "-o", output)
 		case "-lseg":
-			// "-lseg NAME obj..." starts a named load segment
+			// "-lseg NAME obj..." starts a named load segment. The operand
+			// may be "Name:$hhhh" or "$hhhh:Name"; the hex piece is the KIND.
 			i++
-			groups = append(groups, link.Group{Name: args[i]})
+			if i >= len(args) {
+				return fmt.Errorf("linkiigs: missing argument to -lseg")
+			}
+			name, kind, kindSet, dyn, err := link.ParseLsegOperand(args[i])
+			if err != nil {
+				return fmt.Errorf("linkiigs -lseg %s: %w", args[i], err)
+			}
+			groups = append(groups, link.Group{Name: name, Dynamic: dyn,
+				Kind: kind, KindSet: kindSet})
 			log = append(log, "-lseg", args[i])
 		case "-apw":
 			// accepted for compatibility; the oracle emits the same
