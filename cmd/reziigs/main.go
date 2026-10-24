@@ -12,6 +12,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/dagenbrock/iigs-programmers-workshop/rez"
@@ -20,6 +21,8 @@ import (
 func main() {
 	var input, out string
 	var incDirs, defines []string
+	var memo *rez.Memo
+	var fileType [4]byte
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
@@ -35,8 +38,46 @@ func main() {
 				die("missing argument to -i")
 			}
 			incDirs = append(incDirs, strings.Split(args[i], ",")...)
-		case a == "-t" || a == "-c":
-			i++ // ProDOS type / creator: file metadata, not fork content
+		case a == "-t":
+			// ProDOS type: file metadata, not fork content -- unless -memo
+			// stamps it into rFileMemo the way DuplicateIIGS -mac did
+			i++
+			if i >= len(args) {
+				die("missing argument to -t")
+			}
+			if t, err := strconv.ParseUint(strings.TrimPrefix(args[i], "$"), 16, 8); err == nil && strings.HasPrefix(args[i], "$") {
+				fileType = rez.FileTypeField(byte(t), 0)
+			} else {
+				copy(fileType[:], fmt.Sprintf("%-4s", args[i]))
+			}
+		case a == "-c":
+			i++ // creator: file metadata, not fork content
+		case a == "-memo":
+			// "-memo NAME" fills rFileMemo as DuplicateIIGS -mac NAME would
+			i++
+			if i >= len(args) {
+				die("missing argument to -memo")
+			}
+			memo = &rez.Memo{Name: args[i], Creator: [4]byte{'p', 'd', 'o', 's'}, Const: 2}
+		case a == "-memodate":
+			// Mac-epoch seconds (decimal or $hex) for the memo's creation time
+			i++
+			if i >= len(args) {
+				die("missing argument to -memodate")
+			}
+			if memo == nil {
+				die("-memodate needs -memo first")
+			}
+			s := args[i]
+			base := 10
+			if strings.HasPrefix(s, "$") {
+				s, base = s[1:], 16
+			}
+			v, err := strconv.ParseUint(s, base, 32)
+			if err != nil {
+				die("bad -memodate %q", args[i])
+			}
+			memo.Created = uint32(v)
 		case a == "-d":
 			i++
 			if i >= len(args) {
@@ -59,8 +100,15 @@ func main() {
 	if err != nil {
 		die("%v", err)
 	}
+	fork := rez.Build(res)
+	if memo != nil {
+		memo.FileType = fileType
+		if err := rez.StampMemo(fork, *memo); err != nil {
+			die("%v", err)
+		}
+	}
 	if _, err := os.Stat(out); !os.IsNotExist(err) {
-		if err := os.WriteFile(out+".rsrc", rez.Build(res), 0644); err != nil {
+		if err := os.WriteFile(out+".rsrc", fork, 0644); err != nil {
 			die("%v", err)
 		}
 		return
@@ -68,7 +116,7 @@ func main() {
 	if err := os.WriteFile(out, nil, 0644); err != nil {
 		die("%v", err)
 	}
-	if err := os.WriteFile(out+".rsrc", rez.Build(res), 0644); err != nil {
+	if err := os.WriteFile(out+".rsrc", fork, 0644); err != nil {
 		die("%v", err)
 	}
 }
