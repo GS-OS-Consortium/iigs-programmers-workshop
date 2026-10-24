@@ -67,6 +67,20 @@ func main() {
 			express = false // no ~ExpressLoad segment
 		case a == "-l":
 			// listing flag: no effect on the image
+		case a == "-relocs":
+			// "-relocs 1.2" reproduces the public LinkIIGS 1.2 encoding
+			i++
+			if i >= len(args) {
+				die("missing argument to -relocs")
+			}
+			enc, err := link.ParseRelocEncoding(args[i])
+			if err != nil {
+				die("linkiigs: %v", err)
+			}
+			link.SetRelocEncoding(enc)
+		case a == "-version":
+			fmt.Printf("linkiigs %s\n", link.Version)
+			return
 		case strings.HasPrefix(a, "-"):
 			die("unsupported option %q", a)
 		case len(groups) > 0:

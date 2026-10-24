@@ -772,7 +772,7 @@ const (
 func buildLoadFile(image []byte, org int64, kind uint16, banksize uint32, align int64, patches []relocPatch) ([]byte, error) {
 	return buildExpressFile([]exMember{{name: mainName, image: image, org: org,
 		kind: kind, banksize: banksize, align: align, segNum: 2,
-		relocs: relocRecords(patches)}}), nil
+		relocs: relocRecords(patches, 2)}}), nil
 }
 
 // exMember is one real load segment of an ExpressLoad file.
@@ -894,15 +894,66 @@ func buildExpressFile(members []exMember) []byte {
 	return out
 }
 
-// relocRecords emits the patch list the way LinkIIGS 1.2 does: unshifted 2-
-// and 3-byte patches are packed into SUPER RELOC2 and RELOC3 records, and
-// what is left becomes a cRELOC when its offset and value both fit in two
-// bytes, or a full RELOC otherwise. Width does not decide cRELOC -- a 4-byte
-// patch at a low offset still compresses (oracle-verified).
-func relocRecords(patches []relocPatch) []byte {
+// Version is the linker's version. 1.3 packs relocations the way the
+// internal ~May-1993 LinkIIGS that mastered System 6.0.1 did; 1.2 is the
+// last public release, whose encoding the MPW IIGS 1.2 oracle reproduces.
+const Version = "1.3"
+
+// RelocEncoding selects how a segment's relocation dictionary is spelled.
+type RelocEncoding int
+
+const (
+	// Relocs1993 is the shipped 6.0.1 encoding: in-segment 4-byte patches
+	// join SUPER RELOC3 and high-word (>>16) patches become SUPER
+	// INTERSEG25+n against the segment's own number.
+	Relocs1993 RelocEncoding = iota
+	// Relocs12 is LinkIIGS 1.2's: only unshifted 2- and 3-byte in-segment
+	// patches are SUPER-packed; the rest stay cRELOC/RELOC.
+	Relocs12
+)
+
+var relocEncoding = encodingFromEnv()
+
+// SetRelocEncoding selects the relocation encoding for every later link.
+func SetRelocEncoding(e RelocEncoding) { relocEncoding = e }
+
+// ParseRelocEncoding maps "1.2" / "1.3" (or "1993") to an encoding.
+func ParseRelocEncoding(s string) (RelocEncoding, error) {
+	switch s {
+	case "1.3", "1993":
+		return Relocs1993, nil
+	case "1.2":
+		return Relocs12, nil
+	}
+	return 0, fmt.Errorf("unknown relocation encoding %q (want 1.2 or 1.3)", s)
+}
+
+// encodingFromEnv lets a caller that drives the package indirectly (mpwmk)
+// pick the encoding: LINKIIGS_RELOCS=1.2 reproduces the 1.2 oracle.
+func encodingFromEnv() RelocEncoding {
+	if s := stdos.Getenv("LINKIIGS_RELOCS"); s != "" {
+		if e, err := ParseRelocEncoding(s); err == nil {
+			return e
+		}
+	}
+	return Relocs1993
+}
+
+// relocRecords emits the relocation dictionary of load segment segNum.
+// Unshifted 2- and 3-byte in-segment patches are packed into SUPER RELOC2 and
+// RELOC3 records; under the 1993 encoding so are 4-byte patches (RELOC3
+// patches the low three bytes, so the value must fit 24 bits) and 2-byte
+// high-word patches (SUPER INTERSEG25+segNum, the loader taking the high word
+// of base+offset, so the stored offset must fit 16 bits). What is left becomes
+// a cRELOC when its offset and value both fit in two bytes, or a full RELOC
+// otherwise. Width does not decide cRELOC -- a 4-byte patch at a low offset
+// still compresses (oracle-verified). Standalone records come first in patch
+// order, then the SUPER records in ascending type.
+func relocRecords(patches []relocPatch, segNum int) []byte {
 	var out []byte
 	var super2, super3 []relocPatch
 	superIS := map[int][]relocPatch{} // SUPER INTERSEG lists by type byte
+	pack1993 := relocEncoding == Relocs1993
 	for _, p := range patches {
 		if p.interseg {
 			switch {
@@ -948,6 +999,11 @@ func relocRecords(patches []relocPatch) []byte {
 			super2 = append(super2, p)
 		case p.shift == 0 && p.size == 3 && v < 0x1000000:
 			super3 = append(super3, p)
+		case pack1993 && p.shift == 0 && p.size == 4 && v < 0x1000000:
+			super3 = append(super3, p)
+		case pack1993 && p.shift == -16 && p.size == 2 && v < 0x10000 &&
+			segNum >= 1 && segNum <= 12:
+			superIS[25+segNum] = append(superIS[25+segNum], p)
 		case p.offset < 0x10000 && v < 0x10000:
 			out = append(out, 0xF5, byte(p.size), byte(int8(p.shift)))
 			out = append(out, byte(p.offset), byte(p.offset>>8))
@@ -1555,7 +1611,7 @@ func LinkGroups(groups []Group, express bool) ([]byte, error) {
 	for i, m := range members {
 		exMembers[i] = exMember{name: m.name, image: m.image, org: m.org,
 			kind: m.kind, banksize: m.banksize, align: m.align, segNum: m.segNum,
-			relocs: relocRecords(m.patches)}
+			relocs: relocRecords(m.patches, m.segNum)}
 	}
 	return buildExpressFile(exMembers), nil
 }
@@ -1649,7 +1705,7 @@ func gequSelfRef(b []byte, segName string) (int64, bool) {
 func loadSegment(name string, segNum int, image []byte, org int64, kind uint16, banksize uint32, align int64, patches []relocPatch) []byte {
 	le := binary.LittleEndian
 	dispData := mainDispName + 10 + 1 + len(name)
-	relocBytes := relocRecords(patches)
+	relocBytes := relocRecords(patches, segNum)
 	byteCnt := dispData + len(image) + 5 + len(relocBytes) + 1
 
 	hdr := make([]byte, dispData)
