@@ -5,11 +5,12 @@
 /bin/
 /obj/
 
-# Stray binaries from `go build` in the repo root (named for their cmd/ dir)
+# Stray binaries from `go build` in the repo root (named for their cmd/ dir).
+# mpwmk is the source package, so it is not listed: that pattern also ignores
+# new files inside the package.
 /asmiigs
 /linkiigs
 /makebiniigs
-/mpwmk
 /omfdiff
 /omfdump
 /reziigs
