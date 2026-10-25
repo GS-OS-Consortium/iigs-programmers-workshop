@@ -401,11 +401,16 @@ func (e *Env) runRez(args []string) error {
 func (e *Env) runAsm(args []string) error {
 	var input, output string
 	var outIsDir bool
+	var liveDate bool
 	var incDirs []string
 	var defines []string
 	var extras []string
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
+		case "-live-date":
+			// &SysDate/&SysTime use the real clock. Not logged: AsmIIGS
+			// has no such option, and the oracle replay must not see it.
+			liveDate = true
 		case "-o":
 			i++
 			outIsDir = strings.HasSuffix(args[i], ":")
@@ -445,6 +450,15 @@ func (e *Env) runAsm(args []string) error {
 		incDirs = append(incDirs, e.HostPath(d))
 	}
 	e.logAsm(input, output, incDirs, defines, extras)
+	if liveDate {
+		prev, had := os.LookupEnv("SOURCE_DATE_EPOCH")
+		os.Unsetenv("SOURCE_DATE_EPOCH")
+		defer func() {
+			if had {
+				os.Setenv("SOURCE_DATE_EPOCH", prev)
+			}
+		}()
+	}
 	obj, err := asm.AssembleFileWith(input, asm.FileOpts{
 		IncDirs: incDirs,
 		Defines: defines,
@@ -512,6 +526,8 @@ func (e *Env) runLink(args []string) error {
 	var aliases map[string]string
 	selCache := map[string]*omf.File{}
 	express := true
+	var relocEnc link.RelocEncoding
+	haveReloc := false
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; strings.ToLower(a) {
 		case "-o":
@@ -559,6 +575,20 @@ func (e *Env) runLink(args []string) error {
 		case "-x":
 			express = false // no ~ExpressLoad segment
 			log = append(log, "-x")
+		case "-relocs":
+			// "-relocs 1.2" is this linker's public-1.2 encoding. The
+			// oracle is LinkIIGS 1.2 and has no such flag, so the replay
+			// log omits it: the original tool's own encoding is 1.2.
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("linkiigs: missing argument to -relocs")
+			}
+			enc, err := link.ParseRelocEncoding(args[i])
+			if err != nil {
+				return fmt.Errorf("linkiigs: %w", err)
+			}
+			relocEnc = enc
+			haveReloc = true
 		case "-w", "-w1", "-w2", "-w3", "-l", "-s": // warnings/listing: output-identical
 		default:
 			// "-lseg:attr[:attr...] NAME" starts a load segment whose KIND the
@@ -598,6 +628,10 @@ func (e *Env) runLink(args []string) error {
 	e.logLink(log)
 	// unconditional, so a previous link's aliases cannot leak into this one
 	link.SetAliases(aliases)
+	if haveReloc {
+		prev := link.SetRelocEncoding(relocEnc)
+		defer link.SetRelocEncoding(prev)
+	}
 	if output == "" || (len(inputs) == 0 && len(groups) == 0) {
 		return fmt.Errorf("linkiigs: need inputs and -o output")
 	}

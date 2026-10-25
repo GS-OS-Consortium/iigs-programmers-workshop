@@ -909,13 +909,22 @@ const (
 	Relocs1993 RelocEncoding = iota
 	// Relocs12 is LinkIIGS 1.2's: only unshifted 2- and 3-byte in-segment
 	// patches are SUPER-packed; the rest stay cRELOC/RELOC.
+	//
+	// A `-relocs 1.2` in a makefile is temporary. It forces this encoding
+	// so one file matches a 6.0.4 disk that was linked with the public 1.2
+	// tool. Drop every such flag once the 1.3 default matches those disks.
 	Relocs12
 )
 
 var relocEncoding = encodingFromEnv()
 
-// SetRelocEncoding selects the relocation encoding for every later link.
-func SetRelocEncoding(e RelocEncoding) { relocEncoding = e }
+// SetRelocEncoding selects the relocation encoding for every later link
+// and returns the encoding that was in effect.
+func SetRelocEncoding(e RelocEncoding) (prev RelocEncoding) {
+	prev = relocEncoding
+	relocEncoding = e
+	return prev
+}
 
 // ParseRelocEncoding maps "1.2" / "1.3" (or "1993") to an encoding.
 func ParseRelocEncoding(s string) (RelocEncoding, error) {

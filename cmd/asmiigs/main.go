@@ -18,9 +18,12 @@ func main() {
 	var incDirs []string
 	var defines []string
 	var out string
+	var liveDate bool
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
+		case a == "-live-date":
+			liveDate = true
 		case a == "-o":
 			i++
 			if i >= len(args) {
@@ -49,6 +52,9 @@ func main() {
 	}
 	if len(inputs) != 1 || out == "" {
 		die("usage: asmiigs [options] file.aii -o file.obj")
+	}
+	if liveDate {
+		os.Unsetenv("SOURCE_DATE_EPOCH")
 	}
 	cwd, _ := os.Getwd()
 	obj, err := asm.AssembleFileWith(inputs[0], asm.FileOpts{
