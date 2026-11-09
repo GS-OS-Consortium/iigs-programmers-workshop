@@ -10,7 +10,7 @@ package mpwmk
 // tool can read -- CR/MacRoman text with a TEXT/MPS Finder type, binaries
 // verbatim with their recorded type -- runs the tool there, and copies every
 // new or changed file back, byte-exact, with its Finder type preserved in a
-// sidecar xattr so a later invocation can restage it faithfully.
+// sibling <name>.finfo file so a later invocation can restage it faithfully.
 
 import (
 	"fmt"
@@ -39,32 +39,28 @@ const textFinderInfo = "TEXTMPS \x00\x00\x00\x00\x00\x00\x00\x00" +
 
 var macRoman = charmap.Macintosh.NewEncoder()
 
+func finfoPath(path string) string { return path + ".finfo" }
+
+func isFinfo(name string) bool { return strings.HasSuffix(name, ".finfo") }
+
 func getFinderInfo(path string) []byte {
-	out, err := exec.Command("xattr", "-px", "com.apple.FinderInfo", path).Output()
-	if err != nil {
+	b, err := os.ReadFile(finfoPath(path))
+	if err != nil || len(b) == 0 {
 		return nil
 	}
-	hex := strings.Fields(strings.ReplaceAll(string(out), "\n", " "))
-	var b []byte
-	for _, h := range hex {
-		for i := 0; i+2 <= len(h); i += 2 {
-			var v byte
-			fmt.Sscanf(h[i:i+2], "%02X", &v)
-			b = append(b, v)
-		}
+	if len(b) < 32 {
+		b = append(b, make([]byte, 32-len(b))...)
 	}
-	return b
+	return b[:32]
 }
 
 func setFinderInfo(path string, info []byte) {
 	if len(info) == 0 {
 		return
 	}
-	var sb strings.Builder
-	for _, b := range info {
-		fmt.Fprintf(&sb, "%02X", b)
-	}
-	exec.Command("xattr", "-wx", "com.apple.FinderInfo", sb.String(), path).Run()
+	buf := make([]byte, 32)
+	copy(buf, info)
+	os.WriteFile(finfoPath(path), buf, 0644)
 }
 
 // isTextFile: valid UTF-8 with no NUL bytes. (An OMF object can decode as
@@ -119,6 +115,9 @@ func (e *Env) runOracleTool(name string, args []string) error {
 	}
 	for _, ent := range ents {
 		if ent.IsDir() {
+			continue
+		}
+		if isFinfo(ent.Name()) {
 			continue
 		}
 		src := filepath.Join(e.Dir, ent.Name())
@@ -204,6 +203,9 @@ func (e *Env) runOracleTool(name string, args []string) error {
 		rel, err := filepath.Rel(work, p)
 		if err != nil {
 			return err
+		}
+		if isFinfo(rel) {
+			return nil
 		}
 		data, err := os.ReadFile(p)
 		if err != nil {
